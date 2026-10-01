@@ -424,7 +424,9 @@ main() {
     fi
     ask GITHUB_OWNER_LOGIN "Your GitHub login (only your merges and reviews decide)" "$GITHUB_OWNER_LOGIN"
     ask GITHUB_REPOS "Repositories, comma-separated (owner/repo)" "$GITHUB_REPOS"
-    [ -n "$GITHUB_OWNER_LOGIN" ] && [ -n "$GITHUB_REPOS" ] || die "The relay needs your GitHub login and at least one repository."
+    if [ -z "$GITHUB_OWNER_LOGIN" ] || [ -z "$GITHUB_REPOS" ]; then
+      die "The relay needs your GitHub login and at least one repository."
+    fi
     local detected
     detected="$(helper prefixes 2>/dev/null || true)"
     [ -n "$detected" ] && note "Your companies' issue prefixes: $detected (used when the next answer is empty)."
@@ -523,8 +525,9 @@ main() {
         if confirm "Create or update the webhook on $GITHUB_REPOS with gh?" y; then
           create_webhooks "$webhook_url"
           sleep 4
-          (cd "$DIR" && docker compose logs --no-log-prefix --since 30s helper </dev/null) | grep -q '"event":"ping"' \
-            && note "The relay received GitHub's ping." || true
+          if (cd "$DIR" && docker compose logs --no-log-prefix --since 30s helper </dev/null) | grep -q '"event":"ping"'; then
+            note "The relay received GitHub's ping."
+          fi
         else
           manual_webhook_steps "$webhook_url"
         fi
