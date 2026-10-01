@@ -83,6 +83,32 @@ test("a merge by the owner approves the child whose approval waits on them", asy
   assert.match(db.patches[0].body.comment, /^Approved: PR #8 merged into `main` by @owner \(abcdef123456\)/);
 });
 
+test("a merge that only clears your escalated review also approves your approval stage that follows", async (t) => {
+  // DIR-68: the review stage hit its round cap and went to the operator; approving it
+  // moved the issue to the approval stage, again the operator's, and left it in review.
+  const { relay, db } = await relayEnv(t);
+  const { child } = seed(db);
+  child.executionState = { status: "pending", currentStageType: "review", currentParticipant: { type: "user", userId: ids.user } };
+  child.nextStages = [{ type: "approval", participant: { type: "user", userId: ids.user } }];
+  const result = await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  assert.deepEqual(result, { identifier: "ACM-2", action: "approve", status: "done", stages: ["review", "approval"] });
+  assert.equal(db.patches.length, 2);
+  assert.match(db.patches[1].body.comment, /^Approved at the approval stage as well: PR #8 was merged\./);
+  assert.equal(child.status, "done");
+});
+
+test("a merge stops at a stage that is someone else's, and says so", async (t) => {
+  const { relay, db, logs } = await relayEnv(t);
+  const { child } = seed(db);
+  child.executionState = { status: "pending", currentStageType: "review", currentParticipant: { type: "user", userId: ids.user } };
+  child.nextStages = [{ type: "approval", participant: { type: "agent", agentId: "a-approver" } }];
+  const result = await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  assert.equal(db.patches.length, 1);
+  assert.equal(result.status, "in_review");
+  assert.equal(result.warning, "asked for done, issue is in_review (approval pending with agent a-approver)");
+  assert.ok(logs.some((l) => l.msg === "relay: the decision didn't move the issue where it was sent"));
+});
+
 test("issue prefixes come from Paperclip when ISSUE_PREFIXES is empty", async (t) => {
   const { relay, db } = await relayEnv(t);
   seed(db);

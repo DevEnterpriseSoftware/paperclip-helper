@@ -37,7 +37,10 @@ const WATCHED_STATUSES = "todo,in_progress,in_review";
 const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
 const PENDING_WAKE = new Set(["queued", "claimed", "deferred_issue_execution"]);
 const CONCURRENCY = 4;
-const HANDOFF_BUG = "[paperclipai/paperclip#13880](https://github.com/paperclipai/paperclip/pull/13880)";
+// Plain text, no URL: Paperclip links every github.com pull-request URL in a
+// comment to the issue as one of its PRs, so a link here would show Paperclip's
+// own PR on every issue the watchdog nudges.
+const HANDOFF_BUG = "paperclipai/paperclip#13880";
 
 // A paused task tree refuses a board user's comment, alone or with a PATCH, with
 // 409 "Task is paused" (assertBoardCommentNotPaused). Nothing to do until it resumes.
@@ -169,7 +172,7 @@ export function createWatchdog(ctx, state) {
       deferredMin: Math.round((now() - ts(wake.requestedAt)) / 60_000),
       previousRun: previous?.runId ?? null,
       previousRunLease: previous?.environmentLease?.status ?? null,
-      hint: `Paperclip is waiting for an earlier run to release execution (${HANDOFF_BUG.replace(/^\[|\]\(.*$/g, "")}). See \`pch why ${issue.identifier ?? issue.id}\`.`,
+      hint: `Paperclip is waiting for an earlier run to release execution (${HANDOFF_BUG}). See \`pch why ${issue.identifier ?? issue.id}\`.`,
     });
   }
 

@@ -220,7 +220,13 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       if (rest === "" && req.method === "PATCH") {
         if (body.comment && issue.paused) return send(409, { error: "Task is paused. Resume it before sending a message." });
         db.patches.push({ issueId: issue.id, identifier: issue.identifier, body });
-        if (body.status) issue.status = body.status;
+        if (body.status === "done" && issue.nextStages?.length && issue.executionState?.status === "pending") {
+          // Like Paperclip's applyIssueExecutionStageTransition: approving a stage
+          // that isn't the last moves the issue to the next stage, still in review.
+          const next = issue.nextStages.shift();
+          issue.executionState = { status: "pending", currentStageType: next.type, currentParticipant: next.participant };
+          issue.status = "in_review";
+        } else if (body.status) issue.status = body.status;
         if (body.blockedByIssueIds) issue.blockedBy = body.blockedByIssueIds.map((id) => ({ id }));
         if (body.comment) db.comments.push({ issueId: issue.id, identifier: issue.identifier, body: body.comment, via: "patch" });
         issue.updatedAt = new Date().toISOString();

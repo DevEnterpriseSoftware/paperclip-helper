@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1
+
+- **Relay:** a merge that approves an escalated review stage also approves the approval stage after it when that is yours too, so the issue reaches `done`. The result's `status` is read back from Paperclip, with a `warning` when the issue didn't land where it was sent.
+- **Watchdog:** nudge comments name paperclipai/paperclip#13880 without a link, so Paperclip no longer lists that PR on every nudged issue.
+
 ## 1.0.0
 
 First public release, as a published image with installers for Linux, macOS and Windows.

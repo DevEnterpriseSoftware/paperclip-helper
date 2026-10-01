@@ -105,7 +105,9 @@ In Paperclip, the current participant of a review or approval stage records a de
 | **Someone else merges**, or the PR is **closed** without merging | A comment only. |
 | **The PR is opened, reopened or marked ready for review** | Its URL is posted on the issue, so Paperclip links the PR (`RELAY_LINK_PRS`). |
 
-Every delivery's response body says what the relay did, for example `{"identifier":"ACM-2","action":"approve","status":"done"}`. You can see it in GitHub's webhook **Recent Deliveries**, and **Redeliver** retries a delivery that failed.
+Every delivery's response body says what the relay did, for example `{"identifier":"ACM-2","action":"approve","status":"done"}`. `status` is read back from Paperclip after the decision, and a `warning` says when the issue didn't land where it was sent. You can see it in GitHub's webhook **Recent Deliveries**, and **Redeliver** retries a delivery that failed.
+
+**Several stages of yours.** Approving a stage that isn't the last one moves the issue to the next stage. That happens when a review reaches its round cap and Paperclip hands it to you, and the approval stage after it is yours too. A merge approves each consecutive stage that is waiting on you, up to three, with a short comment on each (the response lists them as `stages`), and stops at the first stage that is someone else's.
 
 **Finding the issue.** The relay collects every issue identifier (`ACM-12`) in the PR's title, branch name and body, and adds each issue's subtasks. It then acts on the one whose approval is waiting on you. A PR often names the *parent* issue, because its branch comes from the parent's workspace, while the review stages sit on a *subtask*. If several are waiting, it prefers the one that lists this PR as a work product; if none does, it comments instead of guessing. If none is waiting on you, it only comments on the first issue named.
 

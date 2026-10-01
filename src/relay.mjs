@@ -29,6 +29,8 @@ import { approvalWaitingOn, DECISION_STATUS } from "./util.mjs";
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 const MAX_FORWARDED_CHARS = 20_000;
 const LINK_ACTIONS = new Set(["opened", "reopened", "ready_for_review"]);
+// Stages a single merge may approve after the first, when each is waiting on you.
+const MAX_CHAINED_STAGES = 3;
 
 export function verifySignature(secret, rawBody, header) {
   if (!secret || typeof header !== "string" || !header.startsWith("sha256=")) return false;
@@ -173,9 +175,38 @@ export function createRelay(ctx, state) {
 
     const status = DECISION_STATUS[kind];
     if (config.dryRun) return { identifier, action: `${kind} (dry run)`, status };
+    const path = `/api/issues/${encodeURIComponent(identifier)}`;
     // The decision and its comment must travel in the same PATCH.
-    await api.request("PATCH", `/api/issues/${encodeURIComponent(identifier)}`, { status, comment });
-    return { identifier, action: kind, status };
+    await api.request("PATCH", path, { status, comment });
+
+    // Approving a stage that isn't the last one only moves the issue to the next
+    // stage. When that stage is yours too (an escalated review followed by your
+    // approval, say), the merge is your decision there as well: approve it, with
+    // a short comment, since Paperclip needs one per decision. Stop as soon as
+    // the next decision is someone else's.
+    const stages = [stageType];
+    let current = await api.request("GET", path).catch(() => null);
+    if (kind === "approve") {
+      const { userId } = await ctx.identity();
+      for (let i = 0; i < MAX_CHAINED_STAGES && current && approvalWaitingOn(current, userId); i++) {
+        const next = current.executionState?.currentStageType ?? "next";
+        stages.push(next);
+        await api.request("PATCH", path, {
+          status,
+          comment: `Approved at the ${next} stage as well: ${prLabel(pr)} was merged. ${pr.html_url ?? ""}`.trim(),
+        });
+        current = await api.request("GET", path).catch(() => null);
+      }
+    }
+    const result = { identifier, action: kind, status: current?.status ?? status };
+    if (stages.length > 1) result.stages = stages;
+    if (current && current.status !== status) {
+      // Paperclip accepted the decision but the issue didn't land where it was sent.
+      const waitingOn = current.executionState?.currentParticipant ?? null;
+      result.warning = `asked for ${status}, issue is ${current.status}${waitingOn ? ` (${current.executionState?.currentStageType ?? "stage"} pending with ${waitingOn.type} ${waitingOn.userId ?? waitingOn.agentId})` : ""}`;
+      log.warn("relay: the decision didn't move the issue where it was sent", { identifier, ...result });
+    }
+    return result;
   }
 
   // Plain comments go where the review is waiting on you, if anywhere; else to
