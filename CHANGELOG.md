@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2
+
+- **Watchdog:** a run Paperclip cancelled before it started (`execution_reconciliation_required`, after a hand-off) no longer counts as the owner having picked the issue up. Once the hold has cleared, the owner is nudged; while it is still in place, the watchdog waits.
+
 ## 1.0.1
 
 - **Relay:** a merge that approves an escalated review stage also approves the approval stage after it when that is yours too, so the issue reaches `done`. The result's `status` is read back from Paperclip, with a `warning` when the issue didn't land where it was sent.

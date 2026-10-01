@@ -181,6 +181,9 @@ export function createWatchdog(ctx, state) {
 
   // ---------------------------------------------------------------- 1. hand-offs
 
+  // Cancelled by Paperclip at admission, before any work: see stalledHandOff.
+  const refused = (run) => run.status === "cancelled" && run.errorCode === "execution_reconciliation_required";
+
   async function stalledHandOff(issue, agents) {
     const assignee = issue.assigneeAgentId;
     const agent = await agentFor(assignee, agents);
@@ -189,14 +192,33 @@ export function createWatchdog(ctx, state) {
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`);
     if (!Array.isArray(runs) || runs.length === 0) return null; // never worked on: not a hand-off
     if (runs.some((r) => r.agentId === assignee && ACTIVE_RUN.has(r.status))) return null;
-    const latest = runs.reduce((a, b) => (ts(b.createdAt) > ts(a.createdAt) ? b : a));
+    const newest = (list) => list.reduce((a, b) => (ts(b.createdAt) > ts(a.createdAt) ? b : a));
+    // A run Paperclip cancelled before it started, because the issue was held for
+    // reconciliation after a hand-off, did no work. It doesn't count as the owner
+    // having run: the hold clears on its own, but the wakes were skipped, so
+    // nothing wakes the owner again (DIR-91, DIR-95).
+    const worked = runs.filter((r) => !refused(r));
+    if (!worked.length) return null;
+    const latest = newest(worked);
     if (latest.agentId === assignee) return null; // the owner has run since the hand-off
     if (ACTIVE_RUN.has(latest.status)) return null; // the previous owner is still finishing
-    const endedAt = ts(latest.finishedAt) || ts(latest.startedAt) || ts(latest.createdAt);
+    const last = newest(runs); // quiet since the last attempt, refused or not
+    const endedAt = ts(last.finishedAt) || ts(last.startedAt) || ts(last.createdAt);
     const sinceRunSec = Math.round((now() - endedAt) / 1000);
     if (sinceRunSec < config.watchdogStallSec) return null;
     // A wake waiting in the agent's queue (it's busy elsewhere) is not a stall.
     if (await hasPendingWake(issue, runs)) return null;
+    if (worked.length < runs.length) {
+      // While the hold is still in place, a comment's run would be refused too.
+      const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+      if (full?.executionBlocker) {
+        log.debug("watchdog: the issue is held for reconciliation; a comment can't help yet", {
+          issue: issue.identifier ?? issue.id,
+          cause: full.executionBlocker.cause ?? null,
+        });
+        return null;
+      }
+    }
     return { agent, latest, sinceRunSec };
   }
 

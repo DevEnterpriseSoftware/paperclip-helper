@@ -113,6 +113,42 @@ test("wakes deferred for other agents don't hide a dropped hand-off from the ass
   assert.equal(env2.logs.filter((l) => l.msg.startsWith("watchdog: a wake has been deferred")).length, 1);
 });
 
+test("runs Paperclip refused before they started don't count as the owner having run", async (t) => {
+  // DIR-91: the reviewer's runs after the hand-off were cancelled at admission
+  // (execution_reconciliation_required) and its wakes skipped. The hold cleared
+  // later, and nothing woke the reviewer again.
+  const env = await watchdogEnv(t);
+  const { issue, reviewer } = droppedHandOff(env.db);
+  const refusedRun = (min) => ({ runId: uuid(), agentId: reviewer.id, status: "cancelled", errorCode: "execution_reconciliation_required", createdAt: minutesAgo(min), finishedAt: minutesAgo(min) });
+  env.db.issueRuns[issue.id].push(refusedRun(8), refusedRun(7));
+  env.db.wakes[issue.id] = [{ kind: "wake_request", agentId: reviewer.id, status: "skipped", reason: "other", requestedAt: minutesAgo(7) }];
+
+  // Still held: a comment's run would be refused as well.
+  issue.executionBlocker = { cause: "execution_owner_active", runId: uuid(), recoveryActionId: null };
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 0);
+
+  // The hold has cleared: nudge the reviewer.
+  issue.executionBlocker = null;
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 1);
+  assert.ok(env.db.comments[0].body.startsWith(`[@Reviewer](agent://${reviewer.id})`));
+
+  // A refusal within the stall window is too recent to act on.
+  const env2 = await watchdogEnv(t);
+  const second = droppedHandOff(env2.db);
+  env2.db.issueRuns[second.issue.id].push({ ...refusedRun(1), agentId: second.reviewer.id });
+  await env2.watchdog.tick();
+  assert.equal(env2.db.comments.length, 0);
+
+  // A run of the reviewer's that did start still counts.
+  const env3 = await watchdogEnv(t);
+  const third = droppedHandOff(env3.db);
+  env3.db.issueRuns[third.issue.id].push({ runId: uuid(), agentId: third.reviewer.id, status: "cancelled", errorCode: "issue_reassigned", createdAt: minutesAgo(8), finishedAt: minutesAgo(8) });
+  await env3.watchdog.tick();
+  assert.equal(env3.db.comments.length, 0);
+});
+
 test("an assignee's wake deferred before a later run came and went is stale and doesn't hold the nudge back", async (t) => {
   // The reviewer's wake was deferred 16 minutes ago; a run created after it (the
   // engineer's, reassigned) has since finished, so execution moved on without it.
