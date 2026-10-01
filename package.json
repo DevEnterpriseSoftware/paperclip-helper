@@ -1,0 +1,22 @@
+{
+  "name": "paperclip-helper",
+  "version": "1.0.0",
+  "description": "Small automations that run beside a self-hosted Paperclip: GitHub merge-to-approve relay, stalled-work watchdog and subscription cost sync.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "paperclip-helper": "src/index.mjs"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test --test-reporter=spec \"test/*.test.mjs\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DevEnterpriseSoftware/paperclip-helper.git"
+  }
+}

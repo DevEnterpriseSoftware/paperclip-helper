@@ -1,0 +1,24 @@
+# Paperclip Helper: https://github.com/DevEnterpriseSoftware/paperclip-helper
+#
+# This is the reference setup for Linux hosts, where the helper shares the
+# host's network: Paperclip is at http://127.0.0.1:<its port> and the relay
+# listens on 127.0.0.1:3110. The installer writes a variant of this file for
+# Docker Desktop and for Paperclip containers whose port isn't published.
+#
+# Upgrade: docker compose pull && docker compose up -d
+
+services:
+  helper:
+    image: ${PCH_IMAGE:-ghcr.io/deventerprisesoftware/paperclip-helper:1}
+    container_name: paperclip-helper
+    restart: unless-stopped
+    stop_grace_period: 30s       # lets an in-flight cost post finish on shutdown
+    # The owner of ./data. The installer sets PCH_UID/PCH_GID in .env.
+    user: "${PCH_UID:-1000}:${PCH_GID:-1000}"
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
