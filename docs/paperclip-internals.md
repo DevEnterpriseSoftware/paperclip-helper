@@ -8,7 +8,9 @@ Paperclip's API is large and mostly undocumented. Everything below was read in P
 - `main` was at `5edf55d` on 2026-09-30.
 - The production release `2026.916.1` is not an ancestor of `53aad90`. Differences that matter are called out.
 
-**When Paperclip is upgraded,** re-check these facts first, with `npm test` and a quick run of `pch check`, `pch why` and `pch costs`.
+**When Paperclip is upgraded,** run `npm run test:compat -- <version>` first. It boots that Paperclip from npm and runs the helper's own code against it: every endpoint below, the response fields the helper reads, and the watchdog, relay and commands end to end (see [test/compat](../test/compat/compat.test.mjs)). Then a quick run of `pch check`, `pch why` and `pch costs` on your own instance covers what a throwaway instance can't reproduce: real lease refusals, failed workspace clean-ups and subscription runs.
+
+**Checked releases:** 2026.916.1 and 2026.1001.0 pass the compatibility suite. 2026.1001.0 changed the comment queue in one way that touches the helper (paperclipai/paperclip#13539): a queue can now hold a saved answer or approval instead of comments, and `queued-comments/interrupt` also accepts such a queue when its response needs a fresh session. The watchdog's request and the fields it reads are unchanged.
 
 ## Authentication: the board key
 
@@ -108,7 +110,7 @@ The rule lives in `server/src/services/issue-execution-policy.ts`:
   - **Only one sweep resumes these wakes,** and it needs a board recovery action. So a wake deferred behind a stuck run waits indefinitely. (live: a hand-off to a paused agent, then a nudge, stayed deferred)
   - **The board action that retries one** (read in 2026.916.1 source; `WATCHDOG_RETRY_DEFERRED` uses it):
     - `GET /api/issues/:id/queued-comments` returns `{ queueId, state, targetRunId, revision, protocol, entries[], executionWait? }`. A queue exists only when a `deferred_issue_execution` or `queued` wake for the assignee carries saved comment ids: `state` is `deferred` or `queued` respectively (`findQueuedCommentWake`, `server/src/routes/issues.ts`). `targetRunId` is set only when the queue is deferred **and** a run on the issue is `running` (`resolveActiveIssueRun`; `server/src/services/issue-queued-comment-queue.ts`), so a null `targetRunId` means the interrupt cancels nothing. (2026.916.1)
-    - `POST /api/issues/:id/queued-comments/interrupt` with `{ queueId, revision, targetRunId }` (`targetRunId` required, nullable) is the UI's "send queued messages now". Board user only; legacy protocol only; a stale `revision` is 409.
+    - `POST /api/issues/:id/queued-comments/interrupt` with `{ queueId, revision, targetRunId }` (`targetRunId` required, nullable) is the UI's "send queued messages now". Board user only; legacy protocol only (from 2026.1001.0 also a saved answer or approval that needs a fresh session); a stale `revision` is 409.
     - If `targetRunId` is a running run, it is **cancelled**. Otherwise `resumeQueuedCommentInterrupt(…, { retryCleanup: true })` gives the blocking run's `pending_cleanup` leases one cleanup attempt past the sweep's cap (`sweepPendingCleanupLeases({ explicitRetry })`, `services/heartbeat.ts`), then re-enqueues the comments as `issue_commented`, which still passes every admission gate.
     - It doesn't help a lease that was never released (`releasedAt` null, not `pending_cleanup`) or a process that is still alive: the new wake is deferred again.
     - The route still exists on `main` at `467125f` (2026-09-30).
@@ -185,6 +187,13 @@ The rule lives in `server/src/services/issue-execution-policy.ts`:
   - Project budgets match only an event's `projectId`, which `POST /cost-events` doesn't derive from `issueId`. So synced events never count toward a project budget.
 
 - **Resumed sessions report per-run cost.** A resumed run gets a new session id, and its `sessionIdBefore` is the previous run's `sessionIdAfter`. On 2026.916.1 (`claude_local`, CLI engine), resumed runs often cost less than the run they resumed, which a cumulative figure can't do. `pch costs --sessions` runs this check.
+
+## Compatibility notes
+
+- **Mentions:** on Paperclip's `main`, an `@mention` in a comment no longer wakes the mentioned agent. The watchdog doesn't depend on it, because a board user's comment wakes the issue's assignee, which is who it nudges.
+- **After paperclipai/paperclip#13880 ships:** the watchdog's hand-off check should find nothing to do, and can stay on or be turned off. The other checks cover separate gaps.
+- **Resumed sessions:** Claude Code's reported cost is per run, not cumulative for a resumed session, so nothing is counted twice. `pch costs --sessions` checks this on your own runs.
+- **Codex:** on Paperclip's CLI engine every Codex run is a fresh thread, and Paperclip's token counts match Codex's own logs. Codex on the ACP engine hasn't been checked.
 
 ## Unverified
 

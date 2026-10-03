@@ -2,6 +2,7 @@
 
 ## 1.1.0
 
+- **Compatibility suite:** `npm run test:compat -- <version>` boots a throwaway Paperclip of that version and runs the helper's own code against it: every endpoint, the response fields it reads, and the watchdog, relay, cost sync and commands end to end. CI runs it on every push and daily against Paperclip's latest release. Paperclip 2026.916.1 and 2026.1001.0 both pass.
 - **Watchdog:** a recovery hold left by a hand-off ("Automatic recovery blocked", with the issue marked blocked and a saved message waiting) is released by delivering the saved messages to the current owner, as the board's Interrupt button does. Only when the held run was cancelled by a reassignment, and only with `WATCHDOG_RETRY_DEFERRED` on; any other hold is reported once and left to you.
 - **Watchdog:** the failed-clean-up repair waits while the issue's assignee is paused, terminated or awaiting approval. Moving the issue to `todo` for an agent Paperclip can't invoke made its recovery block the issue again for a board decision.
 - **`pch why`:** shows an execution hold and its next action, and says "none linked" instead of "all done" when an issue has no blockers.

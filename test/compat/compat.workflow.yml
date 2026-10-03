@@ -1,0 +1,40 @@
+name: Paperclip compatibility
+
+# The helper's own code against real Paperclip releases (test/compat).
+# The daily run is what notices a new Paperclip release that breaks the helper.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Paperclip version to check (an npm version or tag of paperclipai, e.g. 2026.1001.0 or canary). Empty: the usual list."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  compat:
+    name: Paperclip ${{ matrix.paperclip }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Releases known to pass, plus whatever is latest today.
+        paperclip: ${{ fromJSON(inputs.version && format('["{0}"]', inputs.version) || '["2026.916.1", "2026.1001.0", "latest"]') }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Compatibility suite
+        env:
+          PAPERCLIP_VERSION: ${{ matrix.paperclip }}
+        run: npm run test:compat -- "$PAPERCLIP_VERSION"

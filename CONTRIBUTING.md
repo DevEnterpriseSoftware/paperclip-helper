@@ -22,7 +22,9 @@ test/
   fake-paperclip.mjs   an in-memory Paperclip for the tests
   helpers.mjs          shared test set-up
   *.test.mjs
+  compat/              the same code against a real Paperclip, one version at a time
 docs/paperclip-internals.md   the Paperclip API facts the helper relies on
+docs/*.md                     the user guides the README links to (install, relay, watchdog, cost sync, commands, troubleshooting)
 install.sh, install.ps1       the installers
 ```
 
@@ -42,6 +44,28 @@ npm test                     # the whole suite, against the fake Paperclip
 node src/index.mjs help      # the CLI, with settings from your environment
 docker build -t paperclip-helper:dev .
 ```
+
+## Checking a Paperclip version
+
+```bash
+npm run test:compat                      # Paperclip's latest release
+npm run test:compat -- 2026.1001.0       # one version, or several
+npm run test:compat -- --keep latest     # leave it running afterwards
+```
+
+This downloads that Paperclip from npm (`npx paperclipai@<version>`), starts it with its embedded PostgreSQL in a temporary directory on a free port, runs `test/compat/compat.test.mjs` against it, and removes it. It never touches a Paperclip you already run. It needs what Paperclip needs: Node 24.11 or newer for the 2026.9 releases, and a user that isn't root. On Windows, run it in WSL.
+
+The suite seeds a company with `process`-adapter agents (a shell one-liner each), so runs, wakes and comment queues are real and no model is called. It checks three things:
+
+1. Paperclip's OpenAPI document still lists every endpoint the helper calls.
+2. Each response carries the fields the helper reads, and each write behaves as the helper assumes.
+3. `login`, the watchdog, the relay, cost sync and the commands work end to end. For example, a hand-off whose wake Paperclip dropped is nudged, and the nudge starts the new owner's run.
+
+To run it against a Paperclip you started yourself, set `PAPERCLIP_COMPAT_API`. That instance must be in `local_trusted` mode and hold no companies of your own: the suite refuses to run otherwise.
+
+The same suite runs in CI on every push, and daily against Paperclip's latest release (`.github/workflows/compat.yml`). When a new Paperclip passes, add its version to that workflow's list. When the helper calls a new endpoint, the suite's last test fails until you add it to `HELPER_ENDPOINTS`.
+
+What it can't reproduce are failures that need real infrastructure: an environment lease that is refused, a failed `workspace_finalize`, a recovery hold, and subscription runs with usage. Those stay covered by the fake server's tests and by `pch why` on a live instance.
 
 To try a local image with the installer, set `PCH_IMAGE=paperclip-helper:dev`; the installer uses a local image when it can't pull one.
 
