@@ -53,7 +53,7 @@ The installer shows everything before it writes it, and you can re-run it at any
    - **Cost sync** (default: yes): it shows `pch costs` first, and whether to include runs that already finished.
 7. **Writes `compose.yml`, `.env` (mode 600 on Linux and macOS) and `data/`**, then starts the service and shows its first log lines.
 8. **Sets up the webhook.** It checks your public webhook URL. It can create the GitHub webhook with `gh`; otherwise it prints the manual steps.
-9. **Adds the `pch` command:** an alias in `~/.zshrc` or `~/.bashrc` (`~/.bash_profile` on macOS), or a function in your PowerShell profile.
+9. **Adds the `pch` command:** it writes `pch.sh` (or `pch.ps1`) to the install directory, and points an alias in `~/.zshrc` or `~/.bashrc` (`~/.bash_profile` on macOS), or a function in your PowerShell profile, at it.
 
 ### Unattended install
 
@@ -88,6 +88,8 @@ curl -fsSL https://raw.githubusercontent.com/DevEnterpriseSoftware/paperclip-hel
 chmod 600 .env && nano .env                 # PAPERCLIP_API, PAPERCLIP_PUBLIC_URL, PCH_UID/PCH_GID (id -u / id -g)
 docker compose run --rm helper login        # approve the link in Paperclip
 docker compose up -d
+docker run --rm ghcr.io/deventerprisesoftware/paperclip-helper:1 wrapper sh > pch.sh   # the pch command, with pch update
+echo "alias pch='sh \"$HOME/paperclip-helper/pch.sh\"'" >> ~/.bashrc
 ```
 
 ## The relay: GitHub → your decisions in Paperclip
@@ -177,6 +179,8 @@ Each nudge mentions the assignee and says what stalled. Each situation gets at m
 
 With `WATCHDOG_RETRY_DEFERRED` on, the watchdog also presses Paperclip's own **send queued messages now** for that issue, at most `WATCHDOG_MAX_NUDGES` times, spaced by the stall window. Paperclip then retries the stopped run's lease clean-up once and re-sends the saved comments. The watchdog does this only when the deferred wake carries saved comments and targets no running run, so it never interrupts work. A lease that was never released, or an old process that's still alive, needs a manual look. This retry has been checked against Paperclip's source but not yet against a live instance.
 
+**Recovery holds left by a hand-off.** Paperclip's recovery can give up on a run that was cancelled when the issue changed hands. The issue then shows "Automatic recovery blocked" with "Board decision required", is marked blocked with no blocker linked, and its saved messages wait. With `WATCHDOG_RETRY_DEFERRED` on, the watchdog releases that hold the way the board's **Interrupt** button does: it delivers the saved messages to the current owner, at most `WATCHDOG_MAX_NUDGES` times per hold. It only does this when the held run was cancelled by a reassignment. A hold with any other cause means Paperclip is unsure what the run did; the watchdog logs it once and leaves the decision to you. `pch why ISSUE` shows the hold and its next action.
+
 | Setting | Default | Meaning |
 |---|---|---|
 | `WATCHDOG` | `true` | `false` turns it off. |
@@ -235,7 +239,7 @@ Acme: not yet synced (412 runs already synced)
 
 ## Commands
 
-With the alias, `pch <command>` runs a throwaway container next to the service (`docker compose run --rm helper <command>`).
+`pch <command>` runs a throwaway container next to the service (`docker compose run --rm helper <command>`). The exception is `pch update`, which runs on the host, because the container can't pull its own image.
 
 | Command | What it does |
 |---|---|
@@ -251,6 +255,7 @@ With the alias, `pch <command>` runs a throwaway container next to the service (
 | `pch set-model FROM TO [--apply]` | Moves every agent on model `FROM` to `TO`. It previews unless you pass `--apply`. |
 | `pch login`, `pch revoke` | Create the helper's key; revoke and delete it. |
 | `pch secret` | Prints a random webhook secret. |
+| `pch update` | Updates the helper to the latest release of its major version, and restarts it (see [Upgrading](#upgrading)). It doesn't update Paperclip. |
 | `pch version`, `pch help` | Version, and this list. |
 
 ### `set-model`: every model and effort level
@@ -352,11 +357,21 @@ GitHub needs HTTPS access to **one path**, `RELAY_PATH`, forwarded to the relay'
 
 ## Upgrading
 
+```text
+$ pch update
+Pulling ghcr.io/deventerprisesoftware/paperclip-helper:1
+Updated Paperclip Helper: 1.0.2 → 1.1.0.
+```
+
+`pch update` pulls the image, restarts the service if the image changed, and refreshes the `pch` script itself. If the service is stopped, it only pulls, and leaves it stopped. It updates the helper only, never Paperclip.
+
+Without `pch` (a manual install, or a `pch` from an installer older than 1.1):
+
 ```bash
 cd ~/paperclip-helper && docker compose pull && docker compose up -d
 ```
 
-`.env` and `data/` are untouched. `compose.yml` follows the `:1` tag, so upgrades stay within version 1. To pin an exact version, set `PCH_IMAGE=ghcr.io/deventerprisesoftware/paperclip-helper:1.0.0` in `.env`. Re-run the installer to pick up settings added in newer versions.
+`.env` and `data/` are untouched. `compose.yml` follows the `:1` tag, so upgrades stay within version 1. To pin an exact version, set `PCH_IMAGE=ghcr.io/deventerprisesoftware/paperclip-helper:1.0.0` in `.env`; `pch update` then follows that tag. Re-run the installer to pick up settings added in newer versions, and once to get `pch update` if your `pch` predates it.
 
 ## Uninstalling
 

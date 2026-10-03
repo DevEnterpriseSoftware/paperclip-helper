@@ -27,30 +27,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: shellcheck install.sh
-        run: shellcheck install.sh
-      - name: bash -n install.sh
-        run: bash -n install.sh
-      - name: Parse install.ps1 (PowerShell 7)
+      - name: shellcheck install.sh and pch.sh
+        run: shellcheck install.sh bin/pch.sh
+      - name: bash -n install.sh, sh -n pch.sh
+        run: bash -n install.sh && sh -n bin/pch.sh
+      - name: Parse install.ps1 and pch.ps1 (PowerShell 7)
         shell: pwsh
         run: |
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
-          if ($errors) { $errors | Format-List; exit 1 }
+          foreach ($file in @("$PWD/install.ps1", "$PWD/bin/pch.ps1")) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { $errors | Format-List; exit 1 }
+          }
 
   installers-windows:
     name: Installer checks (Windows PowerShell 5.1)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Parse install.ps1
+      - name: Parse install.ps1 and pch.ps1
         shell: powershell
         run: |
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile("$PWD\install.ps1", [ref]$null, [ref]$errors) | Out-Null
-          if ($errors) { $errors | Format-List; exit 1 }
-          $bytes = [System.IO.File]::ReadAllBytes("$PWD\install.ps1")
-          if ($bytes | Where-Object { $_ -gt 127 }) { Write-Error "install.ps1 must be ASCII for Windows PowerShell 5.1"; exit 1 }
+          foreach ($file in @("$PWD\install.ps1", "$PWD\bin\pch.ps1")) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { $errors | Format-List; exit 1 }
+            $bytes = [System.IO.File]::ReadAllBytes($file)
+            if ($bytes | Where-Object { $_ -gt 127 }) { Write-Error "$file must be ASCII for Windows PowerShell 5.1"; exit 1 }
+          }
 
   image:
     name: Image builds and runs
@@ -68,4 +72,5 @@ jobs:
         run: |
           test "$(docker run --rm paperclip-helper:ci version)" = "ci"
           docker run --rm paperclip-helper:ci help | grep -q "pch why ISSUE"
+          docker run --rm --network none paperclip-helper:ci wrapper sh | cmp - bin/pch.sh
           docker run --rm --user 1000:1000 paperclip-helper:ci probe http://127.0.0.1:1 | grep -q '"ok":false'

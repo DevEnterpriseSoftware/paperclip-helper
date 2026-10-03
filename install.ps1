@@ -231,8 +231,19 @@ $network
     }
   }
 
-  function Install-Alias {
-    $line = "function pch { docker compose -f `"$(Join-Path $Dir 'compose.yml')`" run --rm helper @args }"
+  # pch.ps1 comes from the image. `pch update` runs it on the host; every other command
+  # goes to the container. An image older than 1.1 doesn't have it.
+  function Write-Wrapper {
+    $text = @(& docker run --rm --network none $Image wrapper ps1 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $text.Count -eq 0) { return $false }
+    # With a BOM, like the profile, for Windows PowerShell 5.1.
+    [System.IO.File]::WriteAllText($wrapperPath, (($text -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding $true))
+    return $true
+  }
+
+  function Install-Alias([bool]$Wrapper) {
+    $line = if ($Wrapper) { "function pch { & `"$wrapperPath`" @args }" }
+    else { "function pch { docker compose -f `"$composePath`" run --rm helper @args }" }
     $profiles = @($PROFILE.CurrentUserCurrentHost)
     if ($OnWindows) {
       $docs = [Environment]::GetFolderPath('MyDocuments')
@@ -345,6 +356,7 @@ $network
   $Dir = (Resolve-Path $Dir).Path
   $envPath = Join-Path $Dir '.env'
   $composePath = Join-Path $Dir 'compose.yml'
+  $wrapperPath = Join-Path $Dir 'pch.ps1'
   Read-ExistingEnv $envPath
   if (Test-Path $envPath) { Note 'Found an existing install: its settings are the defaults.' }
   $script:Settings = @{}
@@ -524,9 +536,11 @@ $network
   }
 
   Step 'The pch command'
-  if (-not $env:PCH_NO_ALIAS) { Install-Alias }
+  $hasWrapper = Write-Wrapper
+  if (-not $env:PCH_NO_ALIAS) { Install-Alias $hasWrapper }
   # Usable in this window too.
-  $pchBody = [scriptblock]::Create("docker compose -f `"$composePath`" run --rm helper @args")
+  $pchBody = if ($hasWrapper) { [scriptblock]::Create("& `"$wrapperPath`" @args") }
+  else { [scriptblock]::Create("docker compose -f `"$composePath`" run --rm helper @args") }
   Set-Item -Path Function:global:pch -Value $pchBody
 
   Step 'Done'
@@ -534,7 +548,8 @@ $network
   Say '  pch status         what it is doing'
   Say '  pch why ISSUE-1    why nobody is working on an issue'
   Say '  pch help           every command'
-  Say "Upgrade:   cd `"$Dir`"; docker compose pull; docker compose up -d"
+  if ($hasWrapper) { Say 'Update:    pch update' }
+  else { Say "Update:    cd `"$Dir`"; docker compose pull; docker compose up -d" }
   Say "Settings:  re-run this installer, or edit $envPath and run docker compose up -d"
 }
 

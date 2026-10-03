@@ -24,6 +24,7 @@ export const USAGE = `Paperclip Helper
   pch login                    create the helper's board API key (approve it in the browser)
   pch revoke                   revoke the key and delete it
   pch secret                   print a random webhook secret for GITHUB_WEBHOOK_SECRET
+  pch update                   update the helper to the latest release of its major version
   pch version                  print the version
 
 Settings come from .env; see https://github.com/DevEnterpriseSoftware/paperclip-helper`;
@@ -173,8 +174,9 @@ export async function why(ctx, identifier) {
   if (blockers?.diagnosis && blockers.diagnosis !== wakes?.diagnosis) out(`Blocker diagnosis: ${blockers.diagnosis}`);
   const r = blockers?.readiness;
   if (r) {
+    const linked = (blockers?.blockers ?? []).length;
     out(
-      `Blockers: ${r.allBlockersDone ? "all done" : `${r.unresolvedBlockerCount} unresolved`}` +
+      `Blockers: ${!linked ? "none linked" : r.allBlockersDone ? "all done" : `${r.unresolvedBlockerCount} unresolved`}` +
         `${r.pendingFinalizeBlockerCount ? `, ${r.pendingFinalizeBlockerCount} waiting on workspace finalization` : ""}` +
         `; dependency ready: ${r.isDependencyReady ? "yes" : "no"}`,
     );
@@ -197,6 +199,12 @@ export async function why(ctx, identifier) {
   const full = await api.request("GET", `/api/issues/${id}`).catch(() => null);
   const assignee = await nameOf(full?.assigneeAgentId);
   if (assignee) out(`Assignee: ${assignee}`);
+  const hold = full?.executionBlocker;
+  if (hold) {
+    // Paperclip's recovery is holding the issue: new runs are refused until it's released.
+    out(`Execution hold: ${hold.cause ?? "unknown cause"}${hold.runId ? `, source run ${String(hold.runId).slice(0, 8)}` : ""}`);
+    if (hold.nextAction) out(`  Next action: ${hold.nextAction}`);
+  }
   const recent = (wakes?.events ?? []).filter((e) => e.kind === "wake_request").slice(0, 5).reverse();
   if (recent.length) {
     out("Latest wake requests:");
@@ -418,4 +426,22 @@ export async function prefixes(ctx) {
 
 export function secret() {
   console.log(crypto.randomBytes(32).toString("hex"));
+}
+
+// `pch update` is handled by the host-side pch.sh / pch.ps1, because this container
+// can't pull its own image. Reaching this means pch runs the container directly:
+// an alias from an installer older than 1.1, or a manual install.
+export function update() {
+  out("pch update runs on the host, and your pch command starts the helper's container directly.");
+  out("Re-run the installer once to get the pch command that can update the helper:\n");
+  out("  curl -fsSL https://raw.githubusercontent.com/DevEnterpriseSoftware/paperclip-helper/main/install.sh | bash");
+  out("  irm https://raw.githubusercontent.com/DevEnterpriseSoftware/paperclip-helper/main/install.ps1 | iex   # Windows\n");
+  out("Or update now, in the directory with compose.yml:\n");
+  out("  docker compose pull && docker compose up -d");
+}
+
+// For the installer and `pch update`: the host-side pch script, `sh` or `ps1`.
+export function wrapperScript(kind) {
+  if (kind !== "sh" && kind !== "ps1") throw new Error("usage: wrapper sh|ps1");
+  return fs.readFileSync(new URL(`../bin/pch.${kind}`, import.meta.url), "utf8");
 }

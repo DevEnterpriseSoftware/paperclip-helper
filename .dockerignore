@@ -1,4 +1,5 @@
 *
 !src/
+!bin/
 !package.json
 !LICENSE

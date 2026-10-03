@@ -452,3 +452,93 @@ test("finalize failures younger than the stall window, or healing turned off, ar
   await off.tick();
   assert.equal(env.db.patches.length, 0);
 });
+
+// DIR-86: Paperclip's recovery gave up on a run cancelled at a hand-off and marked
+// the issue blocked, with no linked blocker and a saved message waiting.
+function recoveryHold(env, { errorCode = "issue_reassigned" } = {}) {
+  const { engineer, reviewer } = agents(env.db);
+  const source = { runId: uuid(), agentId: reviewer.id, status: "cancelled", errorCode, createdAt: minutesAgo(4000), finishedAt: minutesAgo(4000) };
+  const issue = {
+    id: uuid(),
+    identifier: "ACM-86",
+    companyId: ids.company,
+    status: "blocked",
+    assigneeAgentId: engineer.id,
+    updatedAt: minutesAgo(60),
+    executionBlocker: { recoveryActionId: uuid(), runId: source.runId, agentId: reviewer.id, cause: "automatic_recovery_blocked", nextAction: "Inspect the evidence" },
+  };
+  env.db.issues.push(issue);
+  env.db.issueRuns[issue.id] = [
+    { runId: uuid(), agentId: engineer.id, status: "succeeded", createdAt: minutesAgo(2500), finishedAt: minutesAgo(2490) },
+    source,
+  ];
+  // The saved message's wake predates the engineer's later run, and is still the live queue.
+  env.db.wakes[issue.id] = [{ kind: "wake_request", agentId: engineer.id, status: "deferred_issue_execution", reason: "issue_assigned", requestedAt: minutesAgo(3900) }];
+  env.db.blockerDiagnostics[issue.id] = { readiness: { allBlockersDone: true, unresolvedBlockerCount: 0 }, blockers: [] };
+  env.db.queuedComments[issue.id] = {
+    issueId: issue.id,
+    queueId: uuid(),
+    state: "deferred",
+    targetRunId: null,
+    revision: "rev-1",
+    protocol: "legacy",
+    entries: [{ comment: { id: uuid(), body: "Hand-off to Software Architect" }, position: 0 }],
+    executionWait: { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." },
+  };
+  return { issue, source };
+}
+
+test("a recovery hold left by a hand-off is released by delivering the saved messages, capped and spaced", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue, source } = recoveryHold(env);
+
+  await env.watchdog.tick();
+  assert.equal(env.db.interrupts.length, 1);
+  assert.deepEqual(env.db.interrupts[0].body, { queueId: env.db.queuedComments[issue.id].queueId, revision: "rev-1", targetRunId: null });
+  assert.equal(env.db.comments.length, 0);
+
+  // Still held on the next ticks: not again within the stall window, then once more, then never.
+  await env.watchdog.tick();
+  assert.equal(env.db.interrupts.length, 1);
+  const key = `hold:${issue.id}:${source.runId}`;
+  const age = () => env.state.nudges.set(key, { ...env.state.nudges.get(key), at: Date.now() - 10 * 60_000 });
+  age();
+  await env.watchdog.tick();
+  assert.equal(env.db.interrupts.length, 2);
+  age();
+  await env.watchdog.tick();
+  assert.equal(env.db.interrupts.length, 2);
+});
+
+test("a recovery hold with any other cause, a running run, or retries turned off is left to the board", async (t) => {
+  const env = await watchdogEnv(t);
+  const uncertain = recoveryHold(env, { errorCode: "process_lost" });
+  await env.watchdog.tick();
+  await env.watchdog.tick();
+  assert.equal(env.db.interrupts.length, 0);
+  const reports = env.logs.filter((l) => l.msg === "watchdog: the issue is held for recovery and needs a board decision");
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].issue, uncertain.issue.identifier);
+  assert.equal(reports[0].sourceRunError, "process_lost");
+
+  const env2 = await watchdogEnv(t);
+  const busy = recoveryHold(env2);
+  env2.db.issueRuns[busy.issue.id].push({ runId: uuid(), agentId: busy.issue.assigneeAgentId, status: "running", createdAt: minutesAgo(1) });
+  await env2.watchdog.tick();
+  assert.equal(env2.db.interrupts.length, 0);
+
+  const env3 = await watchdogEnv(t, { WATCHDOG_RETRY_DEFERRED: "false" });
+  recoveryHold(env3);
+  await env3.watchdog.tick();
+  assert.equal(env3.db.interrupts.length, 0);
+  assert.equal(env3.logs.filter((l) => l.msg === "watchdog: the issue is held for recovery and needs a board decision").length, 1);
+});
+
+test("a blocked issue with no linked blocker and no recovery hold is left alone", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue } = recoveryHold(env);
+  issue.executionBlocker = null; // an agent blocked it with a note of its own
+  await env.watchdog.tick();
+  assert.equal(env.db.interrupts.length, 0);
+  assert.equal(env.db.comments.length, 0);
+});

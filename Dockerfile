@@ -18,6 +18,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 COPY package.json LICENSE ./
 COPY src ./src
+COPY bin ./bin
 RUN mkdir -p /data && chown node:node /data
 
 USER node

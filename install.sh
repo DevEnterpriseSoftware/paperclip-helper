@@ -240,13 +240,28 @@ show_file() {
   sed -e "s/^\(GITHUB_WEBHOOK_SECRET=\).\{8,\}$/\1$(mask "$GITHUB_WEBHOOK_SECRET")/" "$2" | sed 's/^/  /'
 }
 
+# pch.sh comes from the image. `pch update` runs it on the host; every other command
+# goes to the container. An image older than 1.1 doesn't have it.
+write_wrapper() {
+  if docker run --rm --network none "$IMAGE" wrapper sh >"$DIR/pch.sh.new" </dev/null 2>/dev/null && [ -s "$DIR/pch.sh.new" ]; then
+    mv "$DIR/pch.sh.new" "$DIR/pch.sh"
+  else
+    rm -f "$DIR/pch.sh.new"
+    return 1
+  fi
+}
+
 install_alias() {
   local rc="" line
   case "${SHELL:-}" in
     */zsh) rc="$HOME/.zshrc" ;;
     */bash) rc="$HOME/.bashrc"; [ "$(uname -s)" = Darwin ] && rc="$HOME/.bash_profile" ;;
   esac
-  line="alias pch='docker compose -f \"$DIR/compose.yml\" run --rm helper'"
+  if write_wrapper; then
+    line="alias pch='sh \"$DIR/pch.sh\"'"
+  else
+    line="alias pch='docker compose -f \"$DIR/compose.yml\" run --rm helper'"
+  fi
   if [ -z "$rc" ]; then
     note "Add this alias to your shell's startup file: $line"
     return
@@ -540,14 +555,18 @@ main() {
   fi
 
   step "The pch command"
-  if [ -z "${PCH_NO_ALIAS:-}" ]; then install_alias; fi
+  if [ -z "${PCH_NO_ALIAS:-}" ]; then install_alias; else write_wrapper || true; fi
 
   step "Done"
   say "The helper runs in the background and restarts with Docker. Try:"
   say "  pch status         what it's doing"
   say "  pch why ISSUE-1    why nobody is working on an issue"
   say "  pch help           every command"
-  say "Upgrade:   cd $DIR && docker compose pull && docker compose up -d"
+  if [ -f "$DIR/pch.sh" ]; then
+    say "Update:    pch update"
+  else
+    say "Update:    cd $DIR && docker compose pull && docker compose up -d"
+  fi
   say "Settings:  re-run this installer, or edit $DIR/.env and run docker compose up -d"
 }
 

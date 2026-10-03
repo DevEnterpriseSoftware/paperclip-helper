@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0
+
+- **Watchdog:** a recovery hold left by a hand-off ("Automatic recovery blocked", with the issue marked blocked and a saved message waiting) is released by delivering the saved messages to the current owner, as the board's Interrupt button does. Only when the held run was cancelled by a reassignment, and only with `WATCHDOG_RETRY_DEFERRED` on; any other hold is reported once and left to you.
+- **`pch why`:** shows an execution hold and its next action, and says "none linked" instead of "all done" when an issue has no blockers.
+- **`pch update`:** updates the helper to the latest release of its major version, restarts it if the image changed, and refreshes the `pch` script itself. It runs on the host, so the installer now writes `pch.sh` (or `pch.ps1`) to the install directory and points `pch` at it. Re-run the installer once to get it. It doesn't update Paperclip.
+
 ## 1.0.2
 
 - **Watchdog:** a run Paperclip cancelled before it started (`execution_reconciliation_required`, after a hand-off) no longer counts as the owner having picked the issue up. Once the hold has cleared, the owner is nudged; while it is still in place, the watchdog waits.

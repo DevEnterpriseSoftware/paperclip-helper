@@ -159,3 +159,21 @@ test("check shows the key, its companies and prefixes", async (t) => {
   assert.match(lines, /Company: Acme \(issue prefix ACM\)/);
   assert.ok(path.isAbsolute(env.ctx.config.tokenFile));
 });
+
+test("update explains that it runs on the host, and how to get there", async () => {
+  const text = (await captureOutput(() => cmd.update())).join("\n");
+  assert.match(text, /install\.sh \| bash/);
+  assert.match(text, /docker compose pull && docker compose up -d/);
+});
+
+test("wrapper prints the host-side pch scripts, which handle update and pass the rest on", () => {
+  for (const kind of ["sh", "ps1"]) {
+    const script = cmd.wrapperScript(kind);
+    assert.match(script, /update/);
+    assert.match(script, /run --rm helper/);
+    assert.match(script, new RegExp(`wrapper ${kind}`), `pch.${kind} refreshes itself`);
+  }
+  assert.match(cmd.wrapperScript("sh"), /^#!\/bin\/sh\n/);
+  assert.ok(![...cmd.wrapperScript("ps1")].some((c) => c.charCodeAt(0) > 127), "pch.ps1 is ASCII for Windows PowerShell 5.1");
+  assert.throws(() => cmd.wrapperScript("bat"), /wrapper sh\|ps1/);
+});

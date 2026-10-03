@@ -27,6 +27,13 @@
 //    clean-up attempt on the run's environment lease, then re-sends the saved
 //    comments. It never interrupts a running run.
 //
+// 5. Recovery holds left by a hand-off. Paperclip's recovery can give up on a
+//    run that was cancelled when the issue changed hands ("Automatic recovery
+//    blocked", board decision required) and mark the issue blocked, with the
+//    saved messages waiting. With WATCHDOG_RETRY_DEFERRED on, the watchdog
+//    delivers them to the current owner, as the board's Interrupt button does.
+//    A hold with any other cause is only reported: that decision stays yours.
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
@@ -55,6 +62,8 @@ const record = {
   retry: (issue) => `retry:${issue.id}`, // "send queued messages now" presses
   retrySkipped: (issue) => `retry-skip:${issue.id}`, // a deferred wake with nothing to re-send, reported once
   stuck: (issue, wake) => `stuck:${issue.id}:${wake.requestedAt}`, // a deferred wake, reported once
+  hold: (issue, runId) => `hold:${issue.id}:${runId}`, // presses to release a hand-off's recovery hold
+  holdReported: (issue, runId) => `hold-report:${issue.id}:${runId}`, // a hold left to the board, reported once
 };
 
 export function createWatchdog(ctx, state) {
@@ -110,8 +119,7 @@ export function createWatchdog(ctx, state) {
   }
 
   // Paperclip's "send queued messages now" for a deferred queue of saved comments.
-  async function retryDeferred(issue) {
-    const key = record.retry(issue);
+  async function retryDeferred(issue, key = record.retry(issue)) {
     const prior = records.get(key);
     const count = prior?.count ?? 0;
     if (count >= config.watchdogMaxNudges || (prior && now() - prior.at < stallMs)) return;
@@ -157,6 +165,35 @@ export function createWatchdog(ctx, state) {
     } catch (err) {
       log.warn("watchdog: Paperclip refused to retry the deferred wake", { issue: who, retry: count + 1, error: err.message });
     }
+  }
+
+  // Paperclip's recovery can hold an issue ("Automatic recovery blocked", board
+  // decision required), and mark it blocked, when the run it wanted to retry was
+  // cancelled at a hand-off and its agent can no longer be invoked. The saved
+  // messages then wait forever. For that one cause the cancelled run did nothing
+  // that needs reconciling, so deliver the saved messages to the current owner,
+  // as the board's Interrupt button does (DIR-86). Any other cause means Paperclip
+  // is unsure what the run did: that stays the board's call, and is logged once.
+  async function releaseHandOffHold(issue, blocker, runs) {
+    const who = issue.identifier ?? issue.id;
+    const runId = blocker.runId ?? "unknown";
+    const source = (Array.isArray(runs) ? runs : []).find((r) => (r.runId ?? r.id) === blocker.runId);
+    const fromHandOff = source?.status === "cancelled" && source.errorCode === "issue_reassigned";
+    if (!fromHandOff || !config.watchdogRetryDeferred) {
+      const key = record.holdReported(issue, runId);
+      if (records.has(key)) return;
+      records.set(key, { count: 1, at: now() });
+      state.touch();
+      log.warn("watchdog: the issue is held for recovery and needs a board decision", {
+        issue: who,
+        cause: blocker.cause ?? null,
+        sourceRun: blocker.runId ?? null,
+        sourceRunError: source?.errorCode ?? null,
+        nextAction: blocker.nextAction ?? null,
+      });
+      return;
+    }
+    await retryDeferred(issue, record.hold(issue, runId));
   }
 
   function reportStuck(issue, wake, runs) {
@@ -212,10 +249,7 @@ export function createWatchdog(ctx, state) {
       // While the hold is still in place, a comment's run would be refused too.
       const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
       if (full?.executionBlocker) {
-        log.debug("watchdog: the issue is held for reconciliation; a comment can't help yet", {
-          issue: issue.identifier ?? issue.id,
-          cause: full.executionBlocker.cause ?? null,
-        });
+        await releaseHandOffHold(issue, full.executionBlocker, runs);
         return null;
       }
     }
@@ -363,6 +397,15 @@ export function createWatchdog(ctx, state) {
           if (await healFailedFinalize(issue, diag, agents)) return;
         }
         if (!quiet(issue)) return;
+        if (!(Array.isArray(diag.blockers) ? diag.blockers : []).length) {
+          // Blocked with no linked blocker: by an agent's own note, or by a recovery hold.
+          const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+          if (!full?.executionBlocker) return;
+          const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
+          if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return;
+          await releaseHandOffHold(issue, full.executionBlocker, runs);
+          return;
+        }
         const idle = await unblockedButIdle(issue, diag, agents);
         if (!idle) return;
         await nudge(

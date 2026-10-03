@@ -146,6 +146,8 @@ async function main() {
     probe: () => cmd.probe(ctx, arg),
     prefixes: () => cmd.prefixes(ctx),
     secret: () => cmd.secret(),
+    update: () => cmd.update(),
+    wrapper: () => process.stdout.write(cmd.wrapperScript(arg)),
     version: () => console.log(VERSION),
     help: () => console.log(cmd.USAGE),
   };
