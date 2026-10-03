@@ -114,6 +114,11 @@ The rule lives in `server/src/services/issue-execution-policy.ts`:
     - If `targetRunId` is a running run, it is **cancelled**. Otherwise `resumeQueuedCommentInterrupt(…, { retryCleanup: true })` gives the blocking run's `pending_cleanup` leases one cleanup attempt past the sweep's cap (`sweepPendingCleanupLeases({ explicitRetry })`, `services/heartbeat.ts`), then re-enqueues the comments as `issue_commented`, which still passes every admission gate.
     - It doesn't help a lease that was never released (`releasedAt` null, not `pending_cleanup`) or a process that is still alive: the new wake is deferred again.
     - The route still exists on `main` at `467125f` (2026-09-30).
+- **Recovery actions** (live, 2026.916.1): Paperclip's recovery sweep parks an assigned issue it can't make progress on by recording a row in `issue_recovery_actions` and moving the issue to `blocked`, with no blocker relation.
+  - `GET /api/issues/:id/recovery-actions` returns `{ active, actions }`. `active` has `id`, `kind`, `cause`, `status`, `ownerType`, `nextAction`, `evidence { latestRunId, latestRunStatus, previousStatus, … }`, `wakePolicy` and `createdAt`.
+  - `kind: "stranded_assigned_issue"` with `ownerType: "board"` is "Automatic recovery blocked … the original assignee is not invokable": the assignee, or an agent above it, was paused, terminated or awaiting approval when the sweep ran (`evaluateAgentInvokability`, `services/agent-invokability.ts`).
+  - **It is not an execution hold.** The issue's `executionBlocker` stays null, and new runs are admitted. A board user's comment moves the issue out of `blocked` and wakes the assignee. (live: `pch comment` started a run within 20 seconds)
+  - `GET /api/issues/:id/comments?order=desc&limit=N` lists comments newest first, with `body`, `authorAgentId`, `authorUserId` and `createdAt`.
 - **The hand-off bug** ([#13880](https://github.com/paperclipai/paperclip/pull/13880), related [#13769](https://github.com/paperclipai/paperclip/pull/13769); both still open on 2026-09-30):
   - An issue changing hands cancels the finishing run (`issue_reassigned`).
   - That run keeps its environment lease for a minute or two.

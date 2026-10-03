@@ -30,6 +30,7 @@ export function emptyDb() {
     wakes: {}, // issueId → [{ kind, agentId, status, reason, requestedAt }], newest first
     queuedComments: {}, // issueId → { queueId, state, protocol, revision, targetRunId, entries }
     interrupts: [], // { issueId, body }
+    recoveryActions: {}, // issueId → the active recovery action
     blockerDiagnostics: {}, // issueId → { readiness, blockers }
     workProducts: {}, // issueId → [...]
     workspaceOps: {}, // workspaceId → [...]
@@ -255,6 +256,15 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         if (queue.revision !== body.revision) return send(409, { error: "The queued messages changed in another session" });
         db.interrupts.push({ issueId: issue.id, body });
         return send(200, queue);
+      }
+      if (rest === "/recovery-actions" && req.method === "GET") {
+        const active = db.recoveryActions[issue.id] ?? null;
+        return send(200, { active, actions: active ? [active] : [] });
+      }
+      if (rest === "/comments" && req.method === "GET") {
+        // Newest first, like ?order=desc.
+        const list = db.comments.filter((c) => c.issueId === issue.id).slice().reverse();
+        return send(200, list.slice(0, Number(q.get("limit") ?? 50)));
       }
       if (rest === "/diagnostics/blockers") {
         return send(200, db.blockerDiagnostics[issue.id] ?? { readiness: null, blockers: [] });

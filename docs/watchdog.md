@@ -1,6 +1,6 @@
 # The watchdog: wake stalled work
 
-Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for five situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment.
+Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for six situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment.
 
 | In Paperclip you see… | The watchdog… |
 |---|---|
@@ -9,6 +9,7 @@ Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog 
 | A blocked issue whose only blocker is done but **"finalizing"** forever. | Removes that blocker, moves the issue to `todo` and explains why. |
 | **"Waiting for execution recovery. Your message is saved."** | Presses Paperclip's **send queued messages now** for it. |
 | **"Automatic recovery blocked"**, board decision required, after a hand-off. | Delivers the saved messages to the current owner, as **Interrupt** does. |
+| **"Automatic recovery blocked … the original assignee is not invokable"**, after you paused and resumed an agent. | Comments on the issue once the agent is back, which un-parks it and wakes the agent. |
 
 ## 1. Dropped hand-offs
 
@@ -59,6 +60,19 @@ Paperclip's recovery can give up on a run that was cancelled when the issue chan
 
 Pressing **Interrupt** by hand releases such a hold on Paperclip 2026.916.1. The watchdog's own press, in 4 and 5, has been checked against Paperclip's source and the test suite, not yet against a live instance.
 
+## 6. Issues parked because the assignee couldn't be run
+
+Paperclip's recovery sweep looks for assigned issues that nothing is working on. When it finds one whose agent it can't invoke, it gives up: it records a recovery action for the board (`stranded_assigned_issue`), marks the issue blocked with no blocker linked, and shows "Automatic recovery blocked: the original assignee is not invokable". The usual cause is that you paused the agent, for a migration or an upgrade, and the sweep ran before you resumed it. A run cut off by a hand-off can strand an issue the same way.
+
+Nothing un-parks the issue when the agent comes back. A comment from a board user is the decision Paperclip is waiting for: it moves the issue out of blocked and wakes the assignee. So once the agent is available and the issue has been quiet for the stall window, the watchdog:
+
+- delivers the issue's saved messages, if it has any (with `WATCHDOG_RETRY_DEFERRED` on), as in 5;
+- otherwise posts a nudge that says why the issue was parked.
+
+It waits while the agent is paused, terminated or awaiting approval, and while any run is active on the issue. A recovery action of any other kind, such as a stalled review, asks for a judgement about who continues. The watchdog logs it once and leaves it to you; `pch why ISSUE` prints the kind, Paperclip's next action, and a recommendation.
+
+A comment clearing a parked issue was verified by hand on Paperclip 2026.916.1.
+
 ## Limits
 
 Each nudge mentions the assignee and says what stalled. Each situation gets at most `WATCHDOG_MAX_NUDGES` comments or presses, spaced by the stall window. The counts are kept in `data/state.json`, so a restart doesn't repeat them.
@@ -68,7 +82,7 @@ Each nudge mentions the assignee and says what stalled. Each situation gets at m
 These look similar in Paperclip, and `pch why ISSUE` tells them apart:
 
 - **An agent waiting on you.** An issue an agent blocked with a note of its own, such as a pending approval or a missing permission, has no blocker linked. Paperclip can keep waking the agent, which re-checks and stops again, a run each time. Decide the approval, or pause the issue.
-- **A recovery hold with another cause,** or one with no saved message to deliver. A message from you to the agent is the board decision Paperclip is waiting for.
+- **A recovery hold or recovery action of another kind,** such as a stalled review. A message from you to the agent is the board decision Paperclip is waiting for.
 - **A run that stays queued.** The watchdog sees a queued run as work on its way, and doesn't check how long it has waited.
 
 ## Watchdog settings

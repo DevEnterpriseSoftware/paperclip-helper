@@ -571,3 +571,77 @@ test("no repair and no hold release while the assignee is paused", async (t) => 
   assert.equal(env.db.patches.length, 1);
   assert.equal(env.db.interrupts.length, 1);
 });
+
+// DIR-109: Paperclip's recovery sweep ran while the assignee was paused, recorded a
+// recovery action for the board and marked the issue blocked. Nothing un-parks it.
+function parkedIssue(env, action = {}) {
+  const { engineer } = agents(env.db);
+  const issue = { id: uuid(), identifier: "ACM-109", companyId: ids.company, status: "blocked", assigneeAgentId: engineer.id, updatedAt: minutesAgo(180) };
+  env.db.issues.push(issue);
+  env.db.issueRuns[issue.id] = [{ runId: uuid(), agentId: engineer.id, status: "succeeded", createdAt: minutesAgo(3000), finishedAt: minutesAgo(2990) }];
+  env.db.blockerDiagnostics[issue.id] = { readiness: { allBlockersDone: true, unresolvedBlockerCount: 0 }, blockers: [] };
+  env.db.recoveryActions[issue.id] = {
+    id: uuid(),
+    kind: "stranded_assigned_issue",
+    cause: "stranded_assigned_issue",
+    status: "active",
+    ownerType: "board",
+    nextAction: "Board operator: inspect the evidence, then explicitly retry the original owner, reassign, or resolve.",
+    ...action,
+  };
+  return { issue, engineer };
+}
+
+test("an issue Paperclip's recovery parked is nudged once its assignee is available, capped", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue, engineer } = parkedIssue(env);
+
+  engineer.status = "paused";
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 0);
+
+  engineer.status = "idle";
+  issue.updatedAt = minutesAgo(180);
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 1);
+  assert.ok(env.db.comments[0].body.startsWith(`[@Engineer](agent://${engineer.id}) Paperclip's recovery parked this issue`));
+  assert.match(env.db.comments[0].body, /nudge 1\/2/);
+
+  // The fake leaves it blocked: a second nudge a stall window later, then no more.
+  for (let i = 0; i < 3; i++) {
+    issue.updatedAt = minutesAgo(180);
+    const key = `parked:${issue.id}:${env.db.recoveryActions[issue.id].id}`;
+    env.state.nudges.set(key, { ...env.state.nudges.get(key), at: Date.now() - 10 * 60_000 });
+    await env.watchdog.tick();
+  }
+  assert.equal(env.db.comments.length, 2);
+});
+
+test("a parked issue with saved messages gets them delivered instead of a comment", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue } = parkedIssue(env);
+  env.db.queuedComments[issue.id] = {
+    issueId: issue.id, queueId: uuid(), state: "deferred", targetRunId: null, revision: "rev-1", protocol: "legacy",
+    entries: [{ comment: { id: uuid(), body: "Hand-off to Software Architect" }, position: 0 }],
+  };
+  await env.watchdog.tick();
+  assert.equal(env.db.interrupts.length, 1);
+  assert.equal(env.db.comments.length, 0);
+});
+
+test("any other kind of recovery action, or a running run, is left to the board", async (t) => {
+  const env = await watchdogEnv(t);
+  parkedIssue(env, { kind: "stalled_review", cause: "stalled_review" });
+  await env.watchdog.tick();
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 0);
+  const reports = env.logs.filter((l) => l.msg === "watchdog: Paperclip's recovery parked the issue and it needs a board decision");
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].kind, "stalled_review");
+
+  const env2 = await watchdogEnv(t);
+  const busy = parkedIssue(env2);
+  env2.db.issueRuns[busy.issue.id].push({ runId: uuid(), agentId: busy.engineer.id, status: "running", createdAt: minutesAgo(1) });
+  await env2.watchdog.tick();
+  assert.equal(env2.db.comments.length, 0);
+});

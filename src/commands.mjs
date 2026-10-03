@@ -7,13 +7,14 @@ import { readJson } from "./store.mjs";
 import { companyAgents, companyPrefixes } from "./paperclip.mjs";
 import { approvalWaitingOn, DECISION_STATUS } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
+import { advise, excerpt, llmPrompt } from "./advice.mjs";
 
 export const USAGE = `Paperclip Helper
 
   pch                          run every enabled component (what the container does)
   pch status                   what the running helper is doing, and when the key expires
   pch check [ISSUE]            who the key belongs to; with an issue, what a merge would do to it
-  pch why ISSUE                Paperclip's own diagnosis of why nobody is working on an issue
+  pch why ISSUE [--prompt]     why nobody is working on an issue, and what to do about it (--prompt: as an LLM prompt)
   pch approve ISSUE [comment]  approve an issue whose approval is waiting on you
   pch changes ISSUE comment    request changes (the comment becomes the brief)
   pch comment ISSUE text       comment as you (wakes the assignee)
@@ -29,7 +30,9 @@ export const USAGE = `Paperclip Helper
 
 Settings come from .env; see https://github.com/DevEnterpriseSoftware/paperclip-helper`;
 
-const out = (line = "") => console.log(line);
+// Lines go to the console, or to `sink` while a command collects its own output.
+let sink = null;
+const out = (line = "") => (sink ? sink.push(line) : console.log(line));
 
 // ---------------------------------------------------------------- key
 
@@ -159,8 +162,37 @@ async function showWorkspaceOps(api, identifier) {
 }
 
 // Paperclip's wake and blocker diagnostics for one issue, in plain lines.
-export async function why(ctx, identifier) {
-  if (!identifier) throw new Error("usage: why <ISSUE-ID>");
+// Then a recommendation: what is going on, what to do, and whether the watchdog
+// does it by itself. With --prompt, the same as a prompt for an LLM chat.
+export async function why(ctx, identifier, { prompt = false } = {}) {
+  if (!identifier || identifier.startsWith("--")) throw new Error("usage: why <ISSUE-ID> [--prompt]");
+  const report = [];
+  sink = report;
+  let facts;
+  try {
+    facts = await whyReport(ctx, identifier);
+  } finally {
+    sink = null;
+  }
+  const advice = advise(facts);
+  if (prompt) {
+    out(llmPrompt({ identifier, report: report.join("\n"), advice, lastComments: facts.lastComments }));
+    return;
+  }
+  for (const line of report) out(line);
+  if (facts.lastComment) out(`Last comment: ${facts.lastComment.author ?? "someone"}: ${excerpt(facts.lastComment.body)}`);
+  out("");
+  out(`Recommendation: ${advice.what}`);
+  advice.steps.forEach((step, i) => out(`  ${i + 1}. ${step}`));
+  if (advice.watchdog === "auto") {
+    out(`  The watchdog does this by itself once the issue has been quiet for ${ctx.config.watchdogStallSec}s. Do it by hand only if you don't want to wait.`);
+  } else if (advice.watchdog === "manual") {
+    out("  The watchdog leaves this one to you.");
+  }
+  out(`  Not what you see? \`pch why ${identifier} --prompt\` prints all of this as a prompt for an LLM chat.`);
+}
+
+async function whyReport(ctx, identifier) {
   const { api } = ctx;
   const id = encodeURIComponent(identifier);
   const [wakes, blockers] = await Promise.all([
@@ -228,6 +260,45 @@ export async function why(ctx, identifier) {
       out(`  ${r.createdAt}  ${names.get(r.agentId) ?? "?"}  ${r.status}${r.errorCode ? ` (${r.errorCode})` : ""}${lease}`);
     }
   }
+
+  // What Paperclip's recovery decided, the saved messages, and the latest notes:
+  // the rest of what a recommendation needs.
+  const [parked, queue, comments, me] = await Promise.all([
+    api.request("GET", `/api/issues/${id}/recovery-actions`).catch(() => null),
+    api.request("GET", `/api/issues/${id}/queued-comments`).catch(() => null),
+    api.request("GET", `/api/issues/${id}/comments?order=desc&limit=3`).catch(() => []),
+    ctx.identity().catch(() => null),
+  ]);
+  const recovery = parked?.active ?? null;
+  if (recovery) {
+    out(`Recovery: ${recovery.kind ?? recovery.cause ?? "unknown"}, waiting on ${recovery.ownerType ?? "?"} since ${recovery.createdAt ?? "?"}`);
+    if (recovery.nextAction) out(`  Next action: ${recovery.nextAction}`);
+  }
+  if (queue?.queueId && queue.entries?.length) {
+    out(`Saved messages: ${queue.entries.length} ${queue.state ?? "waiting"}${queue.executionWait?.message ? ` ("${queue.executionWait.message}")` : ""}`);
+  }
+  const lastComments = [];
+  for (const c of Array.isArray(comments) ? comments : []) {
+    const author = (await nameOf(c.authorAgentId)) ?? (c.authorUserId ? (c.authorUserId === me?.userId ? "you" : "a board user") : null);
+    lastComments.push({ author, body: c.body ?? "", createdAt: c.createdAt ?? null });
+  }
+  const assigneeAgent = full?.assigneeAgentId ? await api.request("GET", `/api/agents/${full.assigneeAgentId}`).catch(() => null) : null;
+  return {
+    identifier,
+    issue: full ?? { status: issue.status },
+    me: me?.userId ?? null,
+    assignee: assigneeAgent ? { name: assigneeAgent.name, status: assigneeAgent.status } : assignee ? { name: assignee, status: null } : null,
+    nameOf: (agentId) => names.get(agentId) ?? null,
+    blockers,
+    wakes: (wakes?.events ?? []).filter((e) => e.kind === "wake_request"),
+    runs: Array.isArray(runs) ? runs : [],
+    recovery,
+    queue,
+    lastComment: lastComments[0] ?? null,
+    lastComments,
+    config: ctx.config,
+    now: ctx.now(),
+  };
 }
 
 // ---------------------------------------------------------------- decisions

@@ -60,6 +60,8 @@ const HELPER_ENDPOINTS = [
   ["GET", "/api/issues/{id}"],
   ["PATCH", "/api/issues/{id}"],
   ["POST", "/api/issues/{id}/comments"],
+  ["GET", "/api/issues/{id}/comments"],
+  ["GET", "/api/issues/{id}/recovery-actions"],
   ["GET", "/api/issues/{id}/runs"],
   ["GET", "/api/issues/{id}/work-products"],
   ["GET", "/api/issues/{id}/diagnostics/wakes"],
@@ -347,6 +349,14 @@ if (!BASE) {
 
       const posted = await s.ctx.api.request("POST", `/api/issues/${s.work.id}/comments`, { body: "compat: please look again" });
       assert.ok(posted.id, "POST comments returns the comment");
+      // What `pch why` quotes, and how the watchdog finds an issue Paperclip's recovery parked.
+      const latest = await s.ctx.api.request("GET", `/api/issues/${s.work.id}/comments?order=desc&limit=3`);
+      assert.ok(Array.isArray(latest) && latest.length >= 1 && latest.length <= 3, "comments are listed, and limit is honoured");
+      assert.equal(latest[0].id, posted.id, "comments are listed newest first with order=desc");
+      hasKeys(latest[0], ["body", "authorUserId", "authorAgentId", "createdAt"], "a comment");
+      const parked = await s.ctx.api.request("GET", `/api/issues/${s.work.id}/recovery-actions`);
+      hasKeys(parked, ["active", "actions"], "the recovery-actions snapshot");
+      assert.equal(parked.active, null, "an issue nobody parked has no active recovery action");
       const runs = await until("a run started by the comment", async () => {
         const list = await runsOf(s.work.id);
         return list.length > before ? list : null;

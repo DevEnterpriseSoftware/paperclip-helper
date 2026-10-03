@@ -34,6 +34,15 @@
 //    delivers them to the current owner, as the board's Interrupt button does.
 //    A hold with any other cause is only reported: that decision stays yours.
 //
+// 6. Issues Paperclip's recovery parked because it couldn't run the assignee.
+//    Its sweep finds an assigned issue whose agent is paused (or whose run was
+//    cut off by a hand-off), records a recovery action for the board
+//    (stranded_assigned_issue: "Automatic recovery blocked") and marks the issue
+//    blocked. Nothing un-parks it when the agent comes back. A board comment is
+//    the decision Paperclip is waiting for, so once the agent is available the
+//    watchdog comments, or delivers the saved messages if there are any. Any
+//    other kind of recovery action is only reported.
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
@@ -64,6 +73,8 @@ const record = {
   stuck: (issue, wake) => `stuck:${issue.id}:${wake.requestedAt}`, // a deferred wake, reported once
   hold: (issue, runId) => `hold:${issue.id}:${runId}`, // presses to release a hand-off's recovery hold
   holdReported: (issue, runId) => `hold-report:${issue.id}:${runId}`, // a hold left to the board, reported once
+  parked: (issue, actionId) => `parked:${issue.id}:${actionId}`, // nudges for an issue Paperclip's recovery parked
+  parkedReported: (issue, actionId) => `parked-report:${issue.id}:${actionId}`, // a parked issue left to the board, reported once
 };
 
 export function createWatchdog(ctx, state) {
@@ -194,6 +205,48 @@ export function createWatchdog(ctx, state) {
       return;
     }
     await retryDeferred(issue, record.hold(issue, runId));
+  }
+
+  // An issue blocked by an active recovery action that waits on the board.
+  async function releaseParkedIssue(issue, action, agents) {
+    const who = issue.identifier ?? issue.id;
+    const agent = await agentFor(issue.assigneeAgentId, agents).catch(() => null);
+    // Waking an agent Paperclip can't invoke is what parked the issue in the first place.
+    if (!agent || asleep(agent)) return;
+    const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
+    if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return;
+    if (action.kind !== "stranded_assigned_issue" || action.ownerType !== "board") {
+      // Paperclip is asking for a judgement (a stalled review, an uncertain action): not ours to make.
+      const key = record.parkedReported(issue, action.id);
+      if (records.has(key)) return;
+      records.set(key, { count: 1, at: now() });
+      state.touch();
+      log.warn("watchdog: Paperclip's recovery parked the issue and it needs a board decision", {
+        issue: who,
+        kind: action.kind ?? action.cause ?? null,
+        owner: action.ownerType ?? null,
+        nextAction: action.nextAction ?? null,
+        hint: `See \`pch why ${who}\` for what to do.`,
+      });
+      return;
+    }
+    // Saved messages go first: they are what the agent was meant to act on.
+    const queue = config.watchdogRetryDeferred
+      ? await api.request("GET", `/api/issues/${issue.id}/queued-comments`).catch(() => null)
+      : null;
+    if (queue?.queueId && queue.state === "deferred" && queue.protocol === "legacy" && queue.entries?.length && !queue.targetRunId) {
+      await retryDeferred(issue, record.hold(issue, action.id));
+      return;
+    }
+    await nudge(
+      issue,
+      record.parked(issue, action.id),
+      agent,
+      `Paperclip's recovery parked this issue for a board decision: it couldn't run you when it looked ` +
+        `(you were paused, or the issue had just changed hands). You are available again and nothing else ` +
+        `blocks the issue. Please continue it.`,
+      { reason: "parked by recovery", kind: action.kind },
+    );
   }
 
   function reportStuck(issue, wake, runs) {
@@ -402,7 +455,12 @@ export function createWatchdog(ctx, state) {
         }
         if (!quiet(issue)) return;
         if (!(Array.isArray(diag.blockers) ? diag.blockers : []).length) {
-          // Blocked with no linked blocker: by an agent's own note, or by a recovery hold.
+          // Blocked with no linked blocker: by an agent's own note, or by Paperclip's recovery.
+          const parked = await api.request("GET", `/api/issues/${issue.id}/recovery-actions`).catch(() => null);
+          if (parked?.active) {
+            await releaseParkedIssue(issue, parked.active, agents);
+            return;
+          }
           const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
           if (!full?.executionBlocker) return;
           // Delivering a message to an agent Paperclip can't invoke only strands it again.

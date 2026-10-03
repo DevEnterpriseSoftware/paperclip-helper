@@ -134,7 +134,7 @@ async function main() {
     login: () => cmd.login(ctx),
     revoke: () => cmd.revoke(ctx),
     check: () => cmd.check(ctx, arg),
-    why: () => cmd.why(ctx, arg),
+    why: () => cmd.why(ctx, [arg, ...rest].find((x) => x && !x.startsWith("--")), { prompt: flags.includes("--prompt") }),
     approve: () => cmd.decide(ctx, "approve", arg, text),
     changes: () => cmd.decide(ctx, "changes", arg, text),
     comment: () => cmd.comment(ctx, arg, text),

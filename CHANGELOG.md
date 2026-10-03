@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.2
+
+- **`pch why`:** ends with a recommendation: what is holding the issue, the steps or commands that get it moving, and whether the watchdog does it by itself. It also shows the latest comment, an issue Paperclip's recovery parked, and saved messages that are waiting. `pch why ISSUE --prompt` prints all of it, with the last three comments, as a prompt for an LLM chat.
+- **Watchdog:** an issue Paperclip's recovery parked because it couldn't run the assignee (`stranded_assigned_issue`: "Automatic recovery blocked … the original assignee is not invokable", typically after agents were paused) is un-parked once the agent is available: the watchdog delivers its saved messages, or comments on it. Any other kind of recovery action is reported once and left to you. Paperclip reports these as recovery actions, not as an execution hold, so the 1.1.0 release of holds never saw them.
+
 ## 1.1.1
 
 - **Relay:** when no issue the PR names, nor any of their subtasks, is waiting on you, the relay also looks at the issues blocking them and at deeper subtasks. A merge of a PR that names a blocked issue now approves the blocker in review, instead of only commenting on the blocked issue. The result says how it was found (`via: "blocks ACM-12"`). An issue the PR names, or its subtask, still wins when it is waiting.

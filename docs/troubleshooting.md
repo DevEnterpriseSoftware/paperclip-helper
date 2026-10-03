@@ -16,7 +16,7 @@ Start with `pch status` and, for a stuck issue, `pch why ISSUE`.
 | A PR has **merge conflicts** after you merged another | GitHub sends no event for that. Comment `/changes Rebase onto main and resolve the conflicts` on the PR to send the issue back. |
 | An issue is **blocked with nothing in "Blocked by"** | Either an agent blocked it with a note of its own, or Paperclip's recovery did. `pch why ISSUE` shows an execution hold if there is one; see [what the watchdog leaves to you](watchdog.md#what-it-leaves-to-you). |
 | An agent **runs every few minutes** and posts the same "Blocked: …" note | It's waiting on something only you can do, usually an approval. Decide it, or pause the issue. |
-| "**The original assignee is not invokable**" | The agent, or one above it in the org chart, was paused, terminated or awaiting approval when Paperclip's recovery ran. Resume it, then message the agent on the issue. |
+| "**The original assignee is not invokable**" | The agent, or one above it in the org chart, was paused, terminated or awaiting approval when Paperclip's recovery ran. Resume it. The watchdog then un-parks the issue with a comment; `pch why ISSUE` gives the command to do it yourself. |
 | No PR rows on the issue | Turn on **Instance settings → Experimental → External Objects**. |
 | Codex costs missing | Look for `pch costs` lines such as `model unknown` or `no price for …`, then set `CODEX_DEFAULT_MODEL` or add the model to `prices.json`. |
 | Anything else | `docker compose logs --tail 50`. There's one JSON line per event; `LOG_LEVEL=debug` shows more. |
