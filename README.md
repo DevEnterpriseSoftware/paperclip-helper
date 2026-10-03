@@ -14,7 +14,7 @@ A small companion service for self-hosted [Paperclip](https://github.com/papercl
 | In Paperclip you see… | The helper… |
 |---|---|
 | **"Approval pending with You"**, and no Approve button. A decision is a status change *plus* a comment in the same request, and the issue page has no button for that. Paperclip's own Approve button appears only on stalled reviews. | **Relay.** Merge the PR on GitHub and the issue is approved. **Request changes** on GitHub sends it back to the engineer, with your review as the brief. |
-| **Agents stop at hand-offs**, and **blocked issues can stay blocked** after their blockers are done. | **Watchdog.** It finds issues whose wake Paperclip dropped and wakes the right agent with a comment. It also repairs blockers stuck on a failed workspace clean-up. |
+| **Agents stop at hand-offs**, **blocked issues can stay blocked** after their blockers are done, and issues wait on **"Waiting for execution recovery"** or **"Automatic recovery blocked"**. | **Watchdog.** It finds issues whose wake Paperclip dropped and wakes the right agent with a comment. It also repairs blockers stuck on a failed workspace clean-up, and releases recovery holds that a hand-off left behind. |
 | **The Costs page shows $0** because your agents run on a Claude or ChatGPT subscription. | **Cost sync.** It posts each run's API-equivalent cost: Claude Code's own figure, and for Codex, tokens × OpenAI list prices. |
 | **The model drop-down doesn't list** a new model id. | **`pch set-model`** moves every agent from one model to another and keeps the rest of their config, effort included. |
 | **"Why is nobody working on this?"** | **`pch why ISSUE`** prints Paperclip's own diagnosis, ready to paste into an LLM chat. |
@@ -152,18 +152,32 @@ The installer can create it with `gh`. If `gh` answers 404, run `gh auth refresh
 
 ## The watchdog: wake stalled work
 
-Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for three situations Paperclip doesn't recover from by itself.
+Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for five situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment.
+
+| In Paperclip you see… | The watchdog… |
+|---|---|
+| An issue assigned to an agent that **never starts**, after a hand-off. | Comments on it, which wakes the new owner. |
+| A **blocked** issue whose blockers are all **done**. | Comments on it, which moves it to `todo` and wakes the owner. |
+| A blocked issue whose only blocker is done but **"finalizing"** forever. | Removes that blocker, moves the issue to `todo` and explains why. |
+| **"Waiting for execution recovery. Your message is saved."** | Presses Paperclip's **send queued messages now** for it. |
+| **"Automatic recovery blocked"**, board decision required, after a hand-off. | Delivers the saved messages to the current owner, as **Interrupt** does. |
 
 **1. Dropped hand-offs** (`todo`, `in_progress`, `in_review`). When an issue changes hands, for example engineer → reviewer, Paperclip cancels the finishing run. That run still holds its environment lease for a minute or two. The new owner's wake is refused ("has not released its environment lease") and nothing retries it: [paperclipai/paperclip#13880](https://github.com/paperclipai/paperclip/pull/13880).
 
 The watchdog looks for an issue where all of these hold:
 
 - An agent owns it, and nothing is running or checked out on it.
-- The latest run belongs to someone else and ended at least `WATCHDOG_STALL_SEC` ago.
+- The latest run that did any work belongs to someone else and ended at least `WATCHDOG_STALL_SEC` ago.
 - The owner isn't paused, terminated or waiting for approval.
-- Paperclip has no wake queued for it.
+- Paperclip has no wake queued for the owner.
 
 It then comments on the issue, which wakes the assignee. While a task is paused, Paperclip refuses comments, so the watchdog waits until it's resumed.
+
+Three things look like "the owner is on it" and aren't, so the watchdog ignores them:
+
+- **Another agent's wake.** Paperclip lists every agent's wakes on the issue. A wake deferred for the previous owner, or for an agent someone mentioned, says nothing about the current one.
+- **A wake that runs have overtaken.** A wake deferred before a later run was created and finished is never promoted.
+- **A run refused before it started.** After a hand-off Paperclip can hold the issue for reconciliation and cancel the owner's runs on arrival (`execution_reconciliation_required`), skipping their wakes. The chat shows "Waiting to resume". The hold clears on its own, but nothing wakes the owner again. The watchdog nudges once the hold is gone, and waits while it's still in place.
 
 **2. Blocked issues whose blockers are all done.** Paperclip should wake the assignee with `issue_blockers_resolved`, but that wake can be dropped the same way. Once the issue has been quiet for the stall window, it gets the same kind of comment. A comment on a blocked issue whose blockers are done also moves it back to `todo`; this was verified against Paperclip 2026.916.1.
 
@@ -173,13 +187,27 @@ It then comments on the issue, which wakes the assignee. While a task is paused,
 - If nothing else blocks the dependent, it moves it to `todo`.
 - It comments to explain why, and tells the agent to pull the branch first.
 
-Each nudge mentions the assignee and says what stalled. Each situation gets at most `WATCHDOG_MAX_NUDGES` comments, spaced by the stall window. The counts are kept in `data/state.json`, so a restart doesn't re-nudge.
+It waits while the dependent's assignee is paused, terminated or awaiting approval. Moving an issue to `todo` for an agent Paperclip can't invoke makes Paperclip's recovery block it again, this time for a board decision.
 
-**When a comment can't help.** Paperclip sometimes defers even the nudge's wake, because an earlier run still holds execution. The watchdog then logs one warning instead of repeating itself, and `pch status` counts the issue. `pch why ISSUE` shows the runs and their lease state.
+**4. Wakes deferred behind a stopped run.** Paperclip sometimes defers even the nudge's wake, because an earlier run still holds execution. A comment can't help: its wake is deferred too. The watchdog logs one warning instead of repeating itself, and `pch status` counts the issue.
 
-With `WATCHDOG_RETRY_DEFERRED` on, the watchdog also presses Paperclip's own **send queued messages now** for that issue, at most `WATCHDOG_MAX_NUDGES` times, spaced by the stall window. Paperclip then retries the stopped run's lease clean-up once and re-sends the saved comments. The watchdog does this only when the deferred wake carries saved comments and targets no running run, so it never interrupts work. A lease that was never released, or an old process that's still alive, needs a manual look. This retry has been checked against Paperclip's source but not yet against a live instance.
+With `WATCHDOG_RETRY_DEFERRED` on, the watchdog also presses Paperclip's own **send queued messages now** for that issue. Paperclip then retries the stopped run's lease clean-up once and re-sends the saved comments. The watchdog does this only when the deferred wake carries saved comments and targets no running run, so it never interrupts work. A lease that was never released, or an old process that's still alive, needs a manual look.
 
-**Recovery holds left by a hand-off.** Paperclip's recovery can give up on a run that was cancelled when the issue changed hands. The issue then shows "Automatic recovery blocked" with "Board decision required", is marked blocked with no blocker linked, and its saved messages wait. With `WATCHDOG_RETRY_DEFERRED` on, the watchdog releases that hold the way the board's **Interrupt** button does: it delivers the saved messages to the current owner, at most `WATCHDOG_MAX_NUDGES` times per hold. It only does this when the held run was cancelled by a reassignment. A hold with any other cause means Paperclip is unsure what the run did; the watchdog logs it once and leaves the decision to you. `pch why ISSUE` shows the hold and its next action.
+**5. Recovery holds left by a hand-off.** Paperclip's recovery can give up on a run that was cancelled when the issue changed hands. The issue then shows "Automatic recovery blocked" with "Board decision required", is marked blocked with no blocker linked, and its saved messages wait. With `WATCHDOG_RETRY_DEFERRED` on, the watchdog releases that hold the way the board's **Interrupt** button does: it delivers the saved messages to the current owner.
+
+- It only does this when the held run was cancelled by a reassignment, and no run is active on the issue.
+- It waits while the owner is paused, terminated or awaiting approval.
+- A hold with any other cause means Paperclip is unsure what the run did. The watchdog logs it once and leaves the decision to you.
+
+Pressing **Interrupt** by hand releases such a hold on Paperclip 2026.916.1. The watchdog's own press, in 4 and 5, has been checked against Paperclip's source and the test suite, not yet against a live instance.
+
+**Limits.** Each nudge mentions the assignee and says what stalled. Each situation gets at most `WATCHDOG_MAX_NUDGES` comments or presses, spaced by the stall window. The counts are kept in `data/state.json`, so a restart doesn't repeat them.
+
+**What it leaves to you.** These look similar in Paperclip, and `pch why ISSUE` tells them apart:
+
+- **An agent waiting on you.** An issue an agent blocked with a note of its own, such as a pending approval or a missing permission, has no blocker linked. Paperclip can keep waking the agent, which re-checks and stops again, a run each time. Decide the approval, or pause the issue.
+- **A recovery hold with another cause,** or one with no saved message to deliver. A message from you to the agent is the board decision Paperclip is waiting for.
+- **A run that stays queued.** The watchdog sees a queued run as work on its way, and doesn't check how long it has waited.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -395,6 +423,11 @@ Delete the GitHub webhook in each repository's settings. Cost events already pos
 | A delivery failed with `Task is paused` | Paperclip refuses comments on a paused task. Resume it, then **Redeliver** in GitHub. |
 | Deliveries show `names no ACM issue` | The PR's title, branch and body contain no issue identifier. |
 | A merge only comments (`decision is not waiting on you`) | The approval stage isn't pending on your user. `pch check ISSUE` shows who it's waiting on. |
+| A merge leaves the issue **in review**, "Approval pending with You" | The merge approved an earlier stage of yours and the next one belongs to someone else, or the relay is older than 1.0.1. The delivery's response has a `warning` naming who it's waiting on. |
+| A PR has **merge conflicts** after you merged another | GitHub sends no event for that. Comment `/changes Rebase onto main and resolve the conflicts` on the PR to send the issue back. |
+| An issue is **blocked with nothing in "Blocked by"** | Either an agent blocked it with a note of its own, or Paperclip's recovery did. `pch why ISSUE` shows an execution hold if there is one; see [what the watchdog leaves to you](#the-watchdog-wake-stalled-work). |
+| An agent **runs every few minutes** and posts the same "Blocked: …" note | It's waiting on something only you can do, usually an approval. Decide it, or pause the issue. |
+| "**The original assignee is not invokable**" | The agent, or one above it in the org chart, was paused, terminated or awaiting approval when Paperclip's recovery ran. Resume it, then message the agent on the issue. |
 | No PR rows on the issue | Turn on **Instance settings → Experimental → External Objects**. |
 | Codex costs missing | Look for `pch costs` lines such as `model unknown` or `no price for …`, then set `CODEX_DEFAULT_MODEL` or add the model to `prices.json`. |
 | Anything else | `docker compose logs --tail 50`. There's one JSON line per event; `LOG_LEVEL=debug` shows more. |

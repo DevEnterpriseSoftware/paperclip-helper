@@ -293,6 +293,10 @@ export function createWatchdog(ctx, state) {
     const pending = nodes.filter((b) => b.isPendingFinalize);
     // Only when every blocker is done and the only thing holding it is finalization.
     if (!pending.length || nodes.some((b) => b.status !== "done")) return false;
+    // Moving the issue to todo for an agent Paperclip can't invoke makes its
+    // recovery give up on the issue ("Automatic recovery blocked") and block it
+    // again, this time for a board decision (DIR-109). Wait until it's back.
+    if (issue.assigneeAgentId && asleep(await agentFor(issue.assigneeAgentId, agents).catch(() => null))) return false;
     const stuck = [];
     for (const b of pending) {
       const failed = await failedFinalizeOf(b.id ?? b.identifier);
@@ -401,6 +405,8 @@ export function createWatchdog(ctx, state) {
           // Blocked with no linked blocker: by an agent's own note, or by a recovery hold.
           const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
           if (!full?.executionBlocker) return;
+          // Delivering a message to an agent Paperclip can't invoke only strands it again.
+          if (asleep(await agentFor(issue.assigneeAgentId, agents).catch(() => null))) return;
           const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
           if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return;
           await releaseHandOffHold(issue, full.executionBlocker, runs);

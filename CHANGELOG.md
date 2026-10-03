@@ -3,6 +3,7 @@
 ## 1.1.0
 
 - **Watchdog:** a recovery hold left by a hand-off ("Automatic recovery blocked", with the issue marked blocked and a saved message waiting) is released by delivering the saved messages to the current owner, as the board's Interrupt button does. Only when the held run was cancelled by a reassignment, and only with `WATCHDOG_RETRY_DEFERRED` on; any other hold is reported once and left to you.
+- **Watchdog:** the failed-clean-up repair waits while the issue's assignee is paused, terminated or awaiting approval. Moving the issue to `todo` for an agent Paperclip can't invoke made its recovery block the issue again for a board decision.
 - **`pch why`:** shows an execution hold and its next action, and says "none linked" instead of "all done" when an issue has no blockers.
 - **`pch update`:** updates the helper to the latest release of its major version, restarts it if the image changed, and refreshes the `pch` script itself. It runs on the host, so the installer now writes `pch.sh` (or `pch.ps1`) to the install directory and points `pch` at it. Re-run the installer once to get it. It doesn't update Paperclip.
 

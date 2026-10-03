@@ -542,3 +542,32 @@ test("a blocked issue with no linked blocker and no recovery hold is left alone"
   assert.equal(env.db.interrupts.length, 0);
   assert.equal(env.db.comments.length, 0);
 });
+
+test("no repair and no hold release while the assignee is paused", async (t) => {
+  // DIR-109: the repair moved the issue to todo while its assignee was paused, and
+  // Paperclip's recovery blocked it again for a board decision.
+  const env = await watchdogEnv(t);
+  const { engineer } = agents(env.db);
+  engineer.status = "paused";
+  const workspaceId = uuid();
+  const blocker = { id: uuid(), identifier: "ACM-9", companyId: ids.company, status: "done", executionWorkspaceId: workspaceId };
+  const issue = { id: uuid(), identifier: "ACM-8", companyId: ids.company, status: "blocked", assigneeAgentId: engineer.id, updatedAt: minutesAgo(60), blockedBy: [{ id: blocker.id }] };
+  env.db.issues.push(blocker, issue);
+  env.db.blockerDiagnostics[issue.id] = {
+    readiness: { allBlockersDone: false, unresolvedBlockerCount: 1, pendingFinalizeBlockerCount: 1 },
+    blockers: [{ id: blocker.id, identifier: "ACM-9", status: "done", isPendingFinalize: true }],
+  };
+  env.db.workspaceOps[workspaceId] = [{ phase: "workspace_finalize", status: "failed", startedAt: minutesAgo(30), finishedAt: minutesAgo(30) }];
+  const held = recoveryHold(env);
+  env.db.agents.find((a) => a.id === held.issue.assigneeAgentId).status = "paused";
+
+  await env.watchdog.tick();
+  assert.equal(env.db.patches.length, 0);
+  assert.equal(env.db.interrupts.length, 0);
+
+  // Resumed: both go ahead.
+  for (const a of env.db.agents) a.status = "idle";
+  await env.watchdog.tick();
+  assert.equal(env.db.patches.length, 1);
+  assert.equal(env.db.interrupts.length, 1);
+});
