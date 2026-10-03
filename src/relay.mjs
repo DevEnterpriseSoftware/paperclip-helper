@@ -31,6 +31,8 @@ const MAX_FORWARDED_CHARS = 20_000;
 const LINK_ACTIONS = new Set(["opened", "reopened", "ready_for_review"]);
 // Stages a single merge may approve after the first, when each is waiting on you.
 const MAX_CHAINED_STAGES = 3;
+// Issues looked at for one PR, counting blockers and deeper subtasks.
+const MAX_RELATED_ISSUES = 40;
 
 export function verifySignature(secret, rawBody, header) {
   if (!secret || typeof header !== "string" || !header.startsWith("sha256=")) return false;
@@ -109,36 +111,86 @@ export function createRelay(ctx, state) {
   // A PR can name the parent issue (its title and branch come from the parent's
   // workspace) while the review and approval stages sit on a child issue. So look
   // at every issue the PR names, plus their subtasks, and pick the one whose
-  // approval is waiting on you. With several, prefer one that records this PR as a
-  // work product; if none does, decide nothing and comment. With none waiting, the
-  // first issue the PR names gets a comment.
+  // approval is waiting on you. When none of those is waiting, look further: at
+  // the issues blocking them and at deeper subtasks (a PR that names a blocked
+  // issue while the work in review is its blocker). With several waiting, prefer
+  // one that records this PR as a work product; if none does, decide nothing and
+  // comment. With none waiting, the first issue the PR names gets a comment.
   async function resolveTarget(pr, identifiers) {
     const { userId } = await ctx.identity();
     const seen = new Map(); // identifier → issue
     const add = (issue) => {
       const key = issue?.identifier ?? issue?.id;
-      if (key && !seen.has(key)) seen.set(key, issue);
+      if (!key || seen.has(key)) return false;
+      seen.set(key, issue);
+      return true;
     };
-    for (const identifier of identifiers) {
-      const issue = await api.request("GET", `/api/issues/${encodeURIComponent(identifier)}`).catch(() => null);
-      if (!issue?.id) continue;
-      add(issue);
-      const children = await api
+    const get = (ref) => api.request("GET", `/api/issues/${encodeURIComponent(ref)}`).catch(() => null);
+    const subtasks = async (issue) => {
+      const rows = await api
         .request("GET", `/api/companies/${issue.companyId}/issues?parentId=${issue.id}&limit=100`)
         .catch(() => []);
-      for (const child of Array.isArray(children) ? children : []) {
+      const out = [];
+      for (const row of Array.isArray(rows) ? rows : []) {
         // List rows carry executionState: null, so read any subtask in review in full.
-        const full = child.status === "in_review" ? await api.request("GET", `/api/issues/${child.id}`).catch(() => null) : null;
-        add(full ?? child);
+        out.push((row.status === "in_review" ? await get(row.id) : null) ?? row);
       }
+      return out;
+    };
+
+    const named = [];
+    for (const identifier of identifiers) {
+      const issue = await get(identifier);
+      if (!issue?.id) continue;
+      add(issue);
+      named.push(issue);
+      for (const child of await subtasks(issue)) add(child);
     }
     if (seen.size === 0) return null;
-    const waiting = [...seen.values()].filter((issue) => approvalWaitingOn(issue, userId));
-    if (waiting.length <= 1) return { issue: waiting[0] ?? seen.values().next().value, waiting: waiting.length === 1 };
+    const first = seen.values().next().value;
+    const isWaiting = (issue) => approvalWaitingOn(issue, userId);
+    let waiting = [...seen.values()].filter(isWaiting);
 
+    const via = new Map(); // identifier → how a further issue was reached
+    if (waiting.length === 0) {
+      const namedIds = new Set(named.map((i) => i.id));
+      const queue = [...seen.values()];
+      const walked = new Set();
+      while (queue.length && seen.size < MAX_RELATED_ISSUES) {
+        const issue = queue.shift();
+        if (!issue?.id || walked.has(issue.id)) continue;
+        walked.add(issue.id);
+        const label = issue.identifier ?? issue.id;
+        // Blockers are only on the full issue, and list rows may not be full.
+        const full = Array.isArray(issue.blockedBy) ? issue : await get(issue.id);
+        const related = [];
+        for (const blocker of full?.blockedBy ?? []) {
+          const found = blocker?.id ? await get(blocker.id) : null;
+          if (found?.id) related.push([found, `blocks ${label}`]);
+        }
+        // The named issues' own subtasks were read above.
+        if (!namedIds.has(issue.id)) {
+          for (const child of await subtasks(issue)) related.push([child, `subtask of ${label}`]);
+        }
+        for (const [other, how] of related) {
+          if (seen.size >= MAX_RELATED_ISSUES) break;
+          if (!add(other)) continue;
+          via.set(other.identifier ?? other.id, how);
+          queue.push(other);
+        }
+      }
+      waiting = [...seen.values()].filter(isWaiting);
+    }
+    const found = (issue, extra = {}) => {
+      const how = via.get(issue.identifier ?? issue.id);
+      return { issue, waiting: true, ...(how ? { via: how } : {}), ...extra };
+    };
+
+    if (waiting.length === 0) return { issue: first, waiting: false };
+    if (waiting.length === 1) return found(waiting[0]);
     for (const issue of waiting) {
       const products = await api.request("GET", `/api/issues/${issue.id}/work-products`).catch(() => []);
-      if ((Array.isArray(products) ? products : []).some((wp) => isWorkProductOf(wp, pr))) return { issue, waiting: true };
+      if ((Array.isArray(products) ? products : []).some((wp) => isWorkProductOf(wp, pr))) return found(issue);
     }
     // Several wait on you and none records this PR: don't guess which to decide.
     return { issue: waiting[0], waiting: true, ambiguous: waiting.map((i) => i.identifier ?? i.id) };
@@ -153,7 +205,7 @@ export function createRelay(ctx, state) {
   async function decide(pr, identifiers, kind, comment) {
     const target = await resolveTarget(pr, identifiers);
     if (!target) return { identifiers, action: "none", reason: "no Paperclip issue found for the identifiers" };
-    const { issue, waiting, ambiguous } = target;
+    const { issue, waiting, ambiguous, via } = target;
     const identifier = issue.identifier ?? issue.id;
     const stageType = issue?.executionState?.currentStageType ?? null;
 
@@ -199,6 +251,7 @@ export function createRelay(ctx, state) {
       }
     }
     const result = { identifier, action: kind, status: current?.status ?? status };
+    if (via) result.via = via;
     if (stages.length > 1) result.stages = stages;
     if (current && current.status !== status) {
       // Paperclip accepted the decision but the issue didn't land where it was sent.

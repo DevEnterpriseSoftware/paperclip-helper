@@ -1,6 +1,6 @@
 {
   "name": "paperclip-helper",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Small automations that run beside a self-hosted Paperclip: GitHub merge-to-approve relay, stalled-work watchdog and subscription cost sync.",
   "license": "MIT",
   "private": true,

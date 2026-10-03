@@ -215,6 +215,63 @@ test("when the decision isn't waiting on the owner, a merge only comments", asyn
   assert.equal(db.patches.length, 0);
 });
 
+test("a merge naming a blocked issue approves its blocker when that waits on the owner", async (t) => {
+  // DIR-157/DIR-159: the PR named the blocked issue; the work in review was the
+  // issue blocking it, which is neither named nor a subtask of the one named.
+  const { relay, db } = await relayEnv(t);
+  const blocker = { id: uuid(), identifier: "ACM-5", companyId: ids.company, status: "in_review", executionState: waitingOnMe };
+  const blocked = { id: uuid(), identifier: "ACM-1", companyId: ids.company, status: "blocked", blockedBy: [{ id: blocker.id }] };
+  db.issues.push(blocked, blocker);
+  const result = await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  assert.deepEqual(result, { identifier: "ACM-5", action: "approve", status: "done", via: "blocks ACM-1" });
+  assert.equal(db.patches.length, 1);
+  assert.equal(db.patches[0].issueId, blocker.id);
+  assert.equal(db.comments.filter((c) => c.identifier === "ACM-1").length, 0);
+});
+
+test("a merge reaches a subtask of a subtask, and a subtask of a blocker", async (t) => {
+  const { relay, db } = await relayEnv(t);
+  const { child } = seed(db);
+  child.status = "in_progress";
+  child.executionState = null;
+  const grandchild = { id: uuid(), identifier: "ACM-7", companyId: ids.company, parentId: child.id, status: "in_review", executionState: waitingOnMe };
+  db.issues.push(grandchild);
+  const deep = await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  assert.deepEqual(deep, { identifier: "ACM-7", action: "approve", status: "done", via: "subtask of ACM-2" });
+
+  const blocker = { id: uuid(), identifier: "ACM-8", companyId: ids.company, status: "in_progress" };
+  const under = { id: uuid(), identifier: "ACM-9", companyId: ids.company, parentId: blocker.id, status: "in_review", executionState: waitingOnMe };
+  db.issues.push(blocker, under);
+  db.issues.find((i) => i.identifier === "ACM-1").blockedBy = [{ id: blocker.id }];
+  const viaBlocker = await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  assert.deepEqual(viaBlocker, { identifier: "ACM-9", action: "approve", status: "done", via: "subtask of ACM-8" });
+});
+
+test("an issue the PR names, or its subtask, wins over a blocker that also waits", async (t) => {
+  const { relay, db } = await relayEnv(t);
+  const { parent, child } = seed(db);
+  const blocker = { id: uuid(), identifier: "ACM-5", companyId: ids.company, status: "in_review", executionState: waitingOnMe };
+  db.issues.push(blocker);
+  parent.blockedBy = [{ id: blocker.id }];
+  const result = await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  assert.deepEqual(result, { identifier: "ACM-2", action: "approve", status: "done" });
+  assert.equal(child.status, "done");
+  assert.equal(blocker.status, "in_review");
+});
+
+test("blockers that block each other don't loop, and with nothing waiting the named issue gets the comment", async (t) => {
+  const { relay, db } = await relayEnv(t);
+  const a = { id: uuid(), identifier: "ACM-1", companyId: ids.company, status: "blocked" };
+  const b = { id: uuid(), identifier: "ACM-5", companyId: ids.company, status: "blocked", blockedBy: [{ id: a.id }] };
+  a.blockedBy = [{ id: b.id }];
+  db.issues.push(a, b);
+  const result = await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  assert.equal(result.identifier, "ACM-1");
+  assert.equal(result.action, "comment");
+  assert.equal(result.reason, "decision is not waiting on you");
+  assert.equal(db.patches.length, 0);
+});
+
 test("with several waiting, the one with this PR as a work product wins", async (t) => {
   const { relay, db } = await relayEnv(t);
   const { parent, child } = seed(db);

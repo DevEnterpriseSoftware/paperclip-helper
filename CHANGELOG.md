@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+- **Relay:** when no issue the PR names, nor any of their subtasks, is waiting on you, the relay also looks at the issues blocking them and at deeper subtasks. A merge of a PR that names a blocked issue now approves the blocker in review, instead of only commenting on the blocked issue. The result says how it was found (`via: "blocks ACM-12"`). An issue the PR names, or its subtask, still wins when it is waiting.
+
 ## 1.1.0
 
 - **Compatibility suite:** `npm run test:compat -- <version>` boots a throwaway Paperclip of that version and runs the helper's own code against it: every endpoint, the response fields it reads, and the watchdog, relay, cost sync and commands end to end. CI runs it on every push and daily against Paperclip's latest release. Paperclip 2026.916.1 and 2026.1001.0 both pass.
