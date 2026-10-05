@@ -69,18 +69,21 @@ export class BoundedMap {
   }
 }
 
-// The helper's own state: relay deliveries and watchdog nudges, so a restart
-// neither re-processes a delivery nor re-nudges an issue.
+// The helper's own state: relay deliveries, watchdog nudges and the PRs sent back
+// for merge conflicts, so a restart neither re-processes a delivery, re-nudges
+// an issue nor sends a PR back twice.
 export function createStateStore(file, { now = () => Date.now() } = {}) {
   const raw = readJson(file, {}) ?? {};
   const deliveries = new BoundedMap(Object.entries(raw.deliveries ?? {}), 1000);
   const nudges = new BoundedMap(Object.entries(raw.nudges ?? {}), 2000);
+  const conflicts = new BoundedMap(Object.entries(raw.conflicts ?? {}), 500);
   let dirty = false;
   const WEEK = 7 * 86_400_000;
 
   const store = {
     deliveries,
     nudges,
+    conflicts,
     touch() {
       dirty = true;
     },
@@ -94,6 +97,7 @@ export function createStateStore(file, { now = () => Date.now() } = {}) {
         version: 1,
         deliveries: Object.fromEntries(deliveries.entries()),
         nudges: Object.fromEntries(nudges.entries()),
+        conflicts: Object.fromEntries(conflicts.entries()),
       });
       dirty = false;
     },

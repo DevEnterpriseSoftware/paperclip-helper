@@ -48,6 +48,30 @@ test("RELAY_LINK_PRS is validated like every switch", () => {
   assert.match(problems[0], /RELAY_LINK_PRS=sometimes is not true or false/);
 });
 
+test("conflict sweep: off by default, needs GITHUB_TOKEN when on, and its settings are validated", () => {
+  const relay = { GITHUB_WEBHOOK_SECRET: "s", GITHUB_OWNER_LOGIN: "o", GITHUB_REPOS: "org/repo" };
+  const off = loadConfig(relay).config;
+  assert.equal(off.relayFixConflicts, false);
+  assert.equal(off.githubApi, "https://api.github.com");
+  assert.equal(off.conflictMaxAttempts, 2);
+  assert.equal(off.conflictPrComment, true);
+  assert.equal(off.conflictSweepSec, 900);
+  assert.deepEqual(serviceProblems(off), []);
+
+  const noToken = loadConfig({ ...relay, RELAY_FIX_CONFLICTS: "true" }).config;
+  assert.match(serviceProblems(noToken)[0], /GITHUB_TOKEN is not set .*RELAY_FIX_CONFLICTS=false/);
+  const on = loadConfig({ ...relay, RELAY_FIX_CONFLICTS: "true", GITHUB_TOKEN: "ghp_x", RELAY_CONFLICT_SWEEP_SEC: "0" }).config;
+  assert.deepEqual(serviceProblems(on), []);
+  assert.equal(on.conflictSweepSec, 0);
+  // A token alone turns nothing on, and the relay being off needs no token.
+  assert.equal(loadConfig({ ...relay, GITHUB_TOKEN: "ghp_x" }).config.relayFixConflicts, false);
+  assert.deepEqual(serviceProblems(loadConfig({ RELAY: "false", RELAY_FIX_CONFLICTS: "true" }).config), []);
+
+  const bad = loadConfig({ RELAY_CONFLICT_SWEEP_SEC: "5", RELAY_CONFLICT_MAX_ATTEMPTS: "0", GITHUB_API: "github" }).problems;
+  assert.equal(bad.length, 3);
+  assert.match(bad.join("\n"), /RELAY_CONFLICT_SWEEP_SEC=5 must be 0 \(off\) or at least 60/);
+});
+
 test("everything off is a problem", () => {
   const { config } = loadConfig({ RELAY: "false", WATCHDOG: "false", COST_SYNC: "false" });
   assert.match(serviceProblems(config)[0], /nothing to run/);

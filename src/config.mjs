@@ -84,6 +84,11 @@ export function loadConfig(env = process.env) {
   const webhookPath = get("RELAY_PATH", "/hooks/github");
   if (!webhookPath.startsWith("/")) problems.push(`RELAY_PATH=${webhookPath} must start with /`);
 
+  const sweepSec = get("RELAY_CONFLICT_SWEEP_SEC");
+  if (sweepSec !== "" && Number(sweepSec) > 0 && Number(sweepSec) < 60) {
+    problems.push(`RELAY_CONFLICT_SWEEP_SEC=${sweepSec} must be 0 (off) or at least 60`);
+  }
+
   const config = {
     version: "",
     dataDir,
@@ -113,6 +118,17 @@ export function loadConfig(env = process.env) {
     prefixes: list("ISSUE_PREFIXES").map((s) => s.toUpperCase().replace(/[^A-Z0-9]/g, "")).filter(Boolean),
     // Post a newly opened PR's URL on its issue, so Paperclip links the PR.
     relayLinkPrs: bool("RELAY_LINK_PRS", true),
+
+    // relay.mjs: send PRs with merge conflicts back to their agents
+    relayFixConflicts: bool("RELAY_FIX_CONFLICTS", false),
+    githubToken: get("GITHUB_TOKEN"),
+    githubApi: url("GITHUB_API", "https://api.github.com"),
+    // Send-backs per PR for one run of conflicts, before leaving it to you.
+    conflictMaxAttempts: num("RELAY_CONFLICT_MAX_ATTEMPTS", 2, { min: 1 }),
+    // Say on the PR that it was sent back (needs a token that can write).
+    conflictPrComment: bool("RELAY_CONFLICT_PR_COMMENT", true),
+    // Besides after each merge, look at every open PR this often. 0 = only after merges.
+    conflictSweepSec: num("RELAY_CONFLICT_SWEEP_SEC", 900),
 
     // watchdog.mjs: re-wake stalled work
     watchdog: bool("WATCHDOG", true),
@@ -151,6 +167,11 @@ export function serviceProblems(config) {
       ? "the relay turns on when any of GITHUB_WEBHOOK_SECRET, GITHUB_OWNER_LOGIN or GITHUB_REPOS is set, and then needs all three"
       : "RELAY=true needs all three of GITHUB_WEBHOOK_SECRET, GITHUB_OWNER_LOGIN and GITHUB_REPOS";
     for (const p of config.relayProblems) problems.push(`${p} (${why}; set RELAY=false to turn it off)`);
+  }
+  if (config.relay && config.relayFixConflicts && !config.githubToken) {
+    problems.push(
+      "GITHUB_TOKEN is not set (RELAY_FIX_CONFLICTS=true reads pull requests from GitHub with it; set RELAY_FIX_CONFLICTS=false to turn it off)",
+    );
   }
   if (!config.relay && !config.watchdog && !config.costSync) {
     problems.push("the relay, WATCHDOG and COST_SYNC are all off: there is nothing to run");

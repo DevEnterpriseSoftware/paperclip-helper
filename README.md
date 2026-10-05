@@ -16,13 +16,14 @@ Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that 
 | **A Costs page that shows $0**, because your agents run on a Claude or ChatGPT subscription. | **[Cost sync](docs/cost-sync.md).** It posts each run's API-equivalent cost: Claude Code's own figure, and for Codex, tokens × OpenAI list prices. |
 | **A model drop-down that doesn't list** a new model id. | **[`pch set-model`](docs/commands.md)** moves every agent from one model to another and keeps the rest of their config, effort included. |
 | **"Why is nobody working on this?"** | **[`pch why ISSUE`](docs/commands.md)** prints Paperclip's own diagnosis, then a recommendation: what is holding the issue and the command that gets it moving. `--prompt` turns it into a prompt for an LLM chat. |
+| **PRs waiting for your review that you can't merge**, because another merge left them with conflicts. | **Relay.** After each merge it finds the open PRs that now conflict and sends them back to their agents to resolve, with a note on the PR. |
 | **An issue that lists the wrong PR**, or none. | **Relay.** It posts the PR's URL on its issue when the PR opens, so Paperclip links it. |
 
 ## How it works
 
 - **One container, no npm dependencies.** It calls Paperclip's API directly with a named board key, so everything it does appears in Paperclip under your name.
 - **Three components, each with its own switch:** the relay receives signed GitHub webhooks, the watchdog checks every minute, and cost sync posts every 15 minutes.
-- **It works through Paperclip's API, as you would in the UI:** comments, review decisions, blocker edits and cost events. It never merges, pushes or deletes anything.
+- **It works through Paperclip's API, as you would in the UI:** comments, review decisions, blocker edits and cost events. It never merges, pushes or deletes anything. On GitHub it only reads pull requests and, if you turn that on, comments on the ones it sends back.
 - **`DRY_RUN=true`** makes every component log what it would do and change nothing.
 
 ## Quick start
@@ -55,6 +56,7 @@ What it does step by step, unattended and manual installs, networking and the Gi
 | **You "Request changes"**, or comment `/changes …` | **Changes requested**: back to the engineer, with your text as the brief. |
 | **You comment `/approve …`** | Approved without merging. |
 | **You comment** anything else | Copied to the issue, which wakes the assignee. |
+| **A merge leaves another open PR with conflicts** (optional, needs a GitHub token) | That PR's issue goes **back to its agent** to resolve them, and the PR gets a comment saying so. |
 
 It acts only on events signed with your webhook secret, from your repositories, by your GitHub login, and only when Paperclip says the decision is waiting on *you*. Otherwise it comments. Details and settings: **[docs/relay.md](docs/relay.md)**.
 
@@ -95,6 +97,7 @@ Examples and sample output: **[docs/commands.md](docs/commands.md)**.
 - **Where it's stored:** `data/paperclip-token`, mode 600 on Linux and macOS. Only the container's user can read it, and it never leaves the machine.
 - **Revoking it:** `pch revoke` revokes it in Paperclip and deletes the file. Run `pch login` for a new one.
 - **The webhook secret** is in `.env` (mode 600 on Linux and macOS). GitHub signs every delivery with it, and unsigned or wrongly signed deliveries are rejected.
+- **The GitHub token** (optional, for sending back PRs with merge conflicts) is in `.env` too. Give it only the relay's repositories and only "Pull requests" access; the helper reads pull requests and comments on them, nothing else. See [the GitHub token](docs/relay.md#the-github-token).
 - **Paperclip's API is never exposed.** Only the relay's path needs to be public.
 - **The container** runs as a non-root user with a read-only filesystem, no capabilities, and `no-new-privileges`.
 - **Logs** are one JSON line per event. Anything that looks like a key or secret is masked.
@@ -118,7 +121,7 @@ Examples and sample output: **[docs/commands.md](docs/commands.md)**.
 | Page | What's in it |
 |---|---|
 | [docs/install.md](docs/install.md) | What the installer does, unattended and manual installs, general settings, networking, the hostname guard, exposing the relay, upgrading, uninstalling. |
-| [docs/relay.md](docs/relay.md) | Every GitHub event and what it does, how the issue is found, safety rules, the webhook, settings. |
+| [docs/relay.md](docs/relay.md) | Every GitHub event and what it does, how the issue is found, PRs with merge conflicts and the GitHub token, safety rules, the webhook, settings. |
 | [docs/watchdog.md](docs/watchdog.md) | The six situations in detail, limits, what it leaves to you, settings. |
 | [docs/cost-sync.md](docs/cost-sync.md) | How costs are worked out, what to know before turning it on, settings. |
 | [docs/commands.md](docs/commands.md) | Every `pch` command, with `set-model` and `why` examples. |

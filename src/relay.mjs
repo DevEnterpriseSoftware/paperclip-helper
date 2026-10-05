@@ -16,6 +16,9 @@
 //                                          Paperclip links it (RELAY_LINK_PRS)
 //   * PR closed unmerged, or merged by   → a note on the issue
 //     someone else
+//   * Any PR merged                      → other open PRs that now conflict are
+//                                          sent back to their agents
+//                                          (RELAY_FIX_CONFLICTS, conflicts.mjs)
 //
 // It ignores events without a valid GITHUB_WEBHOOK_SECRET signature, or from a
 // repository not in GITHUB_REPOS. Decisions and copied comments also need the
@@ -24,7 +27,9 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
-import { approvalWaitingOn, DECISION_STATUS } from "./util.mjs";
+import { approvalWaitingOn, DECISION_STATUS, every } from "./util.mjs";
+import { createGitHub } from "./github.mjs";
+import { createConflictSweep, HELPER_MARK } from "./conflicts.mjs";
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 const MAX_FORWARDED_CHARS = 20_000;
@@ -101,7 +106,7 @@ export function isWorkProductOf(wp, pr) {
 const heading = (kind, plain, pr) =>
   `${kind === "changes" ? "Changes requested" : kind === "approve" ? "Approved" : plain} on ${prLabel(pr)}`;
 
-export function createRelay(ctx, state) {
+export function createRelay(ctx, state, { github, sleep } = {}) {
   const { config, api, log } = ctx;
   const deliveries = state.deliveries;
   const prefixLabel = () => (ctx.prefixes().length ? ctx.prefixes().join("/") : "Paperclip");
@@ -202,8 +207,9 @@ export function createRelay(ctx, state) {
     return { identifier, action: "comment" };
   }
 
-  async function decide(pr, identifiers, kind, comment) {
-    const target = await resolveTarget(pr, identifiers);
+  // `resolved`: a target the caller already looked up for this PR.
+  async function decide(pr, identifiers, kind, comment, resolved) {
+    const target = resolved ?? (await resolveTarget(pr, identifiers));
     if (!target) return { identifiers, action: "none", reason: "no Paperclip issue found for the identifiers" };
     const { issue, waiting, ambiguous, via } = target;
     const identifier = issue.identifier ?? issue.id;
@@ -269,6 +275,35 @@ export function createRelay(ctx, state) {
     return addComment(target?.issue?.identifier ?? identifiers[0], comment);
   }
 
+  // ------------------------------------------------------------ merge conflicts
+
+  const conflicts = config.relayFixConflicts
+    ? createConflictSweep({
+        ctx,
+        state,
+        github: github ?? createGitHub({ config, log }),
+        identifiersOf: (pr) => findIdentifiers(pr, ctx.prefixes()),
+        resolveTarget,
+        decide,
+        sleep,
+      })
+    : null;
+  const background = new Set();
+  const inBackground = (work) => {
+    const run = work.catch((err) => log.error("relay: conflict sweep failed", { error: err.message }));
+    background.add(run);
+    run.finally(() => background.delete(run));
+  };
+  // Not awaited: GitHub gives a webhook ten seconds, and a sweep can take longer.
+  function sweepAfterMerge(repo, pr) {
+    if (!conflicts) return;
+    inBackground(conflicts.sweep(repo, { base: pr.base?.ref, after: pr }));
+  }
+  async function sweepAll() {
+    for (const repo of config.repos) await conflicts.sweep(repo);
+  }
+  let timer = null;
+
   // ------------------------------------------------------------ GitHub events
 
   async function handle(event, payload) {
@@ -294,6 +329,8 @@ export function createRelay(ctx, state) {
         return commentOnTarget(pr, identifiers, `${prLabel(pr)} ${verb} by @${payload.sender?.login}: ${pr.html_url}`);
       }
       if (payload.action !== "closed") return { ignored: `pull_request.${payload.action}` };
+      // Whoever merged it and whatever it names: the base branch moved.
+      if (pr.merged) sweepAfterMerge(repo, pr);
       const identifiers = findIdentifiers(pr, prefixes);
       if (!identifiers.length) return { ignored: `${prLabel(pr)} names no ${prefixLabel()} issue` };
       const identifier = identifiers[0];
@@ -336,6 +373,8 @@ export function createRelay(ctx, state) {
       if (payload.action !== "created") return { ignored: `issue_comment.${payload.action}` };
       if (!payload.issue?.pull_request) return { ignored: "comment on an issue, not a PR" };
       if (sender !== config.ownerLogin) return { ignored: `comment by @${payload.sender?.login}` };
+      // With your own token, the helper's PR comments arrive as yours.
+      if (String(payload.comment?.body ?? "").includes(HELPER_MARK)) return { ignored: "the helper's own comment" };
       // The issue stands in for the PR (title, body, number, html_url), but it has
       // no branch, so only the title and body are searched for identifiers.
       const pr = payload.issue;
@@ -354,6 +393,7 @@ export function createRelay(ctx, state) {
   // ------------------------------------------------------------ HTTP server
 
   const stats = { handled: 0, failed: 0, lastEventAt: null, lastError: null };
+  if (conflicts) stats.conflicts = conflicts.stats;
 
   function send(res, status, body) {
     res.writeHead(status, { "content-type": "application/json" });
@@ -438,14 +478,25 @@ export function createRelay(ctx, state) {
             repos: config.repos,
             owner: config.ownerLogin,
             prefixes: ctx.prefixes().length ? ctx.prefixes() : "every company's own",
+            fixConflicts: Boolean(conflicts),
           });
+          if (conflicts && config.conflictSweepSec > 0) {
+            timer = every("relay conflicts", config.conflictSweepSec, 30_000, sweepAll, log);
+          }
           resolve(server.address().port);
         });
       });
     },
+    // Look at every open PR now (all repositories, or one).
+    sweepConflicts: (repo, options) => (repo ? conflicts.sweep(repo, options) : sweepAll()),
+    // Resolves when the sweeps started by merges have finished.
+    async idle() {
+      while (background.size) await Promise.allSettled([...background]);
+    },
     async stop() {
+      await timer?.stop();
       await new Promise((resolve) => server.close(() => resolve()));
-      await Promise.allSettled([...inflight]);
+      await Promise.allSettled([...inflight, ...background]);
     },
   };
 }

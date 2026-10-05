@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0
+
+- **Relay: PRs with merge conflicts go back to their agents by themselves.** With many small PRs, each merge can leave other open PRs conflicting with the base branch, and they then wait for a review you can't finish. With `RELAY_FIX_CONFLICTS=true` and a `GITHUB_TOKEN`, the relay looks at the other open PRs after every merge (and every 15 minutes, in case a webhook was missed). For each one GitHub says conflicts, it requests changes on the PR's issue when its review is waiting on you, or comments on it otherwise, with a brief to bring the branch up to date, resolve the conflicts and push. It says so in a comment on the PR, so you can see it was already sent back.
+  - A PR is sent back once per push, and after `RELAY_CONFLICT_MAX_ATTEMPTS` (2) pushes that still conflict it is left to you, with a note on the PR. Drafts, PRs that name no Paperclip issue, and PRs whose issue is done or cancelled are skipped.
+  - Off by default. The installer asks about it and for the token; [docs/relay.md](docs/relay.md#the-github-token) has the steps to create one. `pch check` tests that the token can read your repositories, and `pch status` counts the PRs sent back.
+  - The helper still never merges, pushes, closes or deletes anything. The token is used to read pull requests and to comment on them.
+- **Logs:** GitHub tokens are masked, like Paperclip keys.
+
 ## 1.1.2
 
 - **`pch why`:** ends with a recommendation: what is holding the issue, the steps or commands that get it moving, and whether the watchdog does it by itself. It also shows the latest comment, an issue Paperclip's recovery parked, and saved messages that are waiting. `pch why ISSUE --prompt` prints all of it, with the last three comments, as a prompt for an LLM chat.

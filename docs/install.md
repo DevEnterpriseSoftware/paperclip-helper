@@ -4,7 +4,7 @@ The one-line installers are in the [README](../README.md#quick-start). This page
 
 You need a self-hosted Paperclip and Docker with Compose v2 **on the same machine**. On Linux that means Docker Engine; on Windows and macOS, Docker Desktop or similar. You also need a Paperclip board user.
 
-The installer shows everything before it writes it, and you can re-run it at any time to change settings. It keeps your key and webhook secret. It never uses `sudo` or administrator rights.
+The installer shows everything before it writes it, and you can re-run it at any time to change settings. It keeps your key, webhook secret and GitHub token. It never uses `sudo` or administrator rights.
 
 ## What the installer does
 
@@ -14,7 +14,7 @@ The installer shows everything before it writes it, and you can re-run it at any
 4. **Asks for Paperclip's public URL:** the address you open in a browser.
 5. **Logs in.** It prints an approval link, you approve it in Paperclip, and it saves a named board key.
 6. **Asks about each component:**
-   - **Relay** (default: yes): your GitHub login, the repositories, and the issue prefixes (detected from your companies). Then it asks whether to post new PRs' URLs, and the port and path. It generates the webhook secret.
+   - **Relay** (default: yes): your GitHub login, the repositories, and the issue prefixes (detected from your companies). Then it asks whether to post new PRs' URLs, whether to send PRs with merge conflicts back to their agents (default: no; it then asks for a [GitHub token](relay.md#the-github-token), typed hidden), and the port and path. It generates the webhook secret.
    - **Watchdog** (default: yes): its timing, if you want to change it, and its two repairs: blockers stuck on a failed clean-up, and wakes deferred behind a stopped run.
    - **Cost sync** (default: yes): it shows `pch costs` first, and whether to include runs that already finished.
 7. **Writes `compose.yml`, `.env` (mode 600 on Linux and macOS) and `data/`**, then starts the service and shows its first log lines.
@@ -33,6 +33,7 @@ Set `PCH_NONINTERACTIVE=1` and pass answers as environment variables.
 | `PAPERCLIP_PUBLIC_URL` | The address you open Paperclip at. |
 | `PCH_TOKEN` | An existing board key. Without it, the installer still prints the approval link and waits. |
 | `GITHUB_OWNER_LOGIN`, `GITHUB_REPOS` | `GITHUB_OWNER_LOGIN` turns the relay on, and then `GITHUB_REPOS` is required. |
+| `RELAY_FIX_CONFLICTS`, `GITHUB_TOKEN` | `RELAY_FIX_CONFLICTS=true` sends PRs with merge conflicts back to their agents, and then `GITHUB_TOKEN` is required. |
 | `COST_SYNC_SINCE` | Cost sync posts only runs that finish after the install, because nobody saw the preview. Pass an earlier ISO 8601 time to include past runs, or `1970-01-01T00:00:00Z` for all of them. |
 | Any other setting the installer asks about, such as `ISSUE_PREFIXES`, `WATCHDOG` or `COST_SYNC` | Used as the answer. Add other settings from [`.env.example`](../.env.example) to `.env` afterwards; re-runs keep them. |
 | `PCH_WEBHOOK_URL` | The public webhook URL to test. |

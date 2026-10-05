@@ -11,6 +11,8 @@ src/
   context.mjs     config + logger + API client + identity, built once
   paperclip.mjs   HTTP client: timeouts, safe retries, readable errors
   relay.mjs       GitHub webhooks → decisions and comments
+  conflicts.mjs   the relay's sweep for PRs with merge conflicts
+  github.mjs      GitHub API client, used by that sweep only
   watchdog.mjs    stalled-work checks and nudges
   cost-sync.mjs   API-equivalent cost events
   prices.mjs      model price table

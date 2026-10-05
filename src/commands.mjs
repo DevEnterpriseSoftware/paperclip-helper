@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { readJson } from "./store.mjs";
+import { createGitHub } from "./github.mjs";
 import { companyAgents, companyPrefixes } from "./paperclip.mjs";
 import { approvalWaitingOn, DECISION_STATUS } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
@@ -114,6 +115,19 @@ export async function check(ctx, identifier) {
   for (const companyId of me.companyIds ?? []) {
     const company = await api.request("GET", `/api/companies/${companyId}`).catch(() => null);
     out(`Company: ${company?.name ?? companyId} (issue prefix ${company?.issuePrefix ?? "?"})`);
+  }
+  if (ctx.config.relayFixConflicts && ctx.config.githubToken) {
+    // Reading is all this can try: commenting is only tested by doing it.
+    const github = createGitHub({ config: ctx.config, log: ctx.log });
+    for (const repo of ctx.config.repos) {
+      try {
+        const pulls = await github.openPulls(repo);
+        out(`GitHub: GITHUB_TOKEN reads ${repo} (${pulls.length} open ${pulls.length === 1 ? "PR" : "PRs"})`);
+      } catch (err) {
+        out(`GitHub: ${err.message}`);
+        process.exitCode = 1;
+      }
+    }
   }
   if (!identifier) return;
   const issue = await api.request("GET", `/api/issues/${encodeURIComponent(identifier)}`);
@@ -415,6 +429,8 @@ export async function status(ctx) {
     if (s.dryRun) out("DRY RUN: components log what they would do and change nothing.");
     const r = s.relay;
     out(r?.on ? `Relay: on, ${r.handled} deliveries handled, ${r.failed} failed, last ${ago(r.lastEventAt)}${r.lastError ? `; last error: ${r.lastError}` : ""}` : "Relay: off");
+    const k = r?.on ? r.conflicts : null;
+    if (k) out(`  Merge conflicts: ${k.sentBack} PRs sent back since start, last look ${ago(k.lastSweepAt)}${k.lastError ? `; last error: ${k.lastError}` : ""}`);
     const w = s.watchdog;
     out(
       w?.on

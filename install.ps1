@@ -36,6 +36,21 @@ function Install-PaperclipHelper {
     return $answer.Trim()
   }
 
+  function Mask([string]$Value) {
+    if ($Value.Length -gt 8) { return "$($Value.Substring(0, 4))...($($Value.Length) chars)" }
+    return '***'
+  }
+
+  # Like Ask, but typing is hidden and the current value is shown masked. Enter keeps it.
+  function Ask-Secret([string]$Question, [string]$Current) {
+    if ($NonInteractive) { return $Current }
+    $prompt = if ($Current) { "$Question [keep $(Mask $Current)]" } else { $Question }
+    $secure = Read-Host $prompt -AsSecureString
+    $answer = [System.Net.NetworkCredential]::new('', $secure).Password
+    if ([string]::IsNullOrWhiteSpace($answer)) { return $Current }
+    return ($answer -replace '\s', '')
+  }
+
   function Confirm([string]$Question, [bool]$Default = $true) {
     if ($NonInteractive) { return $Default }
     $hint = if ($Default) { '[Y/n]' } else { '[y/N]' }
@@ -178,7 +193,7 @@ function Install-PaperclipHelper {
   # ---------------------------------------------------------------- files
 
   $Managed = @('PCH_UID', 'PCH_GID', 'PCH_IMAGE', 'PAPERCLIP_API', 'PAPERCLIP_PUBLIC_URL', 'RELAY', 'GITHUB_WEBHOOK_SECRET',
-    'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_HOST', 'RELAY_PORT', 'RELAY_PATH',
+    'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'GITHUB_TOKEN', 'RELAY_HOST', 'RELAY_PORT', 'RELAY_PATH',
     'WATCHDOG', 'WATCHDOG_INTERVAL_SEC', 'WATCHDOG_STALL_SEC', 'WATCHDOG_MAX_NUDGES', 'WATCHDOG_HEAL_FAILED_FINALIZE',
     'WATCHDOG_RETRY_DEFERRED', 'COST_SYNC', 'COST_SYNC_SINCE')
 
@@ -226,7 +241,7 @@ $network
   function Show-File([string]$Label, [string]$Text) {
     Say "---- $Label"
     foreach ($line in ($Text -split "`n")) {
-      if ($line -match '^GITHUB_WEBHOOK_SECRET=(.{8,})$') { $line = "GITHUB_WEBHOOK_SECRET=$($Matches[1].Substring(0, 4))...($($Matches[1].Length) chars)" }
+      if ($line -match '^(GITHUB_WEBHOOK_SECRET|GITHUB_TOKEN)=(.{8,})$') { $line = "$($Matches[1])=$(Mask $Matches[2])" }
       if ($line) { Say "  $line" }
     }
   }
@@ -416,7 +431,7 @@ $network
   }
 
   Step 'Relay: merge a PR to approve its issue'
-  foreach ($key in @('RELAY', 'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'GITHUB_WEBHOOK_SECRET', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS')) { $s[$key] = Pick $key }
+  foreach ($key in @('RELAY', 'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'GITHUB_WEBHOOK_SECRET', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'GITHUB_TOKEN')) { $s[$key] = Pick $key }
   $s.RELAY_PORT = Pick 'RELAY_PORT' '3110'
   $s.RELAY_PATH = Pick 'RELAY_PATH' '/hooks/github'
   $s.RELAY_HOST = if ($script:NetMode -eq 'host') { '127.0.0.1' } else { '0.0.0.0' }
@@ -438,12 +453,31 @@ $network
     $s.ISSUE_PREFIXES = Ask "Issue prefixes to look for (empty = all of your companies')" $s.ISSUE_PREFIXES
     $linkDefault = -not ($s.RELAY_LINK_PRS -and -not (Truthy $s.RELAY_LINK_PRS))
     $s.RELAY_LINK_PRS = if (Confirm "Post each new PR's URL on its issue, so Paperclip links the PR?" $linkDefault) { 'true' } else { 'false' }
+    Say 'Each merge can leave other open PRs conflicting with the base branch. The relay can send those back'
+    Say 'to their agents and say so on the PR. For that it needs a GitHub token.'
+    if (Confirm 'Send PRs with merge conflicts back to their agents automatically?' (Truthy $s.RELAY_FIX_CONFLICTS)) {
+      $s.RELAY_FIX_CONFLICTS = 'true'
+      if (-not $s.GITHUB_TOKEN) {
+        Note 'Create a fine-grained token at https://github.com/settings/personal-access-tokens/new'
+        Note "  Repository access: Only select repositories -> $($s.GITHUB_REPOS)"
+        Note '  Repository permissions: Pull requests -> Read and write'
+        Note "  (A classic token with the `"repo`" scope works too. Steps: $RepoUrl/blob/main/docs/relay.md#the-github-token)"
+      }
+      $s.GITHUB_TOKEN = Ask-Secret 'GitHub token' $s.GITHUB_TOKEN
+      if (-not $s.GITHUB_TOKEN) {
+        Warn "No token given: PRs with merge conflicts won't be sent back. Re-run the installer to add one."
+        $s.RELAY_FIX_CONFLICTS = 'false'
+      }
+    } else {
+      $s.RELAY_FIX_CONFLICTS = 'false'
+    }
     $s.RELAY_PORT = Ask 'Relay port' $s.RELAY_PORT
     $s.RELAY_PATH = Ask 'Webhook path' $s.RELAY_PATH
     if ($s.GITHUB_WEBHOOK_SECRET -and -not (Confirm 'Keep the existing webhook secret?' $true)) { $s.GITHUB_WEBHOOK_SECRET = '' }
     if (-not $s.GITHUB_WEBHOOK_SECRET) { $s.GITHUB_WEBHOOK_SECRET = New-Secret }
   } else {
     $s.RELAY = 'false'
+    $s.RELAY_FIX_CONFLICTS = 'false'
   }
 
   Step 'Watchdog: wake agents whose work stalled'
@@ -503,6 +537,11 @@ $network
   if ($up.Code -ne 0) { Say $up.Text; Die 'docker compose up failed.' }
   Start-Sleep -Seconds 6
   (Invoke-Docker compose -f $composePath logs --no-log-prefix --tail 20 helper).Text -split "`n" | ForEach-Object { Note $_ }
+
+  if ((Truthy $s.RELAY) -and (Truthy $s.RELAY_FIX_CONFLICTS)) {
+    # Prints nothing with an image older than 1.2.
+    (Invoke-Docker compose -f $composePath run --rm helper check).Text -split "`n" | Where-Object { $_ -like 'GitHub:*' } | ForEach-Object { Note $_ }
+  }
 
   if (Truthy $s.RELAY) {
     Step 'Webhook'

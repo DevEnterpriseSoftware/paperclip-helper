@@ -4,9 +4,11 @@
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const SECRET_KEY = /token|secret|password|authorization|cookie/i;
 const SECRET_VALUE = /\bpcp_[a-z_]*[0-9a-f]{16,}\b/gi;
+// GitHub tokens: ghp_…, gho_…, ghs_…, github_pat_….
+const GITHUB_TOKEN = /\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}\b/g;
 
 export function redact(value, depth = 0) {
-  if (typeof value === "string") return value.replace(SECRET_VALUE, "pcp_***");
+  if (typeof value === "string") return value.replace(SECRET_VALUE, "pcp_***").replace(GITHUB_TOKEN, "$1***");
   if (!value || typeof value !== "object" || depth > 6) return value;
   if (Array.isArray(value)) return value.map((v) => redact(v, depth + 1));
   const out = {};

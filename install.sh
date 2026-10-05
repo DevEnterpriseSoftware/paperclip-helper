@@ -40,6 +40,21 @@ ask() {
   printf -v "$var" '%s' "${answer:-$default}"
 }
 
+# ask_secret VAR "Question" "current": like ask, but typing is hidden and the
+# current value is shown masked. Enter keeps the current value.
+ask_secret() {
+  local var="$1" question="$2" current="${3:-}" answer=""
+  if [ -n "$NONINTERACTIVE" ]; then
+    printf -v "$var" '%s' "$current"
+    return
+  fi
+  if [ -n "$current" ]; then printf '%s [keep %s]: ' "$question" "$(mask "$current")" >/dev/tty; else printf '%s: ' "$question" >/dev/tty; fi
+  IFS= read -rs answer </dev/tty || true
+  printf '\n' >/dev/tty
+  answer="$(printf '%s' "$answer" | tr -d '[:space:]')"
+  printf -v "$var" '%s' "${answer:-$current}"
+}
+
 # confirm "Question" y|n: returns 0 for yes.
 confirm() {
   local question="$1" default="${2:-y}" answer=""
@@ -214,7 +229,7 @@ EOF
   } >"$1"
 }
 
-MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED COST_SYNC COST_SYNC_SINCE"
+MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS GITHUB_TOKEN RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED COST_SYNC COST_SYNC_SINCE"
 
 write_env() {
   local key
@@ -237,7 +252,8 @@ write_env() {
 
 show_file() {
   say "---- $1"
-  sed -e "s/^\(GITHUB_WEBHOOK_SECRET=\).\{8,\}$/\1$(mask "$GITHUB_WEBHOOK_SECRET")/" "$2" | sed 's/^/  /'
+  sed -e "s/^\(GITHUB_WEBHOOK_SECRET=\).\{8,\}$/\1$(mask "$GITHUB_WEBHOOK_SECRET")/" \
+    -e "s/^\(GITHUB_TOKEN=\).\{8,\}$/\1$(mask "${GITHUB_TOKEN:-}")/" "$2" | sed 's/^/  /'
 }
 
 # pch.sh comes from the image. `pch update` runs it on the host; every other command
@@ -422,6 +438,8 @@ main() {
   GITHUB_WEBHOOK_SECRET="$(pick GITHUB_WEBHOOK_SECRET)"
   ISSUE_PREFIXES="$(pick ISSUE_PREFIXES)"
   RELAY_LINK_PRS="$(pick RELAY_LINK_PRS)"
+  RELAY_FIX_CONFLICTS="$(pick RELAY_FIX_CONFLICTS)"
+  GITHUB_TOKEN="$(pick GITHUB_TOKEN)"
   RELAY_PORT="$(pick RELAY_PORT 3110)"
   RELAY_PATH="$(pick RELAY_PATH /hooks/github)"
   # shellcheck disable=SC2034  # written to .env by write_env
@@ -448,6 +466,25 @@ main() {
     ask ISSUE_PREFIXES "Issue prefixes to look for (empty = all of your companies')" "$ISSUE_PREFIXES"
     local link=y; if [ -n "$RELAY_LINK_PRS" ] && ! truthy "$RELAY_LINK_PRS"; then link=n; fi
     if confirm "Post each new PR's URL on its issue, so Paperclip links the PR?" "$link"; then RELAY_LINK_PRS=true; else RELAY_LINK_PRS=false; fi
+    say "Each merge can leave other open PRs conflicting with the base branch. The relay can send those back"
+    say "to their agents and say so on the PR. For that it needs a GitHub token."
+    local fix=n; if truthy "$RELAY_FIX_CONFLICTS"; then fix=y; fi
+    if confirm "Send PRs with merge conflicts back to their agents automatically?" "$fix"; then
+      RELAY_FIX_CONFLICTS=true
+      if [ -z "$GITHUB_TOKEN" ]; then
+        note "Create a fine-grained token at https://github.com/settings/personal-access-tokens/new"
+        note "  Repository access: Only select repositories → $GITHUB_REPOS"
+        note "  Repository permissions: Pull requests → Read and write"
+        note "  (A classic token with the \"repo\" scope works too. Steps: $REPO_URL/blob/main/docs/relay.md#the-github-token)"
+      fi
+      ask_secret GITHUB_TOKEN "GitHub token" "$GITHUB_TOKEN"
+      if [ -z "$GITHUB_TOKEN" ]; then
+        warn "No token given: PRs with merge conflicts won't be sent back. Re-run the installer to add one."
+        RELAY_FIX_CONFLICTS=false
+      fi
+    else
+      RELAY_FIX_CONFLICTS=false
+    fi
     ask RELAY_PORT "Relay port" "$RELAY_PORT"
     ask RELAY_PATH "Webhook path" "$RELAY_PATH"
     if [ -n "$GITHUB_WEBHOOK_SECRET" ]; then
@@ -456,6 +493,7 @@ main() {
     [ -n "$GITHUB_WEBHOOK_SECRET" ] || GITHUB_WEBHOOK_SECRET="$(random_hex)"
   else
     RELAY=false
+    RELAY_FIX_CONFLICTS=false
   fi
 
   step "Watchdog: wake agents whose work stalled"
@@ -521,6 +559,11 @@ main() {
   (cd "$DIR" && docker compose up -d --remove-orphans </dev/null) || die "docker compose up failed."
   sleep 6
   (cd "$DIR" && docker compose logs --no-log-prefix --tail 20 helper </dev/null) | sed 's/^/  /'
+
+  if truthy "$RELAY" && truthy "$RELAY_FIX_CONFLICTS"; then
+    # Prints nothing with an image older than 1.2.
+    (cd "$DIR" && docker compose run --rm helper check </dev/null 2>/dev/null) | grep '^GitHub:' | sed 's/^/  /' || true
+  fi
 
   if truthy "$RELAY"; then
     step "Webhook"
