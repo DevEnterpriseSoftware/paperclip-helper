@@ -19,6 +19,8 @@
 
 // Ends every comment the helper writes on a PR, so the relay doesn't copy its
 // own comments back to Paperclip when GitHub delivers them as webhooks.
+import { signed } from "./util.mjs";
+
 export const HELPER_MARK = "<!-- paperclip-helper -->";
 
 // GitHub works out `mergeable` in the background: null means "ask again".
@@ -50,21 +52,19 @@ export function createConflictSweep({ ctx, state, github, identifiersOf, resolve
     const base = pr.base?.ref ?? "the base branch";
     const branch = pr.head?.ref ?? "its branch";
     const cause = after ? ` since ${prLabel(after)} was merged` : "";
-    return [
+    return signed([
       `Changes requested on ${prLabel(pr)}: merge conflicts with \`${base}\``,
       "",
       `${prLabel(pr)} can't be merged: it conflicts with \`${base}\`${cause}. ${pr.html_url}`,
       "",
       `Bring \`${branch}\` up to date with the latest \`origin/${base}\`, resolve the conflicts so that both sides' changes are kept as intended, run the tests, and push to the same branch. Don't open a new pull request. Nothing else about the work was reviewed or needs to change.`,
-      "",
-      "_Sent automatically by Paperclip Helper._",
-    ].join("\n");
+    ].join("\n"));
   }
 
   async function commentOnPr(repo, pr, text) {
     if (!config.conflictPrComment) return false;
     try {
-      await github.comment(repo, pr.number, `${text}\n\n${HELPER_MARK}`);
+      await github.comment(repo, pr.number, `${signed(text)}\n\n${HELPER_MARK}`);
       return true;
     } catch (err) {
       // The send-back itself worked; a missing note isn't worth failing over.

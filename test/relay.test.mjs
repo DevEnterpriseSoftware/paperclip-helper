@@ -4,6 +4,7 @@ import { setup, sign } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { createRelay, findIdentifiers, isWorkProductOf, verifySignature } from "../src/relay.mjs";
 import { createStateStore } from "../src/store.mjs";
+import { signed, SIGNATURE } from "../src/util.mjs";
 
 const SECRET = "test-secret";
 const RELAY_ENV = { GITHUB_WEBHOOK_SECRET: SECRET, GITHUB_OWNER_LOGIN: "Owner", GITHUB_REPOS: "org/app", RELAY_PORT: "0" };
@@ -328,7 +329,10 @@ test("an opened PR posts one comment with its URL on the issue it names", async 
   const r = await relay.handle("pull_request", opened());
   assert.deepEqual(r, { identifier: "ACM-1", action: "comment" });
   assert.equal(db.comments.length, 1);
-  assert.equal(db.comments[0].body, "PR #8 opened by @agent-bot: https://github.com/org/app/pull/8");
+  assert.equal(
+    db.comments[0].body,
+    "PR #8 opened by @agent-bot: https://github.com/org/app/pull/8\n\n_Relayed from GitHub by Paperclip Helper._",
+  );
   assert.equal(db.patches.length, 0, "informational only: no decision");
 });
 
@@ -341,8 +345,8 @@ test("reopened and ready-for-review PRs post their URL too; other actions don't"
   assert.deepEqual(
     db.comments.map((c) => c.body),
     [
-      "PR #8 reopened by @agent-bot: https://github.com/org/app/pull/8",
-      "PR #8 opened by @agent-bot: https://github.com/org/app/pull/8",
+      "PR #8 reopened by @agent-bot: https://github.com/org/app/pull/8\n\n_Relayed from GitHub by Paperclip Helper._",
+      "PR #8 opened by @agent-bot: https://github.com/org/app/pull/8\n\n_Relayed from GitHub by Paperclip Helper._",
     ],
   );
 });
@@ -354,7 +358,7 @@ test("with a parent/subtask split, the URL goes to the subtask waiting on you", 
   assert.equal(r.identifier, "ACM-2");
   assert.equal(db.comments.length, 1);
   assert.equal(db.comments[0].issueId, child.id);
-  assert.match(db.comments[0].body, /https:\/\/github\.com\/org\/app\/pull\/8$/);
+  assert.match(db.comments[0].body, /https:\/\/github\.com\/org\/app\/pull\/8\n\n_Relayed from GitHub by Paperclip Helper\._$/);
 });
 
 test("RELAY_LINK_PRS=false ignores opened PRs; a PR that names no issue is ignored", async (t) => {
@@ -422,4 +426,29 @@ test("HTTP: signature check, JSON summary, duplicate deliveries, and redelivery 
   // Delivery ids survive a restart.
   const again = createStateStore(env.ctx.config.stateFile);
   assert.equal(again.deliveries.has("d1"), true);
+});
+
+test("every message ends with one italic line naming the helper, and only one", async (t) => {
+  assert.equal(signed("Done."), `Done.\n\n${SIGNATURE}`);
+  assert.equal(signed(signed("Done.")), signed("Done."));
+  const nudge = "Please continue.\n\n_Paperclip Helper watchdog, nudge 1/2._";
+  assert.equal(signed(`${nudge}\n`), nudge);
+  // Naming the helper mid-text is not a signature.
+  assert.equal(signed("_Paperclip Helper_ did this.\nMore."), `_Paperclip Helper_ did this.\nMore.\n\n${SIGNATURE}`);
+
+  const { relay, db } = await relayEnv(t);
+  seed(db);
+  const ends = /\n\n_Relayed from GitHub by Paperclip Helper\._$/;
+  await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  assert.match(db.patches.at(-1).body.comment, ends); // merge → approval
+  await relay.handle("pull_request", { action: "closed", pull_request: pr({ merged: false }), repository: repo, sender: owner });
+  assert.match(db.comments.at(-1).body, ends); // closed without merging
+  await relay.handle("issue_comment", {
+    action: "created",
+    issue: { number: 8, title: "ACM-1: thing", body: "", pull_request: {} },
+    comment: { body: "Looks close", html_url: "https://github.com/org/app/pull/8#c1" },
+    repository: repo,
+    sender: owner,
+  });
+  assert.match(db.comments.at(-1).body, ends); // copied PR comment
 });

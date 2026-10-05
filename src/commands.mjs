@@ -6,7 +6,7 @@ import path from "node:path";
 import { readJson } from "./store.mjs";
 import { createGitHub } from "./github.mjs";
 import { companyAgents, companyPrefixes } from "./paperclip.mjs";
-import { approvalWaitingOn, DECISION_STATUS } from "./util.mjs";
+import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, signed } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
 import { advise, excerpt, llmPrompt } from "./advice.mjs";
 
@@ -331,13 +331,16 @@ export async function decide(ctx, kind, identifier, text) {
         `(current participant: ${p ? `${p.type} ${p.agentId ?? p.userId}` : "none"}). Nothing changed.`,
     );
   }
-  await ctx.api.request("PATCH", `/api/issues/${encodeURIComponent(identifier)}`, { status: DECISION_STATUS[kind], comment });
+  await ctx.api.request("PATCH", `/api/issues/${encodeURIComponent(identifier)}`, {
+    status: DECISION_STATUS[kind],
+    comment: signed(comment, COMMAND_SIGNATURE),
+  });
   out(`${identifier}: ${kind === "approve" ? "approved (done)" : "changes requested (back to the engineer)"}.`);
 }
 
 export async function comment(ctx, identifier, text) {
   if (!identifier || !text) throw new Error("usage: comment <ISSUE-ID> <text>");
-  await ctx.api.request("POST", `/api/issues/${encodeURIComponent(identifier)}/comments`, { body: text });
+  await ctx.api.request("POST", `/api/issues/${encodeURIComponent(identifier)}/comments`, { body: signed(text, COMMAND_SIGNATURE) });
   out(`${identifier}: comment added.`);
 }
 

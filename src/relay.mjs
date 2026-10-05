@@ -27,7 +27,7 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
-import { approvalWaitingOn, DECISION_STATUS, every } from "./util.mjs";
+import { approvalWaitingOn, DECISION_STATUS, every, RELAYED_SIGNATURE, signed } from "./util.mjs";
 import { createGitHub } from "./github.mjs";
 import { createConflictSweep, HELPER_MARK } from "./conflicts.mjs";
 
@@ -203,7 +203,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
 
   async function addComment(identifier, comment) {
     if (config.dryRun) return { identifier, action: "comment (dry run)" };
-    await api.request("POST", `/api/issues/${encodeURIComponent(identifier)}/comments`, { body: comment });
+    await api.request("POST", `/api/issues/${encodeURIComponent(identifier)}/comments`, { body: signed(comment, RELAYED_SIGNATURE) });
     return { identifier, action: "comment" };
   }
 
@@ -235,7 +235,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
     if (config.dryRun) return { identifier, action: `${kind} (dry run)`, status };
     const path = `/api/issues/${encodeURIComponent(identifier)}`;
     // The decision and its comment must travel in the same PATCH.
-    await api.request("PATCH", path, { status, comment });
+    await api.request("PATCH", path, { status, comment: signed(comment, RELAYED_SIGNATURE) });
 
     // Approving a stage that isn't the last one only moves the issue to the next
     // stage. When that stage is yours too (an escalated review followed by your
@@ -251,7 +251,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
         stages.push(next);
         await api.request("PATCH", path, {
           status,
-          comment: `Approved at the ${next} stage as well: ${prLabel(pr)} was merged. ${pr.html_url ?? ""}`.trim(),
+          comment: signed(`Approved at the ${next} stage as well: ${prLabel(pr)} was merged. ${pr.html_url ?? ""}`, RELAYED_SIGNATURE),
         });
         current = await api.request("GET", path).catch(() => null);
       }

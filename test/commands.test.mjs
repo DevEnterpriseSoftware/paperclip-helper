@@ -63,7 +63,7 @@ test("approve refuses when the decision isn't waiting on you; changes refuses wi
 
   issue.executionState.currentParticipant = { type: "user", userId: ids.user };
   await captureOutput(() => cmd.decide(env.ctx, "approve", "acm-4", ""));
-  assert.deepEqual(env.db.patches[0].body, { status: "done", comment: "Approved." });
+  assert.deepEqual(env.db.patches[0].body, { status: "done", comment: "Approved.\n\n_Sent with Paperclip Helper (`pch`)._" });
 });
 
 test("comment posts the text as a comment, and needs both an issue and text", async (t) => {
@@ -74,7 +74,7 @@ test("comment posts the text as a comment, and needs both an issue and text", as
   await assert.rejects(cmd.comment(env.ctx, undefined, "hi"), /usage: comment/);
   assert.equal(env.db.comments.length, 0);
   const lines = await captureOutput(() => cmd.comment(env.ctx, "acm-4", "Please rebase first."));
-  assert.deepEqual(env.db.comments.map((c) => [c.identifier, c.body, c.via]), [["ACM-4", "Please rebase first.", "comment"]]);
+  assert.deepEqual(env.db.comments.map((c) => [c.identifier, c.body, c.via]), [["ACM-4", "Please rebase first.\n\n_Sent with Paperclip Helper (`pch`)._", "comment"]]);
   assert.deepEqual(env.db.patches, []);
   assert.deepEqual(lines, ["acm-4: comment added."]);
 });

@@ -63,7 +63,9 @@ test("after a merge, a conflicting PR whose review waits on you is sent back, wi
   assert.equal(gh.comments.length, 1);
   assert.equal(gh.comments[0].number, 8);
   assert.match(gh.comments[0].body, /Sent back for merge conflicts.*ACM-1 was returned to its agent with changes requested\. Attempt 1 of 2/s);
-  assert.ok(gh.comments[0].body.endsWith(HELPER_MARK));
+  assert.ok(gh.comments[0].body.endsWith(`_Sent automatically by Paperclip Helper._\n\n${HELPER_MARK}`));
+  assert.ok(db.patches[0].body.comment.endsWith("\n\n_Sent automatically by Paperclip Helper._"));
+  assert.equal(db.patches[0].body.comment.match(/Paperclip Helper/g).length, 1);
   // Only PRs into the merged PR's base branch were listed.
   assert.ok(gh.requests.some((r) => r.method === "GET" && /\/pulls\?.*base=main/.test(r.path)));
   assert.deepEqual(state.conflicts.get("org/app#8").attempts, 1);

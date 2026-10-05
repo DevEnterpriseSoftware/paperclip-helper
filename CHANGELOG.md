@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.1
+
+- **Every message the helper posts says so.** Comments and decisions end with one italic line naming Paperclip Helper, so you can tell at a glance where a message came from: *Relayed from GitHub by Paperclip Helper.* on what the relay copies from GitHub (merges, reviews, PR comments, opened PRs), *Sent automatically by Paperclip Helper.* on what it sends by itself (PRs with merge conflicts, and its comments on those PRs), and *Sent with Paperclip Helper (`pch`).* on `pch approve`, `pch changes` and `pch comment`. The watchdog's messages already ended with their own line and nudge count.
+
 ## 1.2.0
 
 - **Relay: PRs with merge conflicts go back to their agents by themselves.** With many small PRs, each merge can leave other open PRs conflicting with the base branch, and they then wait for a review you can't finish. With `RELAY_FIX_CONFLICTS=true` and a `GITHUB_TOKEN`, the relay looks at the other open PRs after every merge (and every 15 minutes, in case a webhook was missed). For each one GitHub says conflicts, it requests changes on the PR's issue when its review is waiting on you, or comments on it otherwise, with a brief to bring the branch up to date, resolve the conflicts and push. It says so in a comment on the PR, so you can see it was already sent back.

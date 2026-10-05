@@ -626,7 +626,7 @@ if (!BASE) {
       assert.ok(lines.some((l) => l.startsWith("Modelled") && l.includes("process") && l.includes(s.oldModel) && l.includes("high")), lines.join("\n"));
 
       await captureOutput(() => commands.comment(s.ctx, s.work.identifier, "compat: comment by command"));
-      assert.ok((await commentsOf(s.work.id)).some((c) => c.body === "compat: comment by command"));
+      assert.ok((await commentsOf(s.work.id)).some((c) => c.body.startsWith("compat: comment by command")));
     });
 
     test("pch set-model changes only the model: PATCH merges into adapterConfig", async () => {
