@@ -1,6 +1,6 @@
 # The watchdog: wake stalled work
 
-Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for six situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment.
+Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for seven situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment.
 
 | In Paperclip you see… | The watchdog… |
 |---|---|
@@ -10,6 +10,7 @@ Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog 
 | **"Waiting for execution recovery. Your message is saved."** | Presses Paperclip's **send queued messages now** for it. |
 | **"Automatic recovery blocked"**, board decision required, after a hand-off. | Delivers the saved messages to the current owner, as **Interrupt** does. |
 | **"Automatic recovery blocked … the original assignee is not invokable"**, after you paused and resumed an agent. | Comments on the issue once the agent is back, which un-parks it and wakes the agent. |
+| **"Automatic recovery of this task stopped"**, with every message saved behind "The previous run has no verified stop record". | Releases the hold, as `pch release --apply` does, and delivers the saved messages. |
 
 ## 1. Dropped hand-offs
 
@@ -73,6 +74,19 @@ It waits while the agent is paused, terminated or awaiting approval, and while a
 
 A comment clearing a parked issue was verified by hand on Paperclip 2026.916.1.
 
+## 7. Holds Paperclip can never release by itself
+
+Before Paperclip starts anything new on an issue held for reconciliation (`legacy_execution_requires_reconciliation`), it wants proof that the held run's process is gone: a process id or group it can check, or a stop record. A run cut off at a hand-off, or one whose adapter failed before a process started, records neither. Paperclip then saves every message, Interrupt and comment behind the hold for good. Waiting changes nothing, and nor does pressing Interrupt.
+
+With `WATCHDOG_RELEASE_HOLDS` on, the watchdog releases such a hold the way `pch release ISSUE --apply` does: it records the board's reconciliation (the run has stopped; what it did is unverified) and delivers the saved messages. If there are none, it comments instead, which wakes the owner. Either way the agent is told, or Paperclip's own continuation tells it, that the stopped run may have done part of its work, so it checks the workspace and branch first.
+
+- It acts only on that cause, and only when the held run recorded no process id or group. A run with a recorded process is Paperclip's to check, and its hold clears once the process is gone.
+- It waits until the run has been over for the stall window, and while the owner is paused, terminated or awaiting approval.
+- It leaves the hold alone, and logs it once, while the run is still active, its environment lease is unreleased, or another run on the issue is active.
+- It releases each held run once. A hold that comes back for the same run is logged once and left to you.
+
+This was verified against Paperclip 2026.916.1, 2026.1001.0 and 2026.1005.0 by the compatibility suite, which reproduces the hold with an agent whose command doesn't exist.
+
 ## Limits
 
 Each nudge mentions the assignee and says what stalled. Each situation gets at most `WATCHDOG_MAX_NUDGES` comments or presses, spaced by the stall window. The counts are kept in `data/state.json`, so a restart doesn't repeat them.
@@ -95,6 +109,7 @@ These look similar in Paperclip, and `pch why ISSUE` tells them apart:
 | `WATCHDOG_MAX_NUDGES` | `2` | Comments per stalled situation, and retries per deferred wake. |
 | `WATCHDOG_HEAL_FAILED_FINALIZE` | `true` | Repair blockers stuck on a failed clean-up. This edits the issue's **Blocked by**. |
 | `WATCHDOG_RETRY_DEFERRED` | `true` | Ask Paperclip to retry a wake deferred behind a stopped run, and release a hand-off's recovery hold (4 and 5 above). |
+| `WATCHDOG_RELEASE_HOLDS` | `true` | Release a hold Paperclip can never release by itself, once its run has been over for the stall window (7 above). |
 
 
 ---

@@ -645,3 +645,132 @@ test("any other kind of recovery action, or a running run, is left to the board"
   await env2.watchdog.tick();
   assert.equal(env2.db.comments.length, 0);
 });
+
+// DIR-52: Carla's run was cut off at a hand-off and recorded no process, so
+// Paperclip held the issue for reconciliation and saved every message behind
+// it ("no verified stop record"). Gilfoyle ran after; Carla never could.
+function unprovableHold(env, { ownRun = false, saved = true, finishedMin = 60, pid = null, lease = null } = {}) {
+  const { engineer: carla, reviewer: gilfoyle } = agents(env.db);
+  carla.name = "Carla";
+  const source = {
+    runId: uuid(), agentId: carla.id, status: ownRun ? "failed" : "cancelled", errorCode: ownRun ? "adapter_failed" : "issue_reassigned",
+    createdAt: minutesAgo(finishedMin + 1), finishedAt: minutesAgo(finishedMin), ...(lease ? { environmentLease: lease } : {}),
+  };
+  const issue = {
+    id: uuid(), identifier: "ACM-52", companyId: ids.company, status: "todo", assigneeAgentId: carla.id, updatedAt: minutesAgo(30),
+    executionBlocker: {
+      recoveryActionId: uuid(), runId: source.runId, agentId: carla.id, cause: "legacy_execution_requires_reconciliation",
+      nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+    },
+  };
+  env.db.issues.push(issue);
+  env.db.issueRuns[issue.id] = ownRun
+    ? [source]
+    : [{ runId: uuid(), agentId: gilfoyle.id, status: "succeeded", createdAt: minutesAgo(finishedMin - 5), finishedAt: minutesAgo(finishedMin - 10) }, source];
+  env.db.heartbeatRuns.push({ id: source.runId, companyId: ids.company, agentId: carla.id, status: source.status, processPid: pid, processGroupId: null });
+  if (saved) {
+    env.db.wakes[issue.id] = [{ kind: "wake_request", agentId: carla.id, status: "deferred_issue_execution", reason: "issue_commented", requestedAt: minutesAgo(20) }];
+    env.db.queuedComments[issue.id] = {
+      issueId: issue.id, queueId: uuid(), state: "deferred", targetRunId: null, revision: "rev-1", protocol: "legacy",
+      entries: [{ comment: { id: uuid(), body: "Changes requested on PR #14" }, position: 0 }],
+      executionWait: { reason: "process_identity_missing", message: "The previous run has no verified stop record. Paperclip cannot start this message yet." },
+    };
+  }
+  return { issue, source, carla };
+}
+
+const released = (env) => env.logs.filter((l) => l.msg === "watchdog: released a hold Paperclip couldn't release by itself");
+
+test("a hold Paperclip can't release by itself is released once, and its saved messages delivered", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue, source } = unprovableHold(env);
+  const actionId = issue.executionBlocker.recoveryActionId;
+
+  await env.watchdog.tick();
+  assert.equal(env.db.resolutions.length, 1);
+  const { body } = env.db.resolutions[0];
+  assert.equal(body.actionId, actionId);
+  assert.equal(body.outcome, "restored");
+  assert.equal(body.sourceIssueStatus, "todo");
+  assert.deepEqual(
+    [body.executionReconciliation.runId, body.executionReconciliation.providerStopped, body.executionReconciliation.actionOutcome],
+    [source.runId, true, "mixed"],
+  );
+  assert.match(body.resolutionNote, /Paperclip Helper's watchdog/);
+  assert.equal(issue.executionBlocker, null);
+  assert.equal(env.db.interrupts.length, 1, "the saved messages are delivered");
+  assert.equal(env.db.comments.length, 0, "no extra comment: the saved messages wake the assignee");
+  assert.equal(env.watchdog.stats.releases, 1);
+  assert.equal(released(env)[0].issue, "ACM-52");
+
+  await env.watchdog.tick();
+  assert.equal(env.db.resolutions.length, 1, "once per held run");
+});
+
+test("an owner's own run that left a hold and no messages is released, with a comment to check the branch", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue, carla } = unprovableHold(env, { ownRun: true, saved: false });
+  await env.watchdog.tick();
+  assert.equal(env.db.resolutions.length, 1);
+  assert.equal(issue.executionBlocker, null);
+  assert.equal(env.db.comments.length, 1);
+  assert.ok(env.db.comments[0].body.startsWith(`[@Carla](agent://${carla.id}) Paperclip held this issue`));
+  assert.match(env.db.comments[0].body, /check the workspace and branch/);
+});
+
+test("a hold is not released while its run just ended, a process id was recorded, the lease is held, or the owner is paused", async (t) => {
+  const recent = await watchdogEnv(t);
+  unprovableHold(recent, { finishedMin: 1 });
+  await recent.watchdog.tick();
+  assert.equal(recent.db.resolutions, undefined, "a run that just ended gets its stall window");
+
+  const pid = await watchdogEnv(t);
+  const withPid = unprovableHold(pid, { saved: false, pid: 999999999 });
+  await pid.watchdog.tick();
+  assert.equal(pid.db.resolutions, undefined, "a recorded process is Paperclip's to check");
+  assert.ok(withPid.issue.executionBlocker);
+
+  const leased = await watchdogEnv(t);
+  unprovableHold(leased, { lease: { status: "active", releasedAt: null } });
+  await leased.watchdog.tick();
+  await leased.watchdog.tick();
+  assert.equal(leased.db.resolutions, undefined);
+  const warn = leased.logs.filter((l) => l.msg === "watchdog: a hold Paperclip can't release by itself isn't safe to release yet");
+  assert.equal(warn.length, 1, "reported once");
+  assert.deepEqual(warn[0].problems, ["its environment lease was never released"]);
+
+  const paused = await watchdogEnv(t);
+  const p = unprovableHold(paused);
+  p.carla.status = "paused";
+  await paused.watchdog.tick();
+  assert.equal(paused.db.resolutions, undefined);
+});
+
+test("WATCHDOG_RELEASE_HOLDS=false and dry run release nothing", async (t) => {
+  const off = await watchdogEnv(t, { WATCHDOG_RELEASE_HOLDS: "false" });
+  unprovableHold(off);
+  await off.watchdog.tick();
+  assert.equal(off.db.resolutions, undefined);
+
+  const dry = await watchdogEnv(t, { DRY_RUN: "true" });
+  unprovableHold(dry);
+  await dry.watchdog.tick();
+  assert.equal(dry.db.resolutions, undefined);
+  assert.equal(dry.logs.filter((l) => l.msg.startsWith("watchdog: would release a hold")).length, 1);
+});
+
+test("a hold that comes back after the release is reported once, not released again", async (t) => {
+  let clock = Date.now();
+  const env = await watchdogEnv(t, {}, () => clock);
+  const { issue } = unprovableHold(env);
+  const hold = { ...issue.executionBlocker };
+  await env.watchdog.tick();
+  assert.equal(env.db.resolutions.length, 1);
+  issue.executionBlocker = hold;
+  issue.updatedAt = minutesAgo(30);
+  clock += 10 * 60_000;
+  await env.watchdog.tick();
+  await env.watchdog.tick();
+  assert.equal(env.db.resolutions.length, 1);
+  assert.equal(env.logs.filter((l) => l.msg === "watchdog: a hold the watchdog released is back; it needs a board decision").length, 1);
+});

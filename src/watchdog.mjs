@@ -43,11 +43,23 @@
 //    watchdog comments, or delivers the saved messages if there are any. Any
 //    other kind of recovery action is only reported.
 //
+// 7. Holds Paperclip can never release by itself. A run that stopped without a
+//    process id or stop record Paperclip can check (cut off at a hand-off, or an
+//    adapter that failed to start) leaves the issue held for reconciliation
+//    (legacy_execution_requires_reconciliation), and every message, Interrupt
+//    and comment is saved behind it ("no verified stop record"). Waiting changes
+//    nothing. With WATCHDOG_RELEASE_HOLDS on, once the run has been over for the
+//    stall window, the watchdog records the board's reconciliation (the run has
+//    stopped; what it did is unverified) and delivers the saved messages, as
+//    `pch release --apply` does. Once per held run; a hold whose run may still be
+//    running, holds a lease or has a live process is only reported.
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
 import { companyAgents, listIssues } from "./paperclip.mjs";
 import { agentMention, every, mapLimit, ts } from "./util.mjs";
+import { holdFacts, releaseHold, releaseProblems, unprovable } from "./release.mjs";
 
 const WATCHED_STATUSES = "todo,in_progress,in_review";
 const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
@@ -75,12 +87,15 @@ const record = {
   holdReported: (issue, runId) => `hold-report:${issue.id}:${runId}`, // a hold left to the board, reported once
   parked: (issue, actionId) => `parked:${issue.id}:${actionId}`, // nudges for an issue Paperclip's recovery parked
   parkedReported: (issue, actionId) => `parked-report:${issue.id}:${actionId}`, // a parked issue left to the board, reported once
+  release: (issue, runId) => `release:${issue.id}:${runId}`, // the one automatic release of a hold Paperclip can't release
+  releaseReported: (issue, runId) => `release-report:${issue.id}:${runId}`, // such a hold that isn't safe to release, reported once
+  releaseNudge: (issue, runId) => `release-nudge:${issue.id}:${runId}`, // the comment after a release with no saved messages
 };
 
 export function createWatchdog(ctx, state) {
   const { config, api, log } = ctx;
   const records = state.nudges;
-  const stats = { ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, lastError: null };
+  const stats = { ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, lastError: null };
   const stallMs = config.watchdogStallSec * 1000;
   const now = () => ctx.now();
 
@@ -91,7 +106,7 @@ export function createWatchdog(ctx, state) {
 
   // A wake still waiting in Paperclip's queue (the agent is busy elsewhere, or
   // the issue's previous run still holds execution) means a comment can't help.
-  async function hasPendingWake(issue, runs) {
+  async function hasPendingWake(issue, runs, agents = new Map()) {
     const wakes = await api.request("GET", `/api/issues/${issue.id}/diagnostics/wakes`).catch(() => null);
     // Only the assignee's own wakes count. The diagnostics list every agent's
     // wakes for the issue, and after a hand-off the previous owner's (or a
@@ -113,6 +128,11 @@ export function createWatchdog(ctx, state) {
         (e.agentId == null || e.agentId === issue.assigneeAgentId) &&
         !stale(e),
     );
+    // A wake deferred for the stall window may sit behind a hold Paperclip can
+    // never release by itself: release that instead of retrying into it.
+    if (pending.some((e) => e.status === "deferred_issue_execution" && now() - ts(e.requestedAt) >= stallMs)) {
+      if (await releaseUnprovableHold(issue, agents)) return true;
+    }
     if (!pending.length) {
       // Nothing waiting any more: a later episode gets its own retries.
       if (records.delete(record.retry(issue)) | records.delete(record.retrySkipped(issue))) state.touch();
@@ -185,7 +205,8 @@ export function createWatchdog(ctx, state) {
   // that needs reconciling, so deliver the saved messages to the current owner,
   // as the board's Interrupt button does (DIR-86). Any other cause means Paperclip
   // is unsure what the run did: that stays the board's call, and is logged once.
-  async function releaseHandOffHold(issue, blocker, runs) {
+  async function releaseHandOffHold(issue, blocker, runs, agents = new Map()) {
+    if (await releaseUnprovableHold(issue, agents)) return;
     const who = issue.identifier ?? issue.id;
     const runId = blocker.runId ?? "unknown";
     const source = (Array.isArray(runs) ? runs : []).find((r) => (r.runId ?? r.id) === blocker.runId);
@@ -205,6 +226,95 @@ export function createWatchdog(ctx, state) {
       return;
     }
     await retryDeferred(issue, record.hold(issue, runId));
+  }
+
+  // ---------------------------------------------------------------- 7. holds Paperclip can't release
+
+  // True when the issue is held in a way only the board can release (handled
+  // here, or deliberately left); false when it isn't, so the other checks go on.
+  async function releaseUnprovableHold(issue, agents) {
+    if (!config.watchdogReleaseHolds) return false;
+    const facts = await holdFacts(api, issue.id).catch(() => null);
+    if (!facts?.hold || !unprovable(facts)) return false;
+    const { hold, run } = facts;
+    const who = issue.identifier ?? issue.id;
+    const key = record.release(issue, hold.runId);
+    if (records.has(key)) {
+      // Released once already and held again for the same run: that's for the board.
+      const reported = record.releaseReported(issue, hold.runId);
+      if (now() - records.get(key).at >= stallMs && !records.has(reported)) {
+        records.set(reported, { count: 1, at: now() });
+        state.touch();
+        log.warn("watchdog: a hold the watchdog released is back; it needs a board decision", {
+          issue: who,
+          sourceRun: hold.runId,
+          hint: `See \`pch why ${who}\`.`,
+        });
+      }
+      return true;
+    }
+    const agent = issue.assigneeAgentId ? await agentFor(issue.assigneeAgentId, agents).catch(() => null) : null;
+    // Delivering a message to an agent Paperclip can't invoke only strands it again.
+    if (!agent || asleep(agent)) return true;
+    const endedAt = ts(run?.finishedAt);
+    if (!endedAt || now() - endedAt < stallMs) return true; // give a run that just stopped its stall window
+    const problems = releaseProblems(facts);
+    if (problems.length) {
+      const reported = record.releaseReported(issue, hold.runId);
+      if (!records.has(reported)) {
+        records.set(reported, { count: 1, at: now() });
+        state.touch();
+        log.warn("watchdog: a hold Paperclip can't release by itself isn't safe to release yet", {
+          issue: who,
+          sourceRun: hold.runId,
+          problems,
+          hint: `See \`pch release ${who}\`.`,
+        });
+      }
+      return true;
+    }
+    records.set(key, { count: 1, at: now() });
+    state.touch();
+    const saved = facts.queue?.entries?.length ?? 0;
+    if (config.dryRun) {
+      log("watchdog: would release a hold Paperclip can't release by itself (dry run)", { issue: who, sourceRun: hold.runId, saved });
+      return true;
+    }
+    let result;
+    try {
+      result = await releaseHold(api, facts, {
+        note:
+          "Released by Paperclip Helper's watchdog: the held run stopped without a record Paperclip could verify, " +
+          "so Paperclip could never release this hold by itself.",
+      });
+    } catch (err) {
+      log.warn("watchdog: couldn't release a hold Paperclip can't release by itself", {
+        issue: who,
+        sourceRun: hold.runId,
+        error: err.message,
+        hint: `See \`pch release ${who}\`.`,
+      });
+      return true;
+    }
+    stats.releases += 1;
+    log("watchdog: released a hold Paperclip couldn't release by itself", {
+      issue: who,
+      sourceRun: hold.runId,
+      sourceRunStatus: run ? `${run.status}${run.errorCode ? ` (${run.errorCode})` : ""}` : null,
+      delivered: result.delivered,
+    });
+    if (!result.delivered && !result.waiting) {
+      await nudge(
+        issue,
+        record.releaseNudge(issue, hold.runId),
+        agent,
+        `Paperclip held this issue because an earlier run stopped without a record it could verify, and it ` +
+          `couldn't release the hold by itself. The watchdog has released it. That run may have done part of ` +
+          `its work: check the workspace and branch before you build on it, then please continue this issue.`,
+        { reason: "released hold" },
+      );
+    }
+    return true;
   }
 
   // An issue blocked by an active recovery action that waits on the board.
@@ -290,19 +400,23 @@ export function createWatchdog(ctx, state) {
     const worked = runs.filter((r) => !refused(r));
     if (!worked.length) return null;
     const latest = newest(worked);
-    if (latest.agentId === assignee) return null; // the owner has run since the hand-off
+    if (latest.agentId === assignee) {
+      // The owner's own run ended without finishing; Paperclip may hold the issue for it.
+      if (latest.status !== "succeeded" && !ACTIVE_RUN.has(latest.status)) await releaseUnprovableHold(issue, agents);
+      return null; // the owner has run since the hand-off
+    }
     if (ACTIVE_RUN.has(latest.status)) return null; // the previous owner is still finishing
     const last = newest(runs); // quiet since the last attempt, refused or not
     const endedAt = ts(last.finishedAt) || ts(last.startedAt) || ts(last.createdAt);
     const sinceRunSec = Math.round((now() - endedAt) / 1000);
     if (sinceRunSec < config.watchdogStallSec) return null;
     // A wake waiting in the agent's queue (it's busy elsewhere) is not a stall.
-    if (await hasPendingWake(issue, runs)) return null;
+    if (await hasPendingWake(issue, runs, agents)) return null;
     if (worked.length < runs.length) {
       // While the hold is still in place, a comment's run would be refused too.
       const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
       if (full?.executionBlocker) {
-        await releaseHandOffHold(issue, full.executionBlocker, runs);
+        await releaseHandOffHold(issue, full.executionBlocker, runs, agents);
         return null;
       }
     }
@@ -319,7 +433,7 @@ export function createWatchdog(ctx, state) {
     if (!diag?.readiness?.allBlockersDone || blockers.length === 0) return null;
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
     if ((Array.isArray(runs) ? runs : []).some((r) => r.agentId === assignee && ACTIVE_RUN.has(r.status))) return null;
-    if (await hasPendingWake(issue, runs)) return null;
+    if (await hasPendingWake(issue, runs, agents)) return null;
     const done = blockers.map((b) => b.identifier ?? b.id).sort();
     return { agent, done };
   }
@@ -456,6 +570,7 @@ export function createWatchdog(ctx, state) {
         if (!quiet(issue)) return;
         if (!(Array.isArray(diag.blockers) ? diag.blockers : []).length) {
           // Blocked with no linked blocker: by an agent's own note, or by Paperclip's recovery.
+          if (await releaseUnprovableHold(issue, agents)) return;
           const parked = await api.request("GET", `/api/issues/${issue.id}/recovery-actions`).catch(() => null);
           if (parked?.active) {
             await releaseParkedIssue(issue, parked.active, agents);
@@ -467,7 +582,7 @@ export function createWatchdog(ctx, state) {
           if (asleep(await agentFor(issue.assigneeAgentId, agents).catch(() => null))) return;
           const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
           if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return;
-          await releaseHandOffHold(issue, full.executionBlocker, runs);
+          await releaseHandOffHold(issue, full.executionBlocker, runs, agents);
           return;
         }
         const idle = await unblockedButIdle(issue, diag, agents);
@@ -519,6 +634,7 @@ export function createWatchdog(ctx, state) {
         maxNudges: config.watchdogMaxNudges,
         healFailedFinalize: config.watchdogHealFailedFinalize,
         retryDeferred: config.watchdogRetryDeferred,
+        releaseHolds: config.watchdogReleaseHolds,
       });
       loop = every("watchdog", config.watchdogIntervalSec, 5_000, tick, log);
     },

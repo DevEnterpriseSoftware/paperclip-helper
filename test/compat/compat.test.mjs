@@ -4,13 +4,14 @@
 // helper agrees with our idea of Paperclip. This suite proves it agrees with
 // Paperclip itself, for one version at a time:
 //
-//   npm run test:compat -- 2026.1001.0      boots that version, runs this, removes it
+//   npm run test:compat -- 2026.1005.0      boots that version, runs this, removes it
 //   PAPERCLIP_COMPAT_API=http://127.0.0.1:3100 node --test test/compat/
 //
 // It needs a Paperclip in local_trusted mode (requests without a key act as the
 // board, which is how the suite seeds companies, agents and issues) that holds
-// nothing but earlier compat data. Agents use the `process` adapter with a shell
-// one-liner, so runs, wakes and queues are real and no model is involved.
+// nothing but earlier compat data. Agents use the `process` adapter with a Node
+// one-liner (Node, not sh, so it runs the same on Windows), so runs, wakes and
+// queues are real and no model is involved.
 //
 // Three layers:
 //   1. Paperclip's OpenAPI document lists every endpoint the helper calls.
@@ -62,6 +63,7 @@ const HELPER_ENDPOINTS = [
   ["POST", "/api/issues/{id}/comments"],
   ["GET", "/api/issues/{id}/comments"],
   ["GET", "/api/issues/{id}/recovery-actions"],
+  ["POST", "/api/issues/{id}/recovery-actions/resolve"],
   ["GET", "/api/issues/{id}/runs"],
   ["GET", "/api/issues/{id}/work-products"],
   ["GET", "/api/issues/{id}/diagnostics/wakes"],
@@ -76,6 +78,12 @@ const templateRegex = (template) => new RegExp(`^${template.replace(/\{[^}]+\}/g
 // would be treated as "finished" or "not pending" without anyone having decided so.
 const RUN_STATUSES = new Set(["queued", "scheduled_retry", "running", "succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
 const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
+// What "settled" waits out. From 2026.1005.0 a run that leaves no disposition is
+// retried about a minute later (scheduled_retry, issue_disposition_repair), which
+// our echo agents always do; nothing is executing meanwhile, so it doesn't count.
+const EXECUTING_RUN = new Set(["queued", "running"]);
+// The agents' command: this Node, by absolute path (Paperclip spawns without a shell).
+const NODE = process.execPath;
 const AGENT_STATUSES = new Set(["active", "paused", "idle", "running", "error", "pending_approval", "terminated"]);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -145,7 +153,7 @@ if (!BASE) {
         name,
         role: "engineer",
         adapterType: "process",
-        adapterConfig: { command: "sh", args: ["-c", script], ...extra },
+        adapterConfig: { command: NODE, args: ["-e", script], ...extra },
       });
     // Paperclip follows a run that left no comment with one more run, so "idle"
     // means no active run on two looks in a row.
@@ -153,7 +161,7 @@ if (!BASE) {
       until(`runs on ${issueId} to finish`, async () => {
         const quiet = async () => {
           const runs = await runsOf(issueId);
-          return runs.length > 0 && !runs.some((r) => ACTIVE_RUN.has(r.status));
+          return runs.length > 0 && !runs.some((r) => EXECUTING_RUN.has(r.status));
         };
         if (!(await quiet())) return false;
         await sleep(1500);
@@ -202,11 +210,11 @@ if (!BASE) {
       );
 
       s.company = await ok("POST", "/api/companies", { name: `${COMPANY_PREFIX} ${new Date().toISOString()}` });
-      s.alice = await agent("Alice", "echo alice");
-      s.bob = await agent("Bob", "echo bob");
-      s.slow = await agent("Slow", "sleep 25");
+      s.alice = await agent("Alice", 'console.log("alice")');
+      s.bob = await agent("Bob", 'console.log("bob")');
+      s.slow = await agent("Slow", "setTimeout(() => {}, 25000)");
       s.oldModel = `compat-old-${Date.now()}`;
-      s.modelled = await agent("Modelled", "echo modelled", { model: s.oldModel, effort: "high" });
+      s.modelled = await agent("Modelled", 'console.log("modelled")', { model: s.oldModel, effort: "high" });
 
       s.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pch-compat-"));
       // Every request the helper's client makes is recorded, and the login
@@ -378,6 +386,37 @@ if (!BASE) {
       assert.ok(Date.parse(requests[0].requestedAt) >= Date.parse(requests.at(-1).requestedAt), "wakes are listed newest first");
     });
 
+    test("pch release: no hold is a no-op, and Paperclip accepts the reconciliation it sends", async () => {
+      // A real legacy_execution_requires_reconciliation hold needs a run cut off with
+      // no process or stop record, which a process agent can't be made to leave. So
+      // this checks the parts that can break: the command on an unheld issue, and the
+      // resolve route's schema for exactly the body \`pch release --apply\` posts.
+      const lines = await captureOutput(() => commands.release(s.ctx, s.work.identifier ?? s.work.id, ["--apply"]));
+      assert.match(lines.join("\n"), /no execution hold/, "release leaves an issue without a hold alone");
+      const before = await s.ctx.api.request("GET", `/api/issues/${s.work.id}`);
+      assert.equal(before.executionBlocker, null, "an issue nobody held has no executionBlocker");
+
+      const body = (providerStopped) => ({
+        actionId: "00000000-0000-4000-8000-000000000001",
+        outcome: "restored",
+        sourceIssueStatus: "todo",
+        resolutionNote: "compat",
+        executionReconciliation: {
+          runId: "00000000-0000-4000-8000-000000000002",
+          providerStopped,
+          actionOutcome: "mixed",
+          outcomeEvidence: "compat: the run ended and has no process left; outcome unverified.",
+        },
+      });
+      const malformed = await board("POST", `/api/issues/${s.work.id}/recovery-actions/resolve`, body(false));
+      assert.equal(malformed.status, 400, "providerStopped must be true: the route validates the reconciliation");
+      const unknown = await board("POST", `/api/issues/${s.work.id}/recovery-actions/resolve`, body(true));
+      assert.notEqual(unknown.status, 400, `release's body is valid: ${JSON.stringify(unknown.data)}`);
+      assert.ok(unknown.status >= 400 || unknown.data?.replayed !== undefined, `an unknown action resolves nothing: ${unknown.status} ${JSON.stringify(unknown.data)}`);
+      const after = await s.ctx.api.request("GET", `/api/issues/${s.work.id}`);
+      assert.equal(after.status, before.status, "resolving an unknown action changes nothing");
+    });
+
     test("a comment during a run is held in the queue the watchdog reads, and interrupt takes its body", async () => {
       const slow = await issue({ title: "Slow", status: "todo", assigneeAgentId: s.slow.id });
       const running = await until("the slow run to start", async () => (await runsOf(slow.id)).find((r) => r.status === "running"));
@@ -494,6 +533,38 @@ if (!BASE) {
       assert.deepEqual(touched, [], "issues the watchdog commented on without cause");
       const failed = s.logs.filter((l) => /check failed/.test(JSON.stringify(l)));
       assert.deepEqual(failed, [], "no per-issue check failed against the real API");
+    });
+
+    test("watchdog: a hold Paperclip can't release by itself is released, and the saved message starts the owner", async () => {
+      // An agent whose command doesn't exist fails before any process starts, so its
+      // run records no process id: Paperclip holds the issue for reconciliation and
+      // can never release it by itself (the same hold a run cut off at a hand-off leaves).
+      const broken = await agent("Broken", "", { command: "pch-compat-no-such-command", args: [] });
+      const held = await issue({ title: "Held", status: "todo", assigneeAgentId: broken.id });
+      const hold = await until("Paperclip to hold the issue", async () => (await ok("GET", `/api/issues/${held.id}`)).executionBlocker);
+      assert.equal(hold.cause, "legacy_execution_requires_reconciliation", "a run that never started a process is held for reconciliation");
+      hasKeys(hold, ["recoveryActionId", "runId", "agentId", "cause", "nextAction"], "an execution hold");
+      const source = await s.ctx.api.request("GET", `/api/heartbeat-runs/${hold.runId}`);
+      hasKeys(source, ["processPid", "processGroupId", "finishedAt"], "the held run");
+      assert.equal(source.processPid, null, "the held run recorded no process");
+
+      // A message for the owner is saved behind the hold. Fix the agent, so the
+      // delivered message has something that can run.
+      await s.ctx.api.request("POST", `/api/issues/${held.id}/comments`, { body: "compat: please continue" });
+      await until("the message to be saved", async () => (await ok("GET", `/api/issues/${held.id}/queued-comments`)).entries?.length);
+      await ok("PATCH", `/api/agents/${broken.id}`, { adapterConfig: { command: NODE, args: ["-e", 'console.log("fixed")'] } });
+
+      const watchdog = createWatchdog(s.ctx, s.state);
+      await watchdog.tick();
+      assert.equal(watchdog.stats.releases, 0, "nothing is released inside the stall window");
+      s.skew = 10 * 60_000;
+      await watchdog.tick();
+      s.skew = 0;
+      assert.equal(watchdog.stats.releases, 1, `the hold is released (log: ${JSON.stringify(s.logs.filter((l) => /hold/.test(l.msg ?? "")).slice(-3))})`);
+      assert.equal((await ok("GET", `/api/issues/${held.id}`)).executionBlocker, null, "Paperclip no longer holds the issue");
+      await until("the saved message to start the owner", async () =>
+        (await runsOf(held.id)).some((r) => r.agentId === broken.id && r.status === "succeeded"));
+      await settled(held.id);
     });
 
     // ------------------------------------------------------------ 5. the relay, for real
@@ -636,8 +707,8 @@ if (!BASE) {
       const after = await s.ctx.api.request("GET", `/api/agents/${s.modelled.id}`);
       assert.equal(after.adapterConfig.model, newModel);
       assert.equal(after.adapterConfig.effort, "high");
-      assert.equal(after.adapterConfig.command, "sh");
-      assert.deepEqual(after.adapterConfig.args, ["-c", "echo modelled"]);
+      assert.equal(after.adapterConfig.command, NODE);
+      assert.deepEqual(after.adapterConfig.args, ["-e", 'console.log("modelled")']);
     });
 
     test("a terminated agent leaves the company list but can still be read", async () => {

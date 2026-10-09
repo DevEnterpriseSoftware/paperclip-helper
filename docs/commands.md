@@ -4,12 +4,13 @@
 
 | Command | What it does |
 |---|---|
-| `pch status` | What the service is doing, its last checks and counts, and when the key expires. |
+| `pch status` | What the service is doing, its last checks and counts, Paperclip's version and build commit, and when the key expires. |
 | `pch check [ISSUE]` | Who the key belongs to, its companies and prefixes. With an issue, its stage, current participant, and whether a merge would approve it. With `RELAY_FIX_CONFLICTS` on, also whether `GITHUB_TOKEN` can read each repository. |
 | `pch why ISSUE` | Why nobody is working on an issue, and what to do about it: Paperclip's own diagnosis (wakes, blockers, workspace clean-ups, runs and leases, recovery), then a recommendation. `--prompt` prints it all as a prompt for an LLM chat. |
 | `pch approve ISSUE [comment]` | Approves an issue whose approval is waiting on you. It refuses otherwise. |
 | `pch changes ISSUE comment` | Requests changes. The comment is required and becomes the brief. |
 | `pch comment ISSUE text` | Comments as you, which wakes the assignee. |
+| `pch release ISSUE [--apply] [--outcome=…]` | Releases an execution hold whose run can't prove it stopped, so messages and Interrupt stay saved behind it. It previews unless you pass `--apply`. See [`release`](#release-a-hold-messages-cant-clear). |
 | `pch costs` | Previews what cost sync would post, and what it does to budgets. |
 | `pch costs --sessions` | Checks whether resumed sessions report cumulative costs (see [Compatibility](../README.md#compatibility)). |
 | `pch models` | Every agent's adapter, model, effort and status. |
@@ -64,6 +65,16 @@ The recommendation names what is going on, gives the steps as commands you can p
 - a dropped hand-off, runs Paperclip refused before they started, a failed run, and a run that finished without moving the issue on.
 
 It is a set of rules over what Paperclip reports, not a judgement: it quotes the agent's last note where the answer is in there, and it can be wrong about a case nobody has met yet.
+
+## `release`: a hold messages can't clear
+
+Paperclip holds an issue (`legacy_execution_requires_reconciliation`) when a run stopped without proof of what it did. Before it starts anything new it wants proof that the run's process is gone: a recorded process id it can check, or a stop record. A run cut off at a hand-off can have neither. Then every message, Interrupt and comment is saved with "The previous run has no verified stop record", and nothing releases it.
+
+`pch release ISSUE` shows the hold, the held run (status, process, lease) and the saved messages, and changes nothing. `--apply` records the board's reconciliation (`POST /api/issues/:id/recovery-actions/resolve`): the run has stopped, and what it did is unverified (`--outcome=mixed`, the default; or `completed`, `not_performed`). Paperclip moves the issue to `todo`, and the command then delivers the saved messages, as Interrupt does.
+
+It refuses while the run is still active, its environment lease is unreleased, or its process is alive on the helper's host. Since nobody verified what the run did, have the agent check the branch before it builds on it.
+
+The [watchdog](watchdog.md#7-holds-paperclip-can-never-release-by-itself) does this by itself for a hold whose run recorded no process at all (`WATCHDOG_RELEASE_HOLDS`). Use the command for a hold it leaves to you, or to release one without waiting.
 
 ## Debugging with an LLM
 

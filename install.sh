@@ -229,7 +229,7 @@ EOF
   } >"$1"
 }
 
-MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS GITHUB_TOKEN RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED COST_SYNC COST_SYNC_SINCE"
+MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS GITHUB_TOKEN RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS COST_SYNC COST_SYNC_SINCE"
 
 write_env() {
   local key
@@ -503,6 +503,7 @@ main() {
   WATCHDOG_MAX_NUDGES="$(pick WATCHDOG_MAX_NUDGES 2)"
   WATCHDOG_HEAL_FAILED_FINALIZE="$(pick WATCHDOG_HEAL_FAILED_FINALIZE true)"
   WATCHDOG_RETRY_DEFERRED="$(pick WATCHDOG_RETRY_DEFERRED true)"
+  WATCHDOG_RELEASE_HOLDS="$(pick WATCHDOG_RELEASE_HOLDS true)"
   say "It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without"
   say "anything picking them up, and repairs blockers stuck on a failed workspace clean-up."
   local wd_default=y; truthy "$WATCHDOG" || wd_default=n
@@ -518,6 +519,9 @@ main() {
     local retry=y; truthy "$WATCHDOG_RETRY_DEFERRED" || retry=n
     say "A wake deferred behind a stopped run waits forever. Paperclip's \"send queued messages now\" retries it."
     if confirm "Press it for such wakes (never interrupts a running run)?" "$retry"; then WATCHDOG_RETRY_DEFERRED=true; else WATCHDOG_RETRY_DEFERRED=false; fi
+    local holds=y; truthy "$WATCHDOG_RELEASE_HOLDS" || holds=n
+    say "A run that stopped without a record Paperclip can verify leaves its issue held for good."
+    if confirm "Release such holds (the run has stopped; the agent checks its branch before continuing)?" "$holds"; then WATCHDOG_RELEASE_HOLDS=true; else WATCHDOG_RELEASE_HOLDS=false; fi
   else
     WATCHDOG=false
   fi

@@ -86,7 +86,11 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     let m;
 
     // ---- health and auth
-    if (p === "/api/health") return send(200, { status: "ok", deploymentMode: "authenticated", deploymentExposure: "private" });
+    // Like Paperclip, the version and commit are only told to an authenticated caller.
+    if (p === "/api/health") {
+      const build = who && !who.invalid ? db.build ?? {} : {};
+      return send(200, { status: "ok", deploymentMode: "authenticated", deploymentExposure: "private", ...build });
+    }
     if (p === "/api/cli-auth/challenges" && req.method === "POST") {
       const id = uuid();
       const secret = `pcp_cli_auth_${crypto.randomBytes(8).toString("hex")}`;
@@ -256,6 +260,19 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         if (queue.revision !== body.revision) return send(409, { error: "The queued messages changed in another session" });
         db.interrupts.push({ issueId: issue.id, body });
         return send(200, queue);
+      }
+      if (rest === "/recovery-actions/resolve" && req.method === "POST") {
+        // Paperclip: the board's reconciliation of a held run releases the hold.
+        const hold = issue.executionBlocker;
+        const r = body?.executionReconciliation;
+        if (!body?.outcome || !body.sourceIssueStatus || (r && (r.providerStopped !== true || !r.runId || (r.outcomeEvidence ?? "").length < 20))) {
+          return send(400, { error: "Validation error" });
+        }
+        if (!hold || hold.recoveryActionId !== body.actionId || r?.runId !== hold.runId) return send(409, { error: "Recovery action is not active" });
+        db.resolutions = [...(db.resolutions ?? []), { issueId: issue.id, body }];
+        issue.executionBlocker = null;
+        issue.status = body.sourceIssueStatus;
+        return send(200, { issue, replayed: false });
       }
       if (rest === "/recovery-actions" && req.method === "GET") {
         const active = db.recoveryActions[issue.id] ?? null;

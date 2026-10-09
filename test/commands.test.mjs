@@ -137,6 +137,11 @@ test("status and health read the service's status file", async (t) => {
   assert.match(lines, /Cost sync: on, .*5 runs \(\$12\.34\)/);
   assert.match(lines, /Not priced: gpt-9 \(2 runs\)/);
   assert.match(lines, /as Operator; key "paperclip-helper", no expiry/);
+  // A Paperclip that reports no version or commit adds nothing to the line.
+  assert.match(lines, /^Paperclip: \S+ as Operator/m);
+  env.db.build = { version: "2026.1001.0", commit: "8f8a0ab7effbd6a0584107d8038736c134ee5047" };
+  const withBuild = (await captureOutput(() => cmd.status(env.ctx))).join("\n");
+  assert.match(withBuild, /^Paperclip: \S+ \(2026\.1001\.0, commit 8f8a0ab\) as Operator/m);
   process.exitCode = 0;
 });
 
@@ -176,4 +181,90 @@ test("wrapper prints the host-side pch scripts, which handle update and pass the
   assert.match(cmd.wrapperScript("sh"), /^#!\/bin\/sh\n/);
   assert.ok(![...cmd.wrapperScript("ps1")].some((c) => c.charCodeAt(0) > 127), "pch.ps1 is ASCII for Windows PowerShell 5.1");
   assert.throws(() => cmd.wrapperScript("bat"), /wrapper sh\|ps1/);
+});
+
+function heldIssue(env, extra = {}) {
+  const agent = { id: uuid(), companyId: ids.company, name: "Carla", adapterType: "claude_local", adapterConfig: {}, status: "idle" };
+  env.db.agents.push(agent);
+  const runId = uuid();
+  const actionId = uuid();
+  const issue = {
+    id: uuid(),
+    identifier: "ACM-52",
+    companyId: ids.company,
+    status: "todo",
+    assigneeAgentId: agent.id,
+    executionBlocker: {
+      recoveryActionId: actionId,
+      runId,
+      agentId: agent.id,
+      cause: "legacy_execution_requires_reconciliation",
+      nextAction: "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+    },
+    ...extra,
+  };
+  env.db.issues.push(issue);
+  env.db.issueRuns[issue.id] = [
+    { runId, agentId: agent.id, status: "cancelled", errorCode: "issue_reassigned", createdAt: "2026-10-01T20:20:58.977Z", finishedAt: "2026-10-01T20:21:30.000Z", processPid: null, processGroupId: null },
+  ];
+  // The run itself carries the process ids the issue's run list leaves out.
+  env.db.heartbeatRuns.push({ id: runId, companyId: ids.company, agentId: agent.id, status: "cancelled", processPid: null, processGroupId: null });
+  env.db.queuedComments[issue.id] = {
+    issueId: issue.id, queueId: uuid(), state: "deferred", targetRunId: null, revision: "r1", protocol: "legacy",
+    entries: [{ id: uuid() }],
+    executionWait: { reason: "process_identity_missing", message: "The previous run has no verified stop record. Paperclip cannot start this message yet." },
+  };
+  return { issue, agent, runId, actionId };
+}
+
+test("release previews a hold without changing anything", async (t) => {
+  const env = await setup();
+  t.after(env.close);
+  const { issue, runId } = heldIssue(env);
+  const lines = await captureOutput(() => cmd.release(env.ctx, "acm-52"));
+  const text = lines.join("\n");
+  assert.match(text, /held: legacy_execution_requires_reconciliation/);
+  assert.match(text, new RegExp(`Held run: ${runId} \\(Carla\\)`));
+  assert.match(text, /process: none recorded/);
+  assert.match(text, /Saved messages: 1 \("The previous run has no verified stop record/);
+  assert.match(text, /Paperclip can't release this by itself/);
+  assert.match(text, /pch release acm-52 --apply/);
+  assert.equal(env.db.resolutions, undefined);
+  assert.deepEqual(env.db.interrupts, []);
+  assert.ok(issue.executionBlocker);
+});
+
+test("release --apply reconciles the held run and delivers the saved messages", async (t) => {
+  const env = await setup();
+  t.after(env.close);
+  const { issue, runId, actionId } = heldIssue(env);
+  const lines = await captureOutput(() => cmd.release(env.ctx, "ACM-52", ["--apply"]));
+  const [res] = env.db.resolutions;
+  assert.equal(res.body.actionId, actionId);
+  assert.equal(res.body.outcome, "restored");
+  assert.equal(res.body.sourceIssueStatus, "todo");
+  assert.deepEqual(
+    { runId: res.body.executionReconciliation.runId, providerStopped: res.body.executionReconciliation.providerStopped, actionOutcome: res.body.executionReconciliation.actionOutcome },
+    { runId, providerStopped: true, actionOutcome: "mixed" },
+  );
+  assert.match(res.body.executionReconciliation.outcomeEvidence, /cancelled \(issue_reassigned\).*unverified/);
+  assert.equal(issue.executionBlocker, null);
+  assert.equal(env.db.interrupts.length, 1);
+  assert.equal(env.db.interrupts[0].body.targetRunId, null);
+  assert.match(lines.join("\n"), /hold released \(todo\)[\s\S]*Delivered 1 saved message\(s\) to Carla/);
+});
+
+test("release refuses a still-running run, a bad outcome, and an issue without a hold", async (t) => {
+  const env = await setup();
+  t.after(env.close);
+  const { issue } = heldIssue(env);
+  env.db.issueRuns[issue.id][0].status = "running";
+  await assert.rejects(cmd.release(env.ctx, "ACM-52", ["--apply"]), /Not releasing: the run is still running/);
+  await assert.rejects(cmd.release(env.ctx, "ACM-52", ["--outcome=maybe"]), /--outcome must be one of/);
+  await assert.rejects(cmd.release(env.ctx, undefined), /usage: release/);
+  assert.equal(env.db.resolutions, undefined);
+
+  issue.executionBlocker = null;
+  const lines = await captureOutput(() => cmd.release(env.ctx, "ACM-52", ["--apply"]));
+  assert.match(lines.join("\n"), /no execution hold/);
 });

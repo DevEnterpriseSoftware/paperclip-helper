@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0
+
+- **Watchdog: holds Paperclip can never release by itself are released.** A run cut off at a hand-off, or one whose adapter failed before a process started, records no process id or stop. Paperclip then holds the issue for reconciliation ("Automatic recovery of this task stopped") and saves every message behind "The previous run has no verified stop record", for good. With `WATCHDOG_RELEASE_HOLDS` (default `true`), once the run has been over for the stall window, the watchdog records the board's reconciliation (the run stopped; what it did is unverified) and delivers the saved messages, or comments if there are none. Once per held run; a hold whose run is still active, holds a lease or recorded a process is only logged. The installers ask about it.
+- **`pch release ISSUE [--apply]`:** releases an execution hold (`legacy_execution_requires_reconciliation`) whose run recorded no process or stop, e.g. one cut off at a hand-off. Paperclip can never prove such a run stopped, so messages and Interrupt were saved behind it indefinitely. The command records the board's reconciliation (run stopped, outcome unverified by default) and delivers the saved messages. It previews unless you pass `--apply`.
+- **Compatibility suite:** Paperclip 2026.916.1, 2026.1001.0 and 2026.1005.0 pass. It reproduces a hold Paperclip can't release by itself (an agent whose command doesn't exist) and checks that the watchdog releases it and the saved message then starts the owner. Its test agents now run Node instead of `sh`, so the suite also runs on Windows, and it no longer waits out 2026.1005.0's minute-later retry of runs that leave no disposition.
+- **`pch why`:** recommends `pch release` for that hold, instead of a message and Interrupt, which can't release it.
+- **`pch status`:** shows Paperclip's version and build commit on the "Paperclip:" line, e.g. `(2026.1001.0, commit 8f8a0ab)`. Paperclip reports them only to an authenticated caller, so the helper asks with its key.
+
 ## 1.2.1
 
 - **Every message the helper posts says so.** Comments and decisions end with one italic line naming Paperclip Helper, so you can tell at a glance where a message came from: *Relayed from GitHub by Paperclip Helper.* on what the relay copies from GitHub (merges, reviews, PR comments, opened PRs), *Sent automatically by Paperclip Helper.* on what it sends by itself (PRs with merge conflicts, and its comments on those PRs), and *Sent with Paperclip Helper (`pch`).* on `pch approve`, `pch changes` and `pch comment`. The watchdog's messages already ended with their own line and nudge count.

@@ -9,6 +9,7 @@ import { companyAgents, companyPrefixes } from "./paperclip.mjs";
 import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, signed } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
 import { advise, excerpt, llmPrompt } from "./advice.mjs";
+import { holdFacts, releaseHold, releaseProblems, RELEASE_OUTCOMES, unprovable } from "./release.mjs";
 
 export const USAGE = `Paperclip Helper
 
@@ -19,6 +20,8 @@ export const USAGE = `Paperclip Helper
   pch approve ISSUE [comment]  approve an issue whose approval is waiting on you
   pch changes ISSUE comment    request changes (the comment becomes the brief)
   pch comment ISSUE text       comment as you (wakes the assignee)
+  pch release ISSUE [--apply] [--outcome=mixed|completed|not_performed]
+                               release an execution hold whose run can't prove it stopped (preview without --apply)
   pch costs                    preview what cost sync would post (changes nothing)
   pch costs --sessions         check whether resumed sessions report cumulative costs
   pch models                   every agent's adapter, model and effort
@@ -315,6 +318,70 @@ async function whyReport(ctx, identifier) {
   };
 }
 
+// ---------------------------------------------------------------- release
+
+// An execution hold that messages and Interrupt can't clear (see release.mjs).
+// Shows the hold and the held run; --apply records the board's reconciliation
+// (the run has stopped; what it did is unverified unless --outcome says
+// otherwise) and delivers the saved messages.
+export async function release(ctx, identifier, flags = []) {
+  if (!identifier || identifier.startsWith("--")) {
+    throw new Error("usage: release <ISSUE-ID> [--apply] [--outcome=mixed|completed|not_performed]");
+  }
+  const apply = flags.includes("--apply");
+  const outcomeFlag = flags.find((f) => f.startsWith("--outcome="));
+  const actionOutcome = outcomeFlag ? outcomeFlag.slice("--outcome=".length) : "mixed";
+  if (!RELEASE_OUTCOMES.includes(actionOutcome)) {
+    throw new Error(`--outcome must be one of ${RELEASE_OUTCOMES.join(", ")}`);
+  }
+  const facts = await holdFacts(ctx.api, identifier);
+  const { issue, hold, run, agent, queue } = facts;
+  if (!hold) {
+    out(`${identifier}: no execution hold. Nothing to release; \`pch why ${identifier}\` says what else is going on.`);
+    return;
+  }
+  out(`${identifier}: ${issue.status}, held: ${hold.cause ?? "unknown cause"}`);
+  if (hold.nextAction) out(`  Paperclip: ${hold.nextAction}`);
+  out(`Held run: ${hold.runId ?? "?"}${agent?.name ? ` (${agent.name})` : ""}`);
+  if (run) {
+    const l = run.environmentLease;
+    out(`  ${run.status}${run.errorCode ? ` (${run.errorCode})` : ""}, finished ${run.finishedAt ?? "never"}`);
+    if (run.detailRead) {
+      out(`  process: ${run.processPid ?? "none recorded"}${run.processGroupId ? `, group ${run.processGroupId}` : ""}`);
+    }
+    if (l) out(`  lease: ${l.status}${l.releasedAt ? "" : " (not released)"}${l.cleanupStatus ? `, cleanup ${l.cleanupStatus}` : ""}`);
+  } else {
+    out("  (not among the issue's runs)");
+  }
+  const saved = queue?.entries?.length ?? 0;
+  if (saved) out(`Saved messages: ${saved}${queue.executionWait?.message ? ` ("${queue.executionWait.message}")` : ""}`);
+  if (unprovable(facts)) out("Paperclip can't release this by itself: the run recorded no process it could check.");
+
+  const problems = releaseProblems(facts);
+  if (problems.length) {
+    throw new Error(`Not releasing: ${problems.join("; ")}. Nothing changed.`);
+  }
+  if (!apply) {
+    out("");
+    out(`--apply records, as the board, that this run has stopped and that what it did is ${actionOutcome === "mixed" ? "unverified (mixed)" : actionOutcome.replace("_", " ")},`);
+    out(`moves ${identifier} to todo, and ${saved ? "delivers the saved messages" : "lets the next message start a run"}.`);
+    out("Only do it if no agent process from that run is still running. Have the agent check the branch before it continues.");
+    out(`  pch release ${identifier} --apply${outcomeFlag ? ` ${outcomeFlag}` : ""}`);
+    return;
+  }
+  let result;
+  try {
+    result = await releaseHold(ctx.api, facts, { actionOutcome, signature: `\n\n${COMMAND_SIGNATURE}` });
+  } catch (err) {
+    if (err.stillHeld) throw new Error(`${err.message}. Run \`pch why ${identifier}\`.`);
+    throw err;
+  }
+  out(`${identifier}: hold released (${result.status}).`);
+  if (result.delivered) out(`Delivered ${result.delivered} saved message(s) to ${agent?.name ?? "the assignee"}.`);
+  else if (result.waiting) out(`${result.waiting} saved message(s) are waiting; they start with the next run.`);
+  else out(`No saved messages: \`pch comment ${identifier} "..."\` tells the assignee what to do next.`);
+}
+
 // ---------------------------------------------------------------- decisions
 
 // approve / changes: the same decision the relay records on a merge or review.
@@ -422,6 +489,17 @@ function ago(iso) {
   return `${Math.round(s / 3600)} h ago`;
 }
 
+// Paperclip's version and build commit, e.g. "2026.1001.0, commit 8f8a0ab".
+// Its health endpoint reports them only to an authenticated caller, so this
+// asks with the helper's key. Null when it reports neither.
+export async function paperclipBuild(ctx) {
+  const h = await ctx.api.request("GET", "/api/health").catch(() => null);
+  if (!h || typeof h !== "object") return null;
+  const version = typeof h.version === "string" && h.version ? h.version : null;
+  const commit = typeof h.commit === "string" && h.commit ? `commit ${h.commit.slice(0, 7)}` : null;
+  return [version, commit].filter(Boolean).join(", ") || null;
+}
+
 export async function status(ctx) {
   const s = readStatus(ctx.config);
   const stale = !s || Date.now() - Date.parse(s.heartbeatAt ?? 0) > 120_000;
@@ -455,7 +533,8 @@ export async function status(ctx) {
   try {
     const me = await ctx.identity();
     const key = await currentKey(ctx);
-    out(`Paperclip: ${ctx.config.paperclipApi} as ${me.user?.name ?? me.userId}${key ? `; ${expiryNote(key)}` : ""}`);
+    const build = await paperclipBuild(ctx);
+    out(`Paperclip: ${ctx.config.paperclipApi}${build ? ` (${build})` : ""} as ${me.user?.name ?? me.userId}${key ? `; ${expiryNote(key)}` : ""}`);
   } catch (err) {
     out(`Paperclip: ${err.message}`);
     process.exitCode = 1;

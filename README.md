@@ -12,6 +12,7 @@ Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that 
 | **An agent that never starts** after an issue is handed to it. | **[Watchdog](docs/watchdog.md).** It spots the wake Paperclip dropped and wakes the new owner with a comment. |
 | **A blocked issue that stays blocked** after its blockers are done, or whose done blocker is "finalizing" forever. | **Watchdog.** It wakes the owner, and removes a blocker stuck on a failed workspace clean-up. |
 | **"Waiting for execution recovery"** or **"Automatic recovery blocked"** after a hand-off, with your message saved but never delivered. | **Watchdog.** It presses Paperclip's own **send queued messages now** / **Interrupt** for you. |
+| **"Automatic recovery of this task stopped"**, and every message or **Interrupt** is saved again with "The previous run has no verified stop record". | **Watchdog.** Paperclip wants proof that a run cut off at a hand-off has stopped, and that run never recorded any, so the hold never clears. The watchdog records that the run stopped, releases the hold and delivers the saved messages. **[`pch release ISSUE`](docs/commands.md#release-a-hold-messages-cant-clear)** does the same by hand. |
 | **Issues left blocked after you pause and resume agents** ("the original assignee is not invokable"). | **Watchdog.** Once the agent is back, it comments on each issue Paperclip parked, which un-parks it and wakes the agent. |
 | **A Costs page that shows $0**, because your agents run on a Claude or ChatGPT subscription. | **[Cost sync](docs/cost-sync.md).** It posts each run's API-equivalent cost: Claude Code's own figure, and for Codex, tokens × OpenAI list prices. |
 | **A model drop-down that doesn't list** a new model id. | **[`pch set-model`](docs/commands.md)** moves every agent from one model to another and keeps the rest of their config, effort included. |
@@ -62,7 +63,7 @@ It acts only on events signed with your webhook secret, from your repositories, 
 
 ### Watchdog: wake stalled work
 
-Most stalls start the same way: an issue changes hands, Paperclip cancels a run at that moment, and the next wake is refused and never retried. Every minute the watchdog looks for the stalls in the table above, six situations in all. It acts only after an issue has been quiet for three minutes, at most twice per situation, and never interrupts a running run. A hold whose cause it can't be sure of is logged and left to you. Details and settings: **[docs/watchdog.md](docs/watchdog.md)**.
+Most stalls start the same way: an issue changes hands, Paperclip cancels a run at that moment, and the next wake is refused and never retried. Every minute the watchdog looks for the stalls in the table above, seven situations in all. It acts only after an issue has been quiet for three minutes, at most twice per situation, and never interrupts a running run. A hold Paperclip can never release by itself is released once its run has been over for three minutes; a hold whose cause it can't be sure of is logged and left to you. Details and settings: **[docs/watchdog.md](docs/watchdog.md)**.
 
 ### Cost sync: what your subscription runs would have cost
 
@@ -74,12 +75,13 @@ Paperclip records $0 for runs billed to a subscription. Cost sync posts one cost
 
 | Command | What it does |
 |---|---|
-| `pch status` | What the service is doing, its last checks and counts, and when the key expires. |
+| `pch status` | What the service is doing, its last checks and counts, Paperclip's version and build commit, and when the key expires. |
 | `pch check [ISSUE]` | Who the key belongs to, its companies and prefixes. With an issue, its stage, current participant, and whether a merge would approve it. |
 | `pch why ISSUE` | Why nobody is working on an issue, and what to do about it. `--prompt` prints it as a prompt for an LLM chat. |
 | `pch approve ISSUE [comment]` | Approves an issue whose approval is waiting on you. It refuses otherwise. |
 | `pch changes ISSUE comment` | Requests changes. The comment is required and becomes the brief. |
 | `pch comment ISSUE text` | Comments as you, which wakes the assignee. |
+| `pch release ISSUE [--apply]` | Releases an execution hold that messages and Interrupt can't clear, then delivers the saved messages. It previews unless you pass `--apply`. |
 | `pch costs` | Previews what cost sync would post, and what it does to budgets. |
 | `pch costs --sessions` | Checks whether resumed sessions report cumulative costs (see [cost sync](docs/cost-sync.md)). |
 | `pch models` | Every agent's adapter, model, effort and status. |
@@ -113,7 +115,7 @@ Examples and sample output: **[docs/commands.md](docs/commands.md)**.
 
 ## Compatibility
 
-- **Paperclip versions:** tested against **Paperclip 2026.916.1** (`ghcr.io/paperclipai/paperclip:latest` on 2026-09-30) in `authenticated`/`private` mode and in `local_trusted` mode, and against **2026.1001.0** with the compatibility suite (`npm run test:compat -- <version>`, see [CONTRIBUTING.md](CONTRIBUTING.md)), which runs the helper's own code against a throwaway Paperclip of that version. The API details the helper relies on were also checked against Paperclip's `main` branch at the end of September 2026. They're written down, with source references and version-specific notes, in [docs/paperclip-internals.md](docs/paperclip-internals.md).
+- **Paperclip versions:** tested against **Paperclip 2026.916.1** (`ghcr.io/paperclipai/paperclip:latest` on 2026-09-30) in `authenticated`/`private` mode and in `local_trusted` mode, and against **2026.1001.0** and **2026.1005.0** with the compatibility suite (`npm run test:compat -- <version>`, see [CONTRIBUTING.md](CONTRIBUTING.md)), which runs the helper's own code against a throwaway Paperclip of that version. The API details the helper relies on were also checked against Paperclip's `main` branch at the end of September 2026. They're written down, with source references and version-specific notes, in [docs/paperclip-internals.md](docs/paperclip-internals.md).
 - **Platforms tested:** Linux with Docker Engine 29.8, and Windows 11 with Docker Desktop 4.93. On Windows, both Windows PowerShell 5.1 and PowerShell 7 were used. macOS uses the same Docker Desktop networking as Windows but hasn't been tested.
 
 ## Documentation
@@ -122,7 +124,7 @@ Examples and sample output: **[docs/commands.md](docs/commands.md)**.
 |---|---|
 | [docs/install.md](docs/install.md) | What the installer does, unattended and manual installs, general settings, networking, the hostname guard, exposing the relay, upgrading, uninstalling. |
 | [docs/relay.md](docs/relay.md) | Every GitHub event and what it does, how the issue is found, PRs with merge conflicts and the GitHub token, safety rules, the webhook, settings. |
-| [docs/watchdog.md](docs/watchdog.md) | The six situations in detail, limits, what it leaves to you, settings. |
+| [docs/watchdog.md](docs/watchdog.md) | The seven situations in detail, limits, what it leaves to you, settings. |
 | [docs/cost-sync.md](docs/cost-sync.md) | How costs are worked out, what to know before turning it on, settings. |
 | [docs/commands.md](docs/commands.md) | Every `pch` command, with `set-model` and `why` examples. |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptoms, causes and fixes. |

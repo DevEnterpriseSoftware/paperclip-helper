@@ -120,6 +120,24 @@ export function advise(facts) {
   }
 
   const hold = issue.executionBlocker;
+  // A run that recorded no process id or stop can never prove it stopped: a
+  // message or Interrupt is saved again behind it, every time.
+  const unprovable = hold && (queue?.executionWait?.reason === "process_identity_missing" ||
+    /no verified stop record/i.test(queue?.executionWait?.message ?? ""));
+  if (hold && (unprovable || hold.cause === "legacy_execution_requires_reconciliation") && hold.recoveryActionId && !hold.workspaceRepairRequired) {
+    return {
+      what:
+        `Paperclip is holding execution on this issue (${hold.cause ?? "unknown cause"}) until the board confirms its last run stopped.` +
+        (unprovable ? " That run recorded no process or stop, so messages and Interrupt can't release it." : ""),
+      steps: [
+        ...(hold.nextAction ? [`Paperclip's own next action: ${hold.nextAction}`] : []),
+        `pch release ${identifier}   (shows the held run and what releasing it does)`,
+        `pch release ${identifier} --apply   (records that the run stopped, with its outcome unverified, and delivers the saved messages)`,
+        `Then make sure ${who} checks the branch before building on it: the stopped run may have done part of its work.`,
+      ],
+      watchdog: config.watchdog === false || config.watchdogReleaseHolds === false ? "manual" : "auto",
+    };
+  }
   if (hold) {
     return {
       what: `Paperclip is holding execution on this issue (${hold.cause ?? "unknown cause"}) and refuses new runs until it's released.`,

@@ -137,6 +137,7 @@ export function loadConfig(env = process.env) {
     watchdogMaxNudges: num("WATCHDOG_MAX_NUDGES", 2),
     watchdogHealFailedFinalize: bool("WATCHDOG_HEAL_FAILED_FINALIZE", true),
     watchdogRetryDeferred: bool("WATCHDOG_RETRY_DEFERRED", true),
+    watchdogReleaseHolds: bool("WATCHDOG_RELEASE_HOLDS", true),
 
     // cost-sync.mjs: API-equivalent cost of subscription runs
     costSync: bool("COST_SYNC", true),

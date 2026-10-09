@@ -195,7 +195,7 @@ function Install-PaperclipHelper {
   $Managed = @('PCH_UID', 'PCH_GID', 'PCH_IMAGE', 'PAPERCLIP_API', 'PAPERCLIP_PUBLIC_URL', 'RELAY', 'GITHUB_WEBHOOK_SECRET',
     'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'GITHUB_TOKEN', 'RELAY_HOST', 'RELAY_PORT', 'RELAY_PATH',
     'WATCHDOG', 'WATCHDOG_INTERVAL_SEC', 'WATCHDOG_STALL_SEC', 'WATCHDOG_MAX_NUDGES', 'WATCHDOG_HEAL_FAILED_FINALIZE',
-    'WATCHDOG_RETRY_DEFERRED', 'COST_SYNC', 'COST_SYNC_SINCE')
+    'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'COST_SYNC', 'COST_SYNC_SINCE')
 
   function Get-EnvText {
     $lines = @(
@@ -487,6 +487,7 @@ $network
   $s.WATCHDOG_MAX_NUDGES = Pick 'WATCHDOG_MAX_NUDGES' '2'
   $s.WATCHDOG_HEAL_FAILED_FINALIZE = Pick 'WATCHDOG_HEAL_FAILED_FINALIZE' 'true'
   $s.WATCHDOG_RETRY_DEFERRED = Pick 'WATCHDOG_RETRY_DEFERRED' 'true'
+  $s.WATCHDOG_RELEASE_HOLDS = Pick 'WATCHDOG_RELEASE_HOLDS' 'true'
   Say 'It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without'
   Say 'anything picking them up, and repairs blockers stuck on a failed workspace clean-up.'
   if (Confirm 'Turn the watchdog on?' (Truthy $s.WATCHDOG)) {
@@ -499,6 +500,8 @@ $network
     $s.WATCHDOG_HEAL_FAILED_FINALIZE = if (Confirm 'Repair blockers stuck on a failed workspace clean-up?' (Truthy $s.WATCHDOG_HEAL_FAILED_FINALIZE)) { 'true' } else { 'false' }
     Say 'A wake deferred behind a stopped run waits forever. Paperclip''s "send queued messages now" retries it.'
     $s.WATCHDOG_RETRY_DEFERRED = if (Confirm 'Press it for such wakes (never interrupts a running run)?' (Truthy $s.WATCHDOG_RETRY_DEFERRED)) { 'true' } else { 'false' }
+    Say 'A run that stopped without a record Paperclip can verify leaves its issue held for good.'
+    $s.WATCHDOG_RELEASE_HOLDS = if (Confirm 'Release such holds (the run has stopped; the agent checks its branch before continuing)?' (Truthy $s.WATCHDOG_RELEASE_HOLDS)) { 'true' } else { 'false' }
   } else {
     $s.WATCHDOG = 'false'
   }

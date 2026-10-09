@@ -121,3 +121,22 @@ test("llmPrompt copes with no comments", () => {
   const p = llmPrompt({ identifier: "ACM-1", report: "ACM-1: todo", advice: { what: "Nothing here looks stuck.", steps: [] } });
   assert.match(p, /\(none read\)/);
 });
+
+test("advice: a hold whose run can't prove it stopped points at pch release", () => {
+  const hold = { recoveryActionId: "ra-1", runId: "r-1", cause: "legacy_execution_requires_reconciliation", nextAction: "Automatic recovery stopped." };
+  const a = advise(base({
+    issue: { status: "todo", assigneeAgentId: A, executionBlocker: hold },
+    queue: { queueId: "q", state: "deferred", entries: [{}], executionWait: { reason: "process_identity_missing" } },
+  }));
+  assert.match(a.what, /can't release it/);
+  assert.ok(a.steps.some((s) => s.startsWith("pch release ACM-1 --apply")));
+  assert.equal(a.watchdog, "auto", "the watchdog releases it by itself");
+  const off = advise(base({
+    issue: { status: "todo", assigneeAgentId: A, executionBlocker: hold },
+    config: { watchdog: true, watchdogReleaseHolds: false },
+  }));
+  assert.equal(off.watchdog, "manual");
+
+  const other = advise(base({ issue: { status: "todo", assigneeAgentId: A, executionBlocker: { cause: "execution_owner_active" } } }));
+  assert.match(other.steps.join("\n"), /press Interrupt/);
+});

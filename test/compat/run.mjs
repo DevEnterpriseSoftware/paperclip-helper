@@ -3,14 +3,14 @@
 // against it, and removes it again.
 //
 //   npm run test:compat                     the latest published Paperclip
-//   npm run test:compat -- 2026.1001.0      one version
-//   npm run test:compat -- 2026.916.1 2026.1001.0 latest
+//   npm run test:compat -- 2026.1005.0      one version
+//   npm run test:compat -- 2026.916.1 2026.1001.0 2026.1005.0 latest
 //   npm run test:compat -- --keep latest    leave it running afterwards, to poke at
 //
 // Paperclip comes from npm (`npx paperclipai@<version>`) with its embedded
 // PostgreSQL, in a temporary PAPERCLIP_HOME, on a free loopback port. Nothing
 // touches a Paperclip you already run. It needs what Paperclip needs: a recent
-// Node (24.11 or newer for the 2026.9 releases) and a user that isn't root,
+// Node (24.11 or newer for the 2026.9 and 2026.10 releases) and a user that isn't root,
 // because PostgreSQL refuses to start as root.
 
 import { spawn, spawnSync } from "node:child_process";
