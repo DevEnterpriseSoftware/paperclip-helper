@@ -493,6 +493,7 @@ main() {
       say "  1) a token you paste here: a personal access token (yours or a machine account's)"
       say "  2) a file another program keeps fresh, e.g. a GitHub App installation token"
       ask tsrc "Token source (1 or 2)" "$tsrc"
+      # shellcheck disable=SC2034  # GITHUB_TOKEN_FILE is written to .env by write_env
       if [ "$tsrc" = 2 ]; then
         ask GITHUB_TOKEN_HOST_FILE "Path of the token file on this machine" "${GITHUB_TOKEN_HOST_FILE:-$app_file}"
         [ -n "$GITHUB_TOKEN_HOST_FILE" ] || die "A token file is needed for option 2."
