@@ -610,11 +610,50 @@ test("an issue Paperclip's recovery parked is nudged once its assignee is availa
   // The fake leaves it blocked: a second nudge a stall window later, then no more.
   for (let i = 0; i < 3; i++) {
     issue.updatedAt = minutesAgo(180);
-    const key = `parked:${issue.id}:${env.db.recoveryActions[issue.id].id}`;
+    const key = `parked:${issue.id}:${engineer.id}`;
     env.state.nudges.set(key, { ...env.state.nudges.get(key), at: Date.now() - 10 * 60_000 });
     await env.watchdog.tick();
   }
   assert.equal(env.db.comments.length, 2);
+});
+
+test("the nudge budget for a parked issue survives a new recovery action", async (t) => {
+  // DIR-268: every failed retry chain made a new recovery action, and a budget per action never ran out.
+  const env = await watchdogEnv(t);
+  const { issue, engineer } = parkedIssue(env);
+  for (let i = 0; i < 4; i++) {
+    env.db.recoveryActions[issue.id] = { ...env.db.recoveryActions[issue.id], id: uuid() };
+    issue.updatedAt = minutesAgo(180);
+    const key = `parked:${issue.id}:${engineer.id}`;
+    if (env.state.nudges.has(key)) env.state.nudges.set(key, { ...env.state.nudges.get(key), at: Date.now() - 10 * 60_000 });
+    await env.watchdog.tick();
+  }
+  assert.equal(env.db.comments.length, 2);
+});
+
+test("a parked issue whose last run failed on the provider is not nudged, and is reported once", async (t) => {
+  for (const errorCode of ["provider_quota", "claude_transient_upstream", "codex_transient_upstream"]) {
+    const env = await watchdogEnv(t);
+    const { issue, engineer } = parkedIssue(env);
+    env.db.issueRuns[issue.id].push({ runId: uuid(), agentId: engineer.id, status: "failed", errorCode,
+      createdAt: minutesAgo(31), finishedAt: minutesAgo(30) });
+    await env.watchdog.tick();
+    issue.updatedAt = minutesAgo(180);
+    await env.watchdog.tick();
+    assert.equal(env.db.comments.length, 0, errorCode);
+    const reports = env.logs.filter((l) => l.msg === "watchdog: a parked issue's last run failed on the model provider; not nudging");
+    assert.equal(reports.length, 1, errorCode);
+    assert.equal(reports[0].errorCode, errorCode);
+  }
+});
+
+test("a parked issue whose provider failure is old (the limit has reset) is nudged again", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue, engineer } = parkedIssue(env);
+  env.db.issueRuns[issue.id].push({ runId: uuid(), agentId: engineer.id, status: "failed", errorCode: "claude_transient_upstream",
+    createdAt: minutesAgo(25 * 60), finishedAt: minutesAgo(25 * 60 - 1) });
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 1);
 });
 
 test("a parked issue with saved messages gets them delivered instead of a comment", async (t) => {

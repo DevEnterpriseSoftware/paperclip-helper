@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.0
+
+- **Watchdog: no nudge loop when the model provider is out of capacity.** An issue Paperclip's recovery parked is no longer nudged for 6 hours after its last run failed on the provider (`provider_quota`, or a `*_transient_upstream` error, which is how Paperclip 2026.1005.0 files Claude's "You've hit your org's monthly spend limit"). Paperclip's own retries are spent by then, and a nudge only starts the same failing run. The watchdog logs it once and leaves it to you; after 6 hours (once a limit has usually reset, or you have resumed the agent) it nudges as before, within its budget. Before, each nudge led to two more failed runs and a new recovery action, and the nudge budget counted per action, so it never ran out: 333 runs on one issue in 17 hours.
+- **Watchdog: the nudge budget for a parked issue is per issue and assignee,** not per recovery action. It starts again after a day. Counts kept under the old key are forgotten once on upgrade.
+
 ## 1.4.0
 
 - **Relay: a GitHub App's token works, as well as a personal one.** `GITHUB_TOKEN_FILE` names a file holding the token, which the relay reads again for every GitHub request. A GitHub App installation token lasts an hour; whatever renews it on the host (for example paperclip-github-app's timer) writes the file, and the relay uses each new token at once, without a restart. `GITHUB_TOKEN` is unchanged for a personal access token, a person's or a machine account's. Set one of the two: the helper won't start with both. [docs/relay.md](docs/relay.md#a-token-file-github-app)

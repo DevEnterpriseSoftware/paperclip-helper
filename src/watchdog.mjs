@@ -65,6 +65,13 @@ const WATCHED_STATUSES = "todo,in_progress,in_review";
 const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
 const PENDING_WAKE = new Set(["queued", "claimed", "deferred_issue_execution"]);
 const CONCURRENCY = 4;
+// A run that failed on the model provider: a usage limit, or the transient family Paperclip files
+// some limits under (it took Claude's "You've hit your org's monthly spend limit" for transient).
+const PROVIDER_FAILURE = /^(provider_quota|[a-z]+_transient_upstream|transient_upstream)$/;
+const PROVIDER_FAILURE_HOLD_MS = 6 * 60 * 60_000;
+const PARKED_BUDGET_RESET_MS = 24 * 60 * 60_000;
+const latestRun = (runs) =>
+  runs.reduce((a, r) => (!a || ts(r.finishedAt ?? r.createdAt) > ts(a.finishedAt ?? a.createdAt) ? r : a), null);
 // Plain text, no URL: Paperclip links every github.com pull-request URL in a
 // comment to the issue as one of its PRs, so a link here would show Paperclip's
 // own PR on every issue the watchdog nudges.
@@ -85,7 +92,7 @@ const record = {
   stuck: (issue, wake) => `stuck:${issue.id}:${wake.requestedAt}`, // a deferred wake, reported once
   hold: (issue, runId) => `hold:${issue.id}:${runId}`, // presses to release a hand-off's recovery hold
   holdReported: (issue, runId) => `hold-report:${issue.id}:${runId}`, // a hold left to the board, reported once
-  parked: (issue, actionId) => `parked:${issue.id}:${actionId}`, // nudges for an issue Paperclip's recovery parked
+  parked: (issue) => `parked:${issue.id}:${issue.assigneeAgentId}`, // nudges for an issue Paperclip's recovery parked, whatever the action
   parkedReported: (issue, actionId) => `parked-report:${issue.id}:${actionId}`, // a parked issue left to the board, reported once
   release: (issue, runId) => `release:${issue.id}:${runId}`, // the one automatic release of a hold Paperclip can't release
   releaseReported: (issue, runId) => `release-report:${issue.id}:${runId}`, // such a hold that isn't safe to release, reported once
@@ -324,7 +331,28 @@ export function createWatchdog(ctx, state) {
     // Waking an agent Paperclip can't invoke is what parked the issue in the first place.
     if (!agent || asleep(agent)) return;
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
-    if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return;
+    const list = Array.isArray(runs) ? runs : [];
+    if (list.some((r) => ACTIVE_RUN.has(r.status))) return;
+    // DIR-268: the last run hit a provider limit (or what Paperclip took for a transient error) and
+    // Paperclip's own retries are spent. A nudge only starts the same failing run again, and its
+    // recovery then parks the issue under a new action: 333 runs in 17 hours. Leave it to the board.
+    // Only while the failure is recent: once the limit has reset (the agent is resumed the next
+    // day, say), the issue gets its nudge as before.
+    const last = latestRun(list);
+    if (last && last.status === "failed" && PROVIDER_FAILURE.test(String(last.errorCode ?? "")) &&
+        now() - ts(last.finishedAt ?? last.createdAt) < PROVIDER_FAILURE_HOLD_MS) {
+      const key = record.parkedReported(issue, `provider:${last.runId ?? last.id}`);
+      if (records.has(key)) return;
+      records.set(key, { count: 1, at: now() });
+      state.touch();
+      log.warn("watchdog: a parked issue's last run failed on the model provider; not nudging", {
+        issue: who,
+        agent: agent.name,
+        errorCode: last.errorCode,
+        hint: "A usage limit or provider outage. Resume or retry the issue once the provider works again.",
+      });
+      return;
+    }
     if (action.kind !== "stranded_assigned_issue" || action.ownerType !== "board") {
       // Paperclip is asking for a judgement (a stalled review, an uncertain action): not ours to make.
       const key = record.parkedReported(issue, action.id);
@@ -348,9 +376,14 @@ export function createWatchdog(ctx, state) {
       await retryDeferred(issue, record.hold(issue, action.id));
       return;
     }
+    // One nudge budget per issue and assignee, not per recovery action: each failed retry chain
+    // makes a new action, and a budget keyed on it never runs out. It starts again after a day.
+    const key = record.parked(issue);
+    const prior = records.get(key);
+    if (prior && now() - prior.at > PARKED_BUDGET_RESET_MS) records.delete(key);
     await nudge(
       issue,
-      record.parked(issue, action.id),
+      key,
       agent,
       `Paperclip's recovery parked this issue for a board decision: it couldn't run you when it looked ` +
         `(you were paused, or the issue had just changed hands). You are available again and nothing else ` +
