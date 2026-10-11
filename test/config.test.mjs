@@ -63,6 +63,12 @@ test("conflict sweep: off by default, needs GITHUB_TOKEN when on, and its settin
   const on = loadConfig({ ...relay, RELAY_FIX_CONFLICTS: "true", GITHUB_TOKEN: "ghp_x", RELAY_CONFLICT_SWEEP_SEC: "0" }).config;
   assert.deepEqual(serviceProblems(on), []);
   assert.equal(on.conflictSweepSec, 0);
+  // A token file is the other way to give it a token (a GitHub App's, renewed by another program); not both.
+  const viaFile = loadConfig({ ...relay, RELAY_FIX_CONFLICTS: "true", GITHUB_TOKEN_FILE: "/run/github-token/token" }).config;
+  assert.deepEqual(serviceProblems(viaFile), []);
+  assert.equal(viaFile.githubTokenFile, "/run/github-token/token");
+  const both = loadConfig({ ...relay, RELAY_FIX_CONFLICTS: "true", GITHUB_TOKEN: "ghp_x", GITHUB_TOKEN_FILE: "/t" }).config;
+  assert.match(serviceProblems(both)[0], /GITHUB_TOKEN and GITHUB_TOKEN_FILE are both set/);
   // A token alone turns nothing on, and the relay being off needs no token.
   assert.equal(loadConfig({ ...relay, GITHUB_TOKEN: "ghp_x" }).config.relayFixConflicts, false);
   assert.deepEqual(serviceProblems(loadConfig({ RELAY: "false", RELAY_FIX_CONFLICTS: "true" }).config), []);

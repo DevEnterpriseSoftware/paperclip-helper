@@ -83,6 +83,29 @@ The relay needs a token to read pull requests and comment on them. A **fine-grai
 
 A **classic** token works too: [generate one](https://github.com/settings/tokens/new) with the `repo` scope (`public_repo` for public repositories only). It reaches every repository you can, so prefer the fine-grained one.
 
+### A token file (GitHub App)
+
+If your agents reach GitHub through a **GitHub App** rather than a person's or machine account's token, there is no long-lived token to paste: an App's installation token lasts an hour, and some program on the host mints a new one before it runs out and writes it to a file. Give the relay that file instead of `GITHUB_TOKEN`:
+
+- **`GITHUB_TOKEN_FILE`**: the file's path *inside the container*. The relay reads it again for every GitHub request, so a renewed token is used at once, without a restart.
+- **Mount its folder, read-only, not the file.** Programs that renew a file usually write a new one and rename it over the old one, and a mount of a single file keeps showing the old one.
+- **The helper's user (`PCH_UID`) must be able to read it.** That is normally the user who installed the helper, which is also the one whose program writes the file.
+
+The installer does all of it: answer **2** at "Token source" and give the file's path on the host. It writes `GITHUB_TOKEN_FILE=/run/github-token/<name>`, keeps the host path in `GITHUB_TOKEN_HOST_FILE` for the next run, and adds the mount to `compose.yml`:
+
+```yaml
+    volumes:
+      - ./data:/data
+      - "/home/you/.cache/paperclip-github-app:/run/github-token:ro"
+```
+
+A token file at `~/.cache/paperclip-github-app/token`, where the `paperclip-github-app` timer keeps one, is found and offered by itself. Any other program works as well, as long as it writes a file holding only the token.
+
+- **The App needs Pull requests: Read and write** on the repositories in `GITHUB_REPOS` (Read-only with `RELAY_CONFLICT_PR_COMMENT=false`), and the token mustn't be limited to fewer of them.
+- **The PR comments are written by the App** (`your-app[bot]`), so they stand apart from yours.
+- **`pch check`** prints `GitHub: the token in GITHUB_TOKEN_FILE (/run/github-token/token) reads owner/repo (3 open PRs)`. If the program that renews the file stops, the log says how many minutes ago the file was written.
+- Set one of `GITHUB_TOKEN` and `GITHUB_TOKEN_FILE`, not both: the helper refuses to start with both.
+
 The PR comments are written by the token's account. With your own token they appear under your name; a token from a separate bot account that can read the repositories makes them stand out.
 
 ## Why an issue can show the wrong PRs
@@ -99,8 +122,10 @@ Paperclip builds an issue's "GitHub Pull Request" rows from full `github.com/<ow
 | `GITHUB_REPOS` | none | Comma-separated `owner/repo` list. **Required.** |
 | `ISSUE_PREFIXES` | every company's own | Prefixes to look for, such as `ACM,OPS`. |
 | `RELAY_LINK_PRS` | `true` | Post a newly opened PR's URL on its issue. |
-| `RELAY_FIX_CONFLICTS` | `false` | Send PRs with merge conflicts back to their agents. Needs `GITHUB_TOKEN`. |
+| `RELAY_FIX_CONFLICTS` | `false` | Send PRs with merge conflicts back to their agents. Needs `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE`. |
 | `GITHUB_TOKEN` | none | The [token](#the-github-token) the relay reads pull requests and comments with. |
+| `GITHUB_TOKEN_FILE` | none | Instead of `GITHUB_TOKEN`: [a file](#a-token-file-github-app) holding the token, read for every request (a GitHub App's hourly token). |
+| `GITHUB_TOKEN_HOST_FILE` | none | That file's path on the host. Only the installer reads it, to write the mount. |
 | `RELAY_CONFLICT_MAX_ATTEMPTS` | `2` | Send-backs per PR while it keeps conflicting, one per push, before it is left to you. |
 | `RELAY_CONFLICT_PR_COMMENT` | `true` | Say on the PR that it was sent back. |
 | `RELAY_CONFLICT_SWEEP_SEC` | `900` | Also look at every open PR this often. `0`: only after a merge. Otherwise at least 60. |

@@ -121,7 +121,11 @@ export function loadConfig(env = process.env) {
 
     // relay.mjs: send PRs with merge conflicts back to their agents
     relayFixConflicts: bool("RELAY_FIX_CONFLICTS", false),
+    // Either a token as it is (a personal access token: a person's or a machine account's), or a
+    // file that another program keeps fresh (a GitHub App installation token lasts an hour). The
+    // file is read again for every request, so a renewed token is used at once.
     githubToken: get("GITHUB_TOKEN"),
+    githubTokenFile: get("GITHUB_TOKEN_FILE"),
     githubApi: url("GITHUB_API", "https://api.github.com"),
     // Send-backs per PR for one run of conflicts, before leaving it to you.
     conflictMaxAttempts: num("RELAY_CONFLICT_MAX_ATTEMPTS", 2, { min: 1 }),
@@ -169,10 +173,13 @@ export function serviceProblems(config) {
       : "RELAY=true needs all three of GITHUB_WEBHOOK_SECRET, GITHUB_OWNER_LOGIN and GITHUB_REPOS";
     for (const p of config.relayProblems) problems.push(`${p} (${why}; set RELAY=false to turn it off)`);
   }
-  if (config.relay && config.relayFixConflicts && !config.githubToken) {
+  if (config.relay && config.relayFixConflicts && !config.githubToken && !config.githubTokenFile) {
     problems.push(
-      "GITHUB_TOKEN is not set (RELAY_FIX_CONFLICTS=true reads pull requests from GitHub with it; set RELAY_FIX_CONFLICTS=false to turn it off)",
+      "GITHUB_TOKEN is not set (RELAY_FIX_CONFLICTS=true reads pull requests from GitHub with it, or with GITHUB_TOKEN_FILE; set RELAY_FIX_CONFLICTS=false to turn it off)",
     );
+  }
+  if (config.githubToken && config.githubTokenFile) {
+    problems.push("GITHUB_TOKEN and GITHUB_TOKEN_FILE are both set: keep one (the token, or the file that holds it)");
   }
   if (!config.relay && !config.watchdog && !config.costSync) {
     problems.push("the relay, WATCHDOG and COST_SYNC are all off: there is nothing to run");

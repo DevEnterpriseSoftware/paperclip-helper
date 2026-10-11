@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0
+
+- **Relay: a GitHub App's token works, as well as a personal one.** `GITHUB_TOKEN_FILE` names a file holding the token, which the relay reads again for every GitHub request. A GitHub App installation token lasts an hour; whatever renews it on the host (for example paperclip-github-app's timer) writes the file, and the relay uses each new token at once, without a restart. `GITHUB_TOKEN` is unchanged for a personal access token, a person's or a machine account's. Set one of the two: the helper won't start with both. [docs/relay.md](docs/relay.md#a-token-file-github-app)
+- **Installers:** for the conflict send-back they ask where the token comes from: pasted, or a file another program keeps fresh. They mount the file's folder read-only (a renewed file replaces the old one by rename, which a single-file mount wouldn't show), and warn when the helper's user may not be able to read it. A GitHub App token at `~/.cache/paperclip-github-app/token` is found and offered as the default, including in unattended installs.
+- **Messages:** errors and `pch check` name the token's source. When GitHub rejects a token from a file, the log says how many minutes ago the file was last written, which shows at once whether its renewer stopped. A missing or empty file is reported as such.
+
 ## 1.3.0
 
 - **Watchdog: holds Paperclip can never release by itself are released.** A run cut off at a hand-off, or one whose adapter failed before a process started, records no process id or stop. Paperclip then holds the issue for reconciliation ("Automatic recovery of this task stopped") and saves every message behind "The previous run has no verified stop record", for good. With `WATCHDOG_RELEASE_HOLDS` (default `true`), once the run has been over for the stall window, the watchdog records the board's reconciliation (the run stopped; what it did is unverified) and delivers the saved messages, or comments if there are none. Once per held run; a hold whose run is still active, holds a lease or recorded a process is only logged. The installers ask about it.

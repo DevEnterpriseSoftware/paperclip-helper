@@ -1,9 +1,15 @@
 // GitHub REST API client, for the relay's conflict sweep only.
 //
 // It lists open pull requests, reads whether each can be merged, and leaves a
-// comment on the ones it sends back. It needs GITHUB_TOKEN with "Pull requests"
+// comment on the ones it sends back. It needs a token with "Pull requests"
 // access on the repositories in GITHUB_REPOS: read to look, read and write to
 // comment. It never merges, pushes, closes or deletes anything.
+//
+// The token is GITHUB_TOKEN as it is, or the contents of GITHUB_TOKEN_FILE, read
+// again for every request: a GitHub App installation token lasts an hour, and
+// whatever keeps that file fresh replaces it without the helper restarting.
+
+import fs from "node:fs";
 
 export class GitHubError extends Error {
   constructor(message, { status = 0, method, path } = {}) {
@@ -18,23 +24,61 @@ export class GitHubError extends Error {
 const PAGE_SIZE = 100;
 const MAX_PAGES = 5;
 
+// Where the token comes from, as messages name it.
+export function tokenSource(config) {
+  return config.githubTokenFile ? `the token in GITHUB_TOKEN_FILE (${config.githubTokenFile})` : "GITHUB_TOKEN";
+}
+
+// The token for one request: GITHUB_TOKEN, or GITHUB_TOKEN_FILE read now.
+export function readToken(config, { readFile = fs.readFileSync } = {}) {
+  if (!config.githubTokenFile) return config.githubToken;
+  let token;
+  try {
+    token = String(readFile(config.githubTokenFile, "utf8")).trim();
+  } catch (err) {
+    throw new GitHubError(
+      `cannot read GITHUB_TOKEN_FILE ${config.githubTokenFile} (${err?.code ?? err?.message}): check its folder is mounted into the container and readable by the helper's user (PCH_UID)`,
+    );
+  }
+  if (!token) {
+    throw new GitHubError(`GITHUB_TOKEN_FILE ${config.githubTokenFile} is empty: is the program that writes it running?`);
+  }
+  return token;
+}
+
+function minutesSinceWritten(file) {
+  try {
+    return Math.round((Date.now() - fs.statSync(file).mtimeMs) / 60000);
+  } catch {
+    return null;
+  }
+}
+
 export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {}) {
   const base = config.githubApi;
   const timeoutMs = config.timeoutSec * 1000;
+  const source = tokenSource(config);
 
   function explain(method, path, res, data, text) {
     const detail = data && typeof data === "object" && data.message ? String(data.message) : String(text ?? "").slice(0, 300);
     const meta = { status: res.status, method, path };
     if (res.status === 401) {
+      if (config.githubTokenFile) {
+        const age = minutesSinceWritten(config.githubTokenFile);
+        return new GitHubError(
+          `GitHub rejected ${source} (${detail}). The file was written ${age ?? "?"} minutes ago; a GitHub App token lasts 60. Check that the program that renews it is running.`,
+          meta,
+        );
+      }
       return new GitHubError(`GitHub rejected GITHUB_TOKEN (${detail}). It may have expired or been revoked: create a new one.`, meta);
     }
     if (res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0") {
-      return new GitHubError(`GitHub's rate limit for GITHUB_TOKEN is used up (${detail}).`, meta);
+      return new GitHubError(`GitHub's rate limit for ${source} is used up (${detail}).`, meta);
     }
     if (res.status === 403 || res.status === 404) {
       const need = method === "GET" ? "read" : "read and write";
       return new GitHubError(
-        `${method} ${path} → ${res.status}: ${detail}. GITHUB_TOKEN needs "Pull requests: ${need}" on this repository.`,
+        `${method} ${path} → ${res.status}: ${detail}. ${source} needs "Pull requests: ${need}" on this repository.`,
         meta,
       );
     }
@@ -44,7 +88,7 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
   async function request(method, path, body) {
     const headers = {
       accept: "application/vnd.github+json",
-      authorization: `Bearer ${config.githubToken}`,
+      authorization: `Bearer ${readToken(config)}`,
       "x-github-api-version": "2022-11-28",
       "user-agent": `paperclip-helper/${config.version || "dev"}`,
     };

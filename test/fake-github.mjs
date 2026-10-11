@@ -23,6 +23,8 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
   const comments = []; // { repo, number, body }
   const requests = [];
   const fail = {}; // "POST comments" or "GET pull 8" → status
+  // The token GitHub accepts. A test renews it (as a GitHub App's hourly token is) by setting `current.token`.
+  const current = { token };
 
   const send = (res, status, body) => {
     res.writeHead(status, { "content-type": "application/json" });
@@ -35,7 +37,7 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
     req.on("end", () => {
       const url = new URL(req.url, "http://github");
       requests.push({ method: req.method, path: url.pathname + url.search });
-      if (req.headers.authorization !== `Bearer ${token}`) return send(res, 401, { message: "Bad credentials" });
+      if (req.headers.authorization !== `Bearer ${current.token}`) return send(res, 401, { message: "Bad credentials" });
       let m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls$/);
       if (m && req.method === "GET") {
         const base = url.searchParams.get("base");
@@ -69,6 +71,7 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
   return {
     url: `http://127.0.0.1:${server.address().port}`,
     token,
+    current,
     pulls,
     comments,
     requests,

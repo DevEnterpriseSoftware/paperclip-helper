@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { setup } from "./helpers.mjs";
+import fs from "node:fs";
+import path from "node:path";
+import { setup, tempDir } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { pull, startFakeGitHub } from "./fake-github.mjs";
 import { createRelay } from "../src/relay.mjs";
@@ -221,6 +223,32 @@ test("without RELAY_FIX_CONFLICTS a merge sweeps nothing, and a bad token is exp
 
   const bad = await sweepEnv(t, { GITHUB_TOKEN: "ghp_wrongwrongwrongwrong" });
   await assert.rejects(bad.relay.sweepConflicts(REPO), /GitHub rejected GITHUB_TOKEN/);
+});
+
+test("GITHUB_TOKEN_FILE is read for every request, so a renewed token is used at once", async (t) => {
+  const dir = tempDir();
+  const file = path.join(dir, "token");
+  fs.writeFileSync(file, "ghs_firsttoken0123456789abcdef\n");
+  const env = await sweepEnv(t, { GITHUB_TOKEN: "", GITHUB_TOKEN_FILE: file });
+  env.gh.current.token = "ghs_firsttoken0123456789abcdef";
+  seed(env.db);
+  env.open.push(pull(8, { mergeable: false }));
+  assert.equal((await env.relay.sweepConflicts(REPO))[0].action, "changes");
+
+  // An hour later the App token is replaced on disk (atomically, by rename) and the old one stops working.
+  fs.writeFileSync(path.join(dir, "token.new"), "ghs_secondtoken0123456789abcdef");
+  fs.renameSync(path.join(dir, "token.new"), file);
+  env.gh.current.token = "ghs_secondtoken0123456789abcdef";
+  env.open[0].head = { ...env.open[0].head, sha: "sha-8-b" };
+  assert.equal((await env.relay.sweepConflicts(REPO))[0].attempt, 2);
+
+  // The renewer stopped: GitHub refuses the stale file, and the message says what to check.
+  env.gh.current.token = "ghs_thirdtoken0123456789abcdef";
+  await assert.rejects(env.relay.sweepConflicts(REPO), /GitHub rejected the token in GITHUB_TOKEN_FILE .*written \d+ minutes ago.*renews it is running/);
+  fs.writeFileSync(file, "");
+  await assert.rejects(env.relay.sweepConflicts(REPO), /GITHUB_TOKEN_FILE .* is empty/);
+  fs.rmSync(file);
+  await assert.rejects(env.relay.sweepConflicts(REPO), /cannot read GITHUB_TOKEN_FILE .*ENOENT.*mounted/);
 });
 
 test("GitHub tokens are masked in logs", () => {

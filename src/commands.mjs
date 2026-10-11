@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { readJson } from "./store.mjs";
-import { createGitHub } from "./github.mjs";
+import { createGitHub, tokenSource } from "./github.mjs";
 import { companyAgents, companyPrefixes } from "./paperclip.mjs";
 import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, signed } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
@@ -119,13 +119,13 @@ export async function check(ctx, identifier) {
     const company = await api.request("GET", `/api/companies/${companyId}`).catch(() => null);
     out(`Company: ${company?.name ?? companyId} (issue prefix ${company?.issuePrefix ?? "?"})`);
   }
-  if (ctx.config.relayFixConflicts && ctx.config.githubToken) {
+  if (ctx.config.relayFixConflicts && (ctx.config.githubToken || ctx.config.githubTokenFile)) {
     // Reading is all this can try: commenting is only tested by doing it.
     const github = createGitHub({ config: ctx.config, log: ctx.log });
     for (const repo of ctx.config.repos) {
       try {
         const pulls = await github.openPulls(repo);
-        out(`GitHub: GITHUB_TOKEN reads ${repo} (${pulls.length} open ${pulls.length === 1 ? "PR" : "PRs"})`);
+        out(`GitHub: ${tokenSource(ctx.config)} reads ${repo} (${pulls.length} open ${pulls.length === 1 ? "PR" : "PRs"})`);
       } catch (err) {
         out(`GitHub: ${err.message}`);
         process.exitCode = 1;

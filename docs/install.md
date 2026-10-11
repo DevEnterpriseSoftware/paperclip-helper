@@ -33,7 +33,7 @@ Set `PCH_NONINTERACTIVE=1` and pass answers as environment variables.
 | `PAPERCLIP_PUBLIC_URL` | The address you open Paperclip at. |
 | `PCH_TOKEN` | An existing board key. Without it, the installer still prints the approval link and waits. |
 | `GITHUB_OWNER_LOGIN`, `GITHUB_REPOS` | `GITHUB_OWNER_LOGIN` turns the relay on, and then `GITHUB_REPOS` is required. |
-| `RELAY_FIX_CONFLICTS`, `GITHUB_TOKEN` | `RELAY_FIX_CONFLICTS=true` sends PRs with merge conflicts back to their agents, and then `GITHUB_TOKEN` is required. |
+| `RELAY_FIX_CONFLICTS`, `GITHUB_TOKEN`, `GITHUB_TOKEN_HOST_FILE` | `RELAY_FIX_CONFLICTS=true` sends PRs with merge conflicts back to their agents, and then a token is required: `GITHUB_TOKEN` as it is, or `GITHUB_TOKEN_HOST_FILE`, the host path of a file another program keeps fresh (a GitHub App token; [details](relay.md#a-token-file-github-app)). A GitHub App token at `~/.cache/paperclip-github-app/token` is used by itself when neither is given. |
 | `COST_SYNC_SINCE` | Cost sync posts only runs that finish after the install, because nobody saw the preview. Pass an earlier ISO 8601 time to include past runs, or `1970-01-01T00:00:00Z` for all of them. |
 | Any other setting the installer asks about, such as `ISSUE_PREFIXES`, `WATCHDOG` or `COST_SYNC` | Used as the answer. Add other settings from [`.env.example`](../.env.example) to `.env` afterwards; re-runs keep them. |
 | `PCH_WEBHOOK_URL` | The public webhook URL to test. |

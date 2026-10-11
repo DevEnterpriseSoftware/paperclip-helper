@@ -193,7 +193,8 @@ function Install-PaperclipHelper {
   # ---------------------------------------------------------------- files
 
   $Managed = @('PCH_UID', 'PCH_GID', 'PCH_IMAGE', 'PAPERCLIP_API', 'PAPERCLIP_PUBLIC_URL', 'RELAY', 'GITHUB_WEBHOOK_SECRET',
-    'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'GITHUB_TOKEN', 'RELAY_HOST', 'RELAY_PORT', 'RELAY_PATH',
+    'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'GITHUB_TOKEN', 'GITHUB_TOKEN_FILE', 'GITHUB_TOKEN_HOST_FILE',
+    'RELAY_HOST', 'RELAY_PORT', 'RELAY_PATH',
     'WATCHDOG', 'WATCHDOG_INTERVAL_SEC', 'WATCHDOG_STALL_SEC', 'WATCHDOG_MAX_NUDGES', 'WATCHDOG_HEAL_FAILED_FINALIZE',
     'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'COST_SYNC', 'COST_SYNC_SINCE')
 
@@ -214,6 +215,12 @@ function Install-PaperclipHelper {
     if ($script:NetMode -eq 'host') { $network = '    network_mode: host' }
     elseif ($script:NetMode -eq 'bridge') { $network = "    extra_hosts: [`"host.docker.internal:host-gateway`"]$ports" }
     else { $network = "    networks: [paperclip]$ports" }
+    # A token file is mounted by its folder, read-only: a renewed file replaces the old one by
+    # rename, which a mount of the file itself would never see.
+    $tokenMount = ''
+    if ((Truthy $script:Settings.RELAY) -and (Truthy $script:Settings.RELAY_FIX_CONFLICTS) -and $script:Settings.GITHUB_TOKEN_HOST_FILE) {
+      $tokenMount = "`n      - `"$(Split-Path -Parent $script:Settings.GITHUB_TOKEN_HOST_FILE):/run/github-token:ro`""
+    }
     $text = @"
 # Paperclip Helper: $RepoUrl
 # Written by install.ps1. Upgrade: docker compose pull; docker compose up -d
@@ -227,7 +234,7 @@ services:
 $network
     env_file: .env
     volumes:
-      - ./data:/data
+      - ./data:/data$tokenMount
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -431,7 +438,8 @@ $network
   }
 
   Step 'Relay: merge a PR to approve its issue'
-  foreach ($key in @('RELAY', 'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'GITHUB_WEBHOOK_SECRET', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'GITHUB_TOKEN')) { $s[$key] = Pick $key }
+  foreach ($key in @('RELAY', 'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'GITHUB_WEBHOOK_SECRET', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS',
+      'GITHUB_TOKEN', 'GITHUB_TOKEN_FILE', 'GITHUB_TOKEN_HOST_FILE')) { $s[$key] = Pick $key }
   $s.RELAY_PORT = Pick 'RELAY_PORT' '3110'
   $s.RELAY_PATH = Pick 'RELAY_PATH' '/hooks/github'
   $s.RELAY_HOST = if ($script:NetMode -eq 'host') { '127.0.0.1' } else { '0.0.0.0' }
@@ -457,16 +465,41 @@ $network
     Say 'to their agents and say so on the PR. For that it needs a GitHub token.'
     if (Confirm 'Send PRs with merge conflicts back to their agents automatically?' (Truthy $s.RELAY_FIX_CONFLICTS)) {
       $s.RELAY_FIX_CONFLICTS = 'true'
-      if (-not $s.GITHUB_TOKEN) {
-        Note 'Create a fine-grained token at https://github.com/settings/personal-access-tokens/new'
-        Note "  Repository access: Only select repositories -> $($s.GITHUB_REPOS)"
-        Note '  Repository permissions: Pull requests -> Read and write'
-        Note "  (A classic token with the `"repo`" scope works too. Steps: $RepoUrl/blob/main/docs/relay.md#the-github-token)"
+      # Where the token comes from: pasted as it is, or a file another program keeps fresh
+      # (a GitHub App installation token lasts an hour). paperclip-github-app's file is offered when found.
+      $appFile = if ($HOME) { Join-Path $HOME '.cache/paperclip-github-app/token' } else { '' }
+      $source = if ($s.GITHUB_TOKEN_HOST_FILE) { '2' } else { '1' }
+      if (-not $s.GITHUB_TOKEN_HOST_FILE -and -not $s.GITHUB_TOKEN -and $appFile -and (Test-Path -LiteralPath $appFile)) {
+        $source = '2'; $s.GITHUB_TOKEN_HOST_FILE = $appFile
+        Note "Found a GitHub App token that is kept fresh: $appFile"
       }
-      $s.GITHUB_TOKEN = Ask-Secret 'GitHub token' $s.GITHUB_TOKEN
-      if (-not $s.GITHUB_TOKEN) {
-        Warn "No token given: PRs with merge conflicts won't be sent back. Re-run the installer to add one."
-        $s.RELAY_FIX_CONFLICTS = 'false'
+      Say 'Where the relay gets its GitHub token:'
+      Say "  1) a token you paste here: a personal access token (yours or a machine account's)"
+      Say '  2) a file another program keeps fresh, e.g. a GitHub App installation token'
+      $source = Ask 'Token source (1 or 2)' $source
+      if ($source -eq '2') {
+        $s.GITHUB_TOKEN_HOST_FILE = Ask 'Path of the token file on this machine' $(if ($s.GITHUB_TOKEN_HOST_FILE) { $s.GITHUB_TOKEN_HOST_FILE } else { $appFile })
+        if (-not $s.GITHUB_TOKEN_HOST_FILE) { Die 'A token file is needed for option 2.' }
+        $s.GITHUB_TOKEN_HOST_FILE = [IO.Path]::GetFullPath($s.GITHUB_TOKEN_HOST_FILE)
+        if (-not (Test-Path -LiteralPath $s.GITHUB_TOKEN_HOST_FILE)) {
+          Warn "$($s.GITHUB_TOKEN_HOST_FILE) doesn't exist yet: the relay reports that until the program that writes it has run."
+        }
+        $s.GITHUB_TOKEN_FILE = "/run/github-token/$(Split-Path -Leaf $s.GITHUB_TOKEN_HOST_FILE)"
+        $s.GITHUB_TOKEN = ''
+        Note "Its folder is mounted read-only; the helper's user ($($s.PCH_UID)) must be able to read the file."
+      } else {
+        $s.GITHUB_TOKEN_FILE = ''; $s.GITHUB_TOKEN_HOST_FILE = ''
+        if (-not $s.GITHUB_TOKEN) {
+          Note 'Create a fine-grained token at https://github.com/settings/personal-access-tokens/new'
+          Note "  Repository access: Only select repositories -> $($s.GITHUB_REPOS)"
+          Note '  Repository permissions: Pull requests -> Read and write'
+          Note "  (A classic token with the `"repo`" scope works too. Steps: $RepoUrl/blob/main/docs/relay.md#the-github-token)"
+        }
+        $s.GITHUB_TOKEN = Ask-Secret 'GitHub token' $s.GITHUB_TOKEN
+        if (-not $s.GITHUB_TOKEN) {
+          Warn "No token given: PRs with merge conflicts won't be sent back. Re-run the installer to add one."
+          $s.RELAY_FIX_CONFLICTS = 'false'
+        }
       }
     } else {
       $s.RELAY_FIX_CONFLICTS = 'false'

@@ -204,6 +204,13 @@ $ports}" ;;
     net:*) network_block="    networks: [paperclip]${ports:+
 $ports}" ;;
   esac
+  # A token file is mounted by its folder, read-only: a renewed file replaces the old one by
+  # rename, which a mount of the file itself would never see.
+  local token_mount=""
+  if truthy "$RELAY" && truthy "$RELAY_FIX_CONFLICTS" && [ -n "${GITHUB_TOKEN_HOST_FILE:-}" ]; then
+    token_mount="
+      - \"$(dirname "$GITHUB_TOKEN_HOST_FILE"):/run/github-token:ro\""
+  fi
   {
     cat <<EOF
 # Paperclip Helper: $REPO_URL
@@ -218,7 +225,7 @@ services:
 $network_block
     env_file: .env
     volumes:
-      - ./data:/data
+      - ./data:/data$token_mount
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -229,7 +236,7 @@ EOF
   } >"$1"
 }
 
-MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS GITHUB_TOKEN RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS COST_SYNC COST_SYNC_SINCE"
+MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS GITHUB_TOKEN GITHUB_TOKEN_FILE GITHUB_TOKEN_HOST_FILE RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS COST_SYNC COST_SYNC_SINCE"
 
 write_env() {
   local key
@@ -440,6 +447,9 @@ main() {
   RELAY_LINK_PRS="$(pick RELAY_LINK_PRS)"
   RELAY_FIX_CONFLICTS="$(pick RELAY_FIX_CONFLICTS)"
   GITHUB_TOKEN="$(pick GITHUB_TOKEN)"
+  # shellcheck disable=SC2034  # written to .env by write_env
+  GITHUB_TOKEN_FILE="$(pick GITHUB_TOKEN_FILE)"
+  GITHUB_TOKEN_HOST_FILE="$(pick GITHUB_TOKEN_HOST_FILE)"
   RELAY_PORT="$(pick RELAY_PORT 3110)"
   RELAY_PATH="$(pick RELAY_PATH /hooks/github)"
   # shellcheck disable=SC2034  # written to .env by write_env
@@ -471,16 +481,47 @@ main() {
     local fix=n; if truthy "$RELAY_FIX_CONFLICTS"; then fix=y; fi
     if confirm "Send PRs with merge conflicts back to their agents automatically?" "$fix"; then
       RELAY_FIX_CONFLICTS=true
-      if [ -z "$GITHUB_TOKEN" ]; then
-        note "Create a fine-grained token at https://github.com/settings/personal-access-tokens/new"
-        note "  Repository access: Only select repositories → $GITHUB_REPOS"
-        note "  Repository permissions: Pull requests → Read and write"
-        note "  (A classic token with the \"repo\" scope works too. Steps: $REPO_URL/blob/main/docs/relay.md#the-github-token)"
+      # Where the token comes from: pasted as it is, or a file another program keeps fresh
+      # (a GitHub App installation token lasts an hour). paperclip-github-app's file is offered when found.
+      local app_file="$HOME/.cache/paperclip-github-app/token" tsrc=1
+      [ -n "$GITHUB_TOKEN_HOST_FILE" ] && tsrc=2
+      if [ -z "$GITHUB_TOKEN_HOST_FILE" ] && [ -z "$GITHUB_TOKEN" ] && [ -s "$app_file" ]; then
+        tsrc=2; GITHUB_TOKEN_HOST_FILE="$app_file"
+        note "Found a GitHub App token that is kept fresh: $app_file"
       fi
-      ask_secret GITHUB_TOKEN "GitHub token" "$GITHUB_TOKEN"
-      if [ -z "$GITHUB_TOKEN" ]; then
-        warn "No token given: PRs with merge conflicts won't be sent back. Re-run the installer to add one."
-        RELAY_FIX_CONFLICTS=false
+      say "Where the relay gets its GitHub token:"
+      say "  1) a token you paste here: a personal access token (yours or a machine account's)"
+      say "  2) a file another program keeps fresh, e.g. a GitHub App installation token"
+      ask tsrc "Token source (1 or 2)" "$tsrc"
+      if [ "$tsrc" = 2 ]; then
+        ask GITHUB_TOKEN_HOST_FILE "Path of the token file on this machine" "${GITHUB_TOKEN_HOST_FILE:-$app_file}"
+        [ -n "$GITHUB_TOKEN_HOST_FILE" ] || die "A token file is needed for option 2."
+        case "$GITHUB_TOKEN_HOST_FILE" in /*) ;; *) GITHUB_TOKEN_HOST_FILE="$PWD/$GITHUB_TOKEN_HOST_FILE" ;; esac
+        if [ ! -s "$GITHUB_TOKEN_HOST_FILE" ]; then
+          warn "$GITHUB_TOKEN_HOST_FILE doesn't exist or is empty yet: the relay reports that until the program that writes it has run."
+        else
+          local owner
+          owner="$(stat -c %u "$GITHUB_TOKEN_HOST_FILE" 2>/dev/null || stat -f %u "$GITHUB_TOKEN_HOST_FILE" 2>/dev/null || true)"
+          if [ -n "$owner" ] && [ "$owner" != "$PCH_UID" ]; then
+            warn "$GITHUB_TOKEN_HOST_FILE belongs to uid $owner, but the helper runs as $PCH_UID: it must be able to read the file and its folder."
+          fi
+        fi
+        GITHUB_TOKEN_FILE="/run/github-token/$(basename "$GITHUB_TOKEN_HOST_FILE")"
+        GITHUB_TOKEN=""
+        note "Its folder is mounted into the container read-only, so each renewed token is used at once."
+      else
+        GITHUB_TOKEN_FILE=""; GITHUB_TOKEN_HOST_FILE=""
+        if [ -z "$GITHUB_TOKEN" ]; then
+          note "Create a fine-grained token at https://github.com/settings/personal-access-tokens/new"
+          note "  Repository access: Only select repositories → $GITHUB_REPOS"
+          note "  Repository permissions: Pull requests → Read and write"
+          note "  (A classic token with the \"repo\" scope works too. Steps: $REPO_URL/blob/main/docs/relay.md#the-github-token)"
+        fi
+        ask_secret GITHUB_TOKEN "GitHub token" "$GITHUB_TOKEN"
+        if [ -z "$GITHUB_TOKEN" ]; then
+          warn "No token given: PRs with merge conflicts won't be sent back. Re-run the installer to add one."
+          RELAY_FIX_CONFLICTS=false
+        fi
       fi
     else
       RELAY_FIX_CONFLICTS=false
