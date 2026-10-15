@@ -118,6 +118,9 @@ export function loadConfig(env = process.env) {
     prefixes: list("ISSUE_PREFIXES").map((s) => s.toUpperCase().replace(/[^A-Z0-9]/g, "")).filter(Boolean),
     // Post a newly opened PR's URL on its issue, so Paperclip links the PR.
     relayLinkPrs: bool("RELAY_LINK_PRS", true),
+    // Reply on the PR when your /changes, /approve or "Request changes" wasn't recorded
+    // as a decision, saying where it went and why (needs GITHUB_TOKEN or GITHUB_TOKEN_FILE).
+    relayPrNotes: bool("RELAY_PR_NOTES", true),
 
     // relay.mjs: send PRs with merge conflicts back to their agents
     relayFixConflicts: bool("RELAY_FIX_CONFLICTS", false),

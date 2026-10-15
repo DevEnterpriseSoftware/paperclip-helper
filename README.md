@@ -115,7 +115,7 @@ Examples and sample output: **[docs/commands.md](docs/commands.md)**.
 
 ## Compatibility
 
-- **Paperclip versions:** tested against **Paperclip 2026.916.1** (`ghcr.io/paperclipai/paperclip:latest` on 2026-09-30) in `authenticated`/`private` mode and in `local_trusted` mode, and against **2026.1001.0** and **2026.1005.0** with the compatibility suite (`npm run test:compat -- <version>`, see [CONTRIBUTING.md](CONTRIBUTING.md)), which runs the helper's own code against a throwaway Paperclip of that version. The API details the helper relies on were also checked against Paperclip's `main` branch at the end of September 2026. They're written down, with source references and version-specific notes, in [docs/paperclip-internals.md](docs/paperclip-internals.md).
+- **Paperclip versions:** tested against **Paperclip 2026.916.1** (`ghcr.io/paperclipai/paperclip:latest` on 2026-09-30) in `authenticated`/`private` mode and in `local_trusted` mode, and against **2026.1001.0**, **2026.1005.0** and **2026.1012.0** with the compatibility suite (`npm run test:compat -- <version>`, see [CONTRIBUTING.md](CONTRIBUTING.md)), which runs the helper's own code against a throwaway Paperclip of that version. The API details the helper relies on were also checked against Paperclip's `main` branch at the end of September 2026. They're written down, with source references and version-specific notes, in [docs/paperclip-internals.md](docs/paperclip-internals.md).
 - **Platforms tested:** Linux with Docker Engine 29.8, and Windows 11 with Docker Desktop 4.93. On Windows, both Windows PowerShell 5.1 and PowerShell 7 were used. macOS uses the same Docker Desktop networking as Windows but hasn't been tested.
 
 ## Documentation

@@ -11,6 +11,7 @@ Start with `pch status` and, for a stuck issue, `pch why ISSUE`.
 | Deliveries show 401 in GitHub | The webhook secret doesn't match `GITHUB_WEBHOOK_SECRET`. |
 | A delivery failed with `Task is paused` | Paperclip refuses comments on a paused task. Resume it, then **Redeliver** in GitHub. |
 | Deliveries show `names no ACM issue` | The PR's title, branch and body contain no issue identifier. |
+| A **`/changes` or `/approve` did nothing** you can see | It reached the relay, but the PR's issue wasn't waiting on you, so your text was copied to the first issue the PR names as a comment. With a GitHub token the relay replies on the PR saying which issue and why. Record the decision with `pch changes ISSUE "…"`. |
 | A merge only comments (`decision is not waiting on you`) | The approval stage isn't pending on your user. `pch check ISSUE` shows who it's waiting on. |
 | A merge leaves the issue **in review**, "Approval pending with You" | The merge approved an earlier stage of yours and the next one belongs to someone else, or the relay is older than 1.0.1. The delivery's response has a `warning` naming who it's waiting on. |
 | A PR has **merge conflicts** after you merged another | Turn on [`RELAY_FIX_CONFLICTS`](relay.md#prs-with-merge-conflicts) and the relay sends it back for you. Without it, comment `/changes Merge main and resolve the conflicts` on the PR. |

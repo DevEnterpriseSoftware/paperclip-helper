@@ -1,7 +1,8 @@
-// GitHub REST API client, for the relay's conflict sweep only.
+// GitHub REST API client, for the relay: its conflict sweep, and its notes on a
+// PR when a decision you asked for wasn't recorded.
 //
 // It lists open pull requests, reads whether each can be merged, and leaves a
-// comment on the ones it sends back. It needs a token with "Pull requests"
+// comment on the ones it sends back or explains. It needs a token with "Pull requests"
 // access on the repositories in GITHUB_REPOS: read to look, read and write to
 // comment. It never merges, pushes, closes or deletes anything.
 //

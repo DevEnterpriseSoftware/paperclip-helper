@@ -7,6 +7,7 @@ In Paperclip, the current participant of a review or approval stage records a de
 | **You merge** the PR | The issue is **approved**: `done`, with a comment naming the PR and merge commit. |
 | **You "Request changes"** in a review | **Changes requested**: `in_progress` and back to the engineer, with your review text as the brief. |
 | **You comment `/changes …`** on the PR, or start a review with it | Same as Request changes. |
+| Your `/changes`, `/approve` or Request changes **isn't recorded** (the issue isn't waiting on you, several are, or the PR names no issue) | Your text goes to the issue as a comment, as before, and the relay **replies on the PR** with where it went and why (`RELAY_PR_NOTES`, [below](#when-a-decision-isnt-recorded)). |
 | **You comment `/approve …`** on the PR, or start a review with it | Approved without merging. |
 | **You approve** the PR in a GitHub review | Nothing. Merging is the approval. |
 | **You comment** or review anything else | Your text is copied to the issue as a comment, which wakes the assignee. |
@@ -26,7 +27,19 @@ Every delivery's response body says what the relay did, for example `{"identifie
 - Only repositories in `GITHUB_REPOS` are accepted.
 - Only `GITHUB_OWNER_LOGIN` can approve or request changes. Anyone else's reviews and comments are ignored, and their merges only produce a comment.
 - A decision is recorded only when Paperclip says it's waiting on *you*; otherwise the relay comments.
-- The relay never merges, pushes, closes or deletes anything. Without `RELAY_FIX_CONFLICTS` it never calls GitHub at all; with it, it reads pull requests and comments on the ones it sends back.
+- The relay never merges, pushes, closes or deletes anything. Without a GitHub token it never calls GitHub at all. With one, it comments on PRs to say a decision wasn't recorded, and with `RELAY_FIX_CONFLICTS` it also reads pull requests and comments on the ones it sends back.
+
+<a id="when-a-decision-isnt-recorded"></a>**When a decision isn't recorded.** A `/changes` on a PR whose issue isn't waiting on you can't be a decision, so the relay copies your text to the first issue the PR names instead. That issue may not be the one you were looking at: a PR opened from a parent's workspace names the parent. With a GitHub token (`GITHUB_TOKEN` or `GITHUB_TOKEN_FILE`, "Pull requests: Read and write"), the relay replies on the PR:
+
+> **Your `/changes` was not recorded as a decision.**
+>
+> This PR names DIR-251, DIR-419. None of those issues, their subtasks or their blockers has a decision waiting on you, so the relay used the first one, DIR-251 (blocked, review stage).
+>
+> Your text was added to DIR-251 as a comment. Nothing else changed.
+>
+> To decide on the issue you meant, run `pch changes <issue> "…"` (`pch check <issue>` shows who its decision is waiting on).
+
+A decision that is recorded gets no reply. For comments, GitHub doesn't send the PR's branch, so only its title and body are searched for issue identifiers; the reply says so when it finds none. `RELAY_PR_NOTES=false` turns the replies off.
 
 **GitHub won't let you "Request changes" on your own PR.** If your agents open PRs with your own token, comment `/changes …` instead.
 
@@ -122,8 +135,9 @@ Paperclip builds an issue's "GitHub Pull Request" rows from full `github.com/<ow
 | `GITHUB_REPOS` | none | Comma-separated `owner/repo` list. **Required.** |
 | `ISSUE_PREFIXES` | every company's own | Prefixes to look for, such as `ACM,OPS`. |
 | `RELAY_LINK_PRS` | `true` | Post a newly opened PR's URL on its issue. |
+| `RELAY_PR_NOTES` | `true` | Reply on the PR when a `/changes`, `/approve` or Request changes isn't recorded as a decision. Needs `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE`. |
 | `RELAY_FIX_CONFLICTS` | `false` | Send PRs with merge conflicts back to their agents. Needs `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE`. |
-| `GITHUB_TOKEN` | none | The [token](#the-github-token) the relay reads pull requests and comments with. |
+| `GITHUB_TOKEN` | none | The [token](#the-github-token) the relay reads pull requests and comments with (conflict send-backs and `RELAY_PR_NOTES`). |
 | `GITHUB_TOKEN_FILE` | none | Instead of `GITHUB_TOKEN`: [a file](#a-token-file-github-app) holding the token, read for every request (a GitHub App's hourly token). |
 | `GITHUB_TOKEN_HOST_FILE` | none | That file's path on the host. Only the installer reads it, to write the mount. |
 | `RELAY_CONFLICT_MAX_ATTEMPTS` | `2` | Send-backs per PR while it keeps conflicting, one per push, before it is left to you. |

@@ -20,6 +20,11 @@
 //                                          sent back to their agents
 //                                          (RELAY_FIX_CONFLICTS, conflicts.mjs)
 //
+// When your /changes, /approve or "Request changes" is not recorded as a decision
+// (the issue isn't waiting on you, several are, it's already done, or the PR names
+// no issue), the relay replies on the PR with where your text went and why, so it
+// doesn't look as if nothing arrived (RELAY_PR_NOTES, with a GitHub token).
+//
 // It ignores events without a valid GITHUB_WEBHOOK_SECRET signature, or from a
 // repository not in GITHUB_REPOS. Decisions and copied comments also need the
 // sender to be GITHUB_OWNER_LOGIN; the notes (PR opened, closed, merged by
@@ -100,6 +105,44 @@ export function isWorkProductOf(wp, pr) {
     (String(wp.metadata?.repo ?? "").toLowerCase() === repo && Number(wp.metadata?.number) === number) ||
     String(wp.externalId ?? "").toLowerCase() === `${repo}#${number}`
   );
+}
+
+// What to say on the PR when a decision you asked for wasn't recorded; null when
+// it was. `asked` names what you did ("`/changes`", "Request changes"); `result`
+// is decide()'s; `identifiers` are the issues the PR names.
+export function decisionNote({ kind, asked, result, identifiers, prefixLabel = "Paperclip", fromComment = false }) {
+  if (result && result.action === kind) return null;
+  if (result && /dry run/.test(String(result.action))) return null;
+  const named = identifiers?.length ? identifiers.join(", ") : null;
+  const pch = kind === "approve" ? "pch approve" : "pch changes";
+  const target = result?.identifier ?? null;
+  const lines = [`**${asked} was not recorded as a decision.**`, ""];
+  let copied = false;
+  if (!named) {
+    lines.push(
+      `This PR names no ${prefixLabel} issue in its title or body${fromComment ? " (for comments GitHub doesn't send the branch, so its name isn't read)" : " or branch"}, so nothing was sent to Paperclip.`,
+    );
+  } else if (result?.reason === "no Paperclip issue found for the identifiers") {
+    lines.push(`None of the issues this PR names (${named}) was found in Paperclip.`);
+  } else if (result?.reason === "issue already done") {
+    lines.push(`${target} is already done.`);
+  } else if (String(result?.reason ?? "").startsWith("several issues wait on you")) {
+    lines.push(`${result.reason.replace(/^several issues wait on you \((.*)\) and none lists this PR$/, "$1")} all wait on you, and none of them lists this PR, so the relay didn't guess.`);
+    copied = true;
+  } else if (result?.reason === "decision is not waiting on you") {
+    const where = [result.status, result.stageType ? `${result.stageType} stage` : null].filter(Boolean).join(", ");
+    lines.push(`This PR names ${named}. None of those issues, their subtasks or their blockers has a decision waiting on you, so the relay used the first one, ${target}${where ? ` (${where})` : ""}.`);
+    copied = true;
+  } else {
+    lines.push(`The relay did \`${result?.action ?? "nothing"}\`${target ? ` on ${target}` : ""}${result?.reason ? `: ${result.reason}` : ""}.`);
+  }
+  if (copied && target) lines.push("", `Your text was added to ${target} as a comment. Nothing else changed.`);
+  lines.push(
+    "",
+    `To decide on the issue you meant, run \`${pch} <issue> "…"\` (\`pch check <issue>\` shows who its decision is waiting on)` +
+      (named ? "." : ", or add the issue's identifier to this PR's title or body and comment again."),
+  );
+  return lines.join("\n");
 }
 
 // "Changes requested on PR #8", "Approved on PR #8", or "<plain> on PR #8".
@@ -277,11 +320,13 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
 
   // ------------------------------------------------------------ merge conflicts
 
+  const hasToken = Boolean(config.githubToken || config.githubTokenFile);
+  const gh = github ?? (hasToken ? createGitHub({ config, log }) : null);
   const conflicts = config.relayFixConflicts
     ? createConflictSweep({
         ctx,
         state,
-        github: github ?? createGitHub({ config, log }),
+        github: gh,
         identifiersOf: (pr) => findIdentifiers(pr, ctx.prefixes()),
         resolveTarget,
         decide,
@@ -289,8 +334,8 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       })
     : null;
   const background = new Set();
-  const inBackground = (work) => {
-    const run = work.catch((err) => log.error("relay: conflict sweep failed", { error: err.message }));
+  const inBackground = (work, what = "relay: conflict sweep failed") => {
+    const run = work.catch((err) => log.error(what, { error: err.message }));
     background.add(run);
     run.finally(() => background.delete(run));
   };
@@ -303,6 +348,24 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
     for (const repo of config.repos) await conflicts.sweep(repo);
   }
   let timer = null;
+
+  // ------------------------------------------------------------ notes on the PR
+
+  // Tell the PR when a decision you asked for wasn't recorded. Not awaited, like
+  // the sweep: the webhook has already been answered by the time GitHub replies.
+  function noteOnPr(payload, number, { kind, asked, result, identifiers, fromComment }) {
+    const text = decisionNote({ kind, asked, result, identifiers, prefixLabel: prefixLabel(), fromComment });
+    if (!text) return result;
+    const out = { ...result, prNote: false };
+    if (!config.relayPrNotes || !gh || config.dryRun) return out;
+    const repo = payload?.repository?.full_name;
+    out.prNote = true;
+    inBackground(
+      gh.comment(repo, number, `${signed(text)}\n\n${HELPER_MARK}`).then(() => log("relay: noted on the PR", { repo, pr: number, kind })),
+      "relay: could not note on the PR",
+    );
+    return out;
+  }
 
   // ------------------------------------------------------------ GitHub events
 
@@ -353,18 +416,25 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       if (sender !== config.ownerLogin) return { ignored: `review by @${payload.sender?.login}` };
       const pr = payload.pull_request;
       const review = payload.review;
-      const identifiers = findIdentifiers(pr, prefixes);
-      if (!identifiers.length) return { ignored: `${prLabel(pr)} names no ${prefixLabel()} issue` };
       const state = review.state?.toLowerCase();
       if (state === "approved" && !command(review.body)) {
         // Merging is the approval; a GitHub approval alone changes nothing.
         return { ignored: "GitHub approval (merge to approve in Paperclip)" };
       }
       const kind = state === "changes_requested" ? "changes" : command(review.body);
+      const asked = command(review.body) ? `Your \`/${kind}\`` : "Your Request changes";
+      const identifiers = findIdentifiers(pr, prefixes);
+      if (!identifiers.length) {
+        const ignored = { ignored: `${prLabel(pr)} names no ${prefixLabel()} issue` };
+        return kind ? noteOnPr(payload, pr.number, { kind, asked, result: ignored, identifiers }) : ignored;
+      }
       const text = clip(stripCommand(review.body));
       const inline = `Inline comments, if any: \`gh api repos/${payload.repository.full_name}/pulls/${pr.number}/reviews/${review.id}/comments\``;
       const comment = `${heading(kind, "Review", pr)} (${review.html_url}):\n\n${text || "(no summary)"}\n\n${inline}`;
-      if (kind === "changes" || kind === "approve") return decide(pr, identifiers, kind, comment);
+      if (kind === "changes" || kind === "approve") {
+        const result = await decide(pr, identifiers, kind, comment);
+        return noteOnPr(payload, pr.number, { kind, asked, result, identifiers });
+      }
       if (!text) return { ignored: "review with no summary text" };
       return commentOnTarget(pr, identifiers, comment);
     }
@@ -378,12 +448,19 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       // The issue stands in for the PR (title, body, number, html_url), but it has
       // no branch, so only the title and body are searched for identifiers.
       const pr = payload.issue;
-      const identifiers = findIdentifiers(pr, prefixes);
-      if (!identifiers.length) return { ignored: `${prLabel(pr)} names no ${prefixLabel()} issue` };
       const kind = command(payload.comment.body);
+      const asked = `Your \`/${kind}\``;
+      const identifiers = findIdentifiers(pr, prefixes);
+      if (!identifiers.length) {
+        const ignored = { ignored: `${prLabel(pr)} names no ${prefixLabel()} issue` };
+        return kind ? noteOnPr(payload, pr.number, { kind, asked, result: ignored, identifiers, fromComment: true }) : ignored;
+      }
       const text = clip(stripCommand(payload.comment.body));
       const comment = `${heading(kind, "Comment", pr)} (${payload.comment.html_url}):\n\n${text || "(no text)"}`;
-      if (kind) return decide(pr, identifiers, kind, comment);
+      if (kind) {
+        const result = await decide(pr, identifiers, kind, comment);
+        return noteOnPr(payload, pr.number, { kind, asked, result, identifiers, fromComment: true });
+      }
       return commentOnTarget(pr, identifiers, comment);
     }
 

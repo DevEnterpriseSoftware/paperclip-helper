@@ -85,7 +85,7 @@ With `WATCHDOG_RELEASE_HOLDS` on, the watchdog releases such a hold the way `pch
 - It leaves the hold alone, and logs it once, while the run is still active, its environment lease is unreleased, or another run on the issue is active.
 - It releases each held run once. A hold that comes back for the same run is logged once and left to you.
 
-This was verified against Paperclip 2026.916.1, 2026.1001.0 and 2026.1005.0 by the compatibility suite, which reproduces the hold with an agent whose command doesn't exist.
+This was verified against Paperclip 2026.916.1, 2026.1001.0, 2026.1005.0 and 2026.1012.0 by the compatibility suite, which reproduces the hold with an agent whose command doesn't exist.
 
 ## Limits
 
