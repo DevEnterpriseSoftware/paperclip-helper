@@ -139,6 +139,7 @@ async function main() {
     changes: () => cmd.decide(ctx, "changes", arg, text),
     comment: () => cmd.comment(ctx, arg, text),
     release: () => cmd.release(ctx, [arg, ...rest].find((x) => x && !x.startsWith("--")), flags),
+    workspace: () => cmd.workspace(ctx, [arg, ...rest].find((x) => x && !x.startsWith("--")), flags),
     costs: () => cmd.costs(ctx, flags),
     models: () => cmd.models(ctx),
     "set-model": () => cmd.setModel(ctx, arg, rest.filter((r) => !r.startsWith("--"))[0], flags),

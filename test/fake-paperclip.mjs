@@ -34,6 +34,8 @@ export function emptyDb() {
     blockerDiagnostics: {}, // issueId → { readiness, blockers }
     workProducts: {}, // issueId → [...]
     workspaceOps: {}, // workspaceId → [...]
+    executionWorkspaces: [], // { id, companyId, sourceIssueId, mode, status, branchName, closedAt }
+    experimental: { enableIsolatedWorkspaces: true }, // GET /api/instance/settings/experimental
     heartbeatRuns: [], // { id, companyId, agentId, status, finishedAt, usageJson, contextSnapshot, createdAt, resultJson }
     runEvents: {}, // runId → [{ seq, eventType, payload }], oldest first
     costEvents: [],
@@ -161,6 +163,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         list = list.filter((i) => statuses.includes(i.status));
       }
       if (q.get("parentId")) list = list.filter((i) => i.parentId === q.get("parentId"));
+      if (q.get("executionWorkspaceId")) list = list.filter((i) => i.executionWorkspaceId === q.get("executionWorkspaceId"));
       if (q.get("sortField") === "id") list = [...list].sort((a, b) => (a.id < b.id ? -1 : 1));
       if (q.get("afterId")) list = list.filter((i) => i.id > q.get("afterId"));
       const limit = Math.min(Number(q.get("limit") ?? 500), 1000);
@@ -221,7 +224,11 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       const issue = issueByRef(decodeURIComponent(m[1]));
       if (!issue) return send(404, { error: "Issue not found" });
       const rest = m[2] ?? "";
-      if (rest === "" && req.method === "GET") return send(200, issue);
+      if (rest === "" && req.method === "GET") {
+        // Like Paperclip (routes/issues.ts): the issue carries a compact copy of its workspace.
+        const ws = db.executionWorkspaces.find((w) => w.id === issue.executionWorkspaceId);
+        return send(200, ws && !db.noInlineWorkspace ? { ...issue, currentExecutionWorkspace: { ...ws } } : issue);
+      }
       if (rest === "" && req.method === "PATCH") {
         if (body.comment && issue.paused) return send(409, { error: "Task is paused. Resume it before sending a message." });
         db.patches.push({ issueId: issue.id, identifier: issue.identifier, body });
@@ -233,6 +240,13 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           issue.status = "in_review";
         } else if (body.status) issue.status = body.status;
         if (body.blockedByIssueIds) issue.blockedBy = body.blockedByIssueIds.map((id) => ({ id }));
+        // Like Paperclip's issue update: with isolated workspaces off, the
+        // workspace fields are dropped without an error.
+        if (db.experimental?.enableIsolatedWorkspaces !== false) {
+          for (const k of ["executionWorkspaceId", "executionWorkspacePreference", "executionWorkspaceSettings"]) {
+            if (k in body) issue[k] = body[k];
+          }
+        }
         if (body.comment) db.comments.push({ issueId: issue.id, identifier: issue.identifier, body: body.comment, via: "patch" });
         issue.updatedAt = new Date().toISOString();
         return send(200, issue);
@@ -286,6 +300,14 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       if (rest === "/diagnostics/blockers") {
         return send(200, db.blockerDiagnostics[issue.id] ?? { readiness: null, blockers: [] });
       }
+    }
+    if (p === "/api/instance/settings/experimental" && req.method === "GET") {
+      if (db.experimental === null) return send(404, { error: "Not found" });
+      return send(200, db.experimental);
+    }
+    if ((m = p.match(/^\/api\/execution-workspaces\/([^/]+)$/)) && req.method === "GET") {
+      const ws = db.executionWorkspaces.find((w) => w.id === m[1]);
+      return ws ? send(200, ws) : send(404, { error: "Execution workspace not found" });
     }
     if ((m = p.match(/^\/api\/execution-workspaces\/([^/]+)\/workspace-operations$/))) {
       return send(200, db.workspaceOps[m[1]] ?? []);

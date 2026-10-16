@@ -11,6 +11,7 @@
 | `pch changes ISSUE comment` | Requests changes. The comment is required and becomes the brief. |
 | `pch comment ISSUE text` | Comments as you, which wakes the assignee. |
 | `pch release ISSUE [--apply] [--outcome=…]` | Releases an execution hold whose run can't prove it stopped, so messages and Interrupt stay saved behind it. It previews unless you pass `--apply`. See [`release`](#release-a-hold-messages-cant-clear). |
+| `pch workspace ISSUE [--apply]` | Gives an issue linked to a closed workspace, or to another issue's live one, a new isolated workspace. It previews unless you pass `--apply`. See [`workspace`](#workspace-an-issue-linked-to-the-wrong-workspace). |
 | `pch costs` | Previews what cost sync would post, and what it does to budgets. |
 | `pch costs --sessions` | Checks whether resumed sessions report cumulative costs (see [Compatibility](../README.md#compatibility)). |
 | `pch models` | Every agent's adapter, model, effort and status. |
@@ -59,9 +60,10 @@ The recommendation names what is going on, gives the steps as commands you can p
 - an assignee that is paused, terminated or awaiting approval;
 - a run that is working, about to start, or has sat queued for more than ten minutes;
 - a review or approval waiting on you;
+- a link to a closed workspace, which fails every run at setup;
 - an execution hold, and an issue Paperclip's recovery parked;
 - saved messages waiting behind an earlier run;
-- a blocked issue: waiting on open blockers, on a workspace clean-up, with every blocker done, blocked by an agent's own note, or an agent re-running every few minutes while it waits on you;
+- a blocked issue: waiting on open blockers, on a workspace clean-up, with every blocker done, blocked by an agent over another issue's workspace or with a note of its own, or an agent re-running every few minutes while it waits on you;
 - a dropped hand-off, runs Paperclip refused before they started, a failed run, and a run that finished without moving the issue on.
 
 It is a set of rules over what Paperclip reports, not a judgement: it quotes the agent's last note where the answer is in there, and it can be wrong about a case nobody has met yet.
@@ -75,6 +77,33 @@ Paperclip holds an issue (`legacy_execution_requires_reconciliation`) when a run
 It refuses while the run is still active, its environment lease is unreleased, or its process is alive on the helper's host. Since nobody verified what the run did, have the agent check the branch before it builds on it.
 
 The [watchdog](watchdog.md#7-holds-paperclip-can-never-release-by-itself) does this by itself for a hold whose run recorded no process at all (`WATCHDOG_RELEASE_HOLDS`). Use the command for a hold it leaves to you, or to release one without waiting.
+
+## `workspace`: an issue linked to the wrong workspace
+
+When an agent creates an issue from another issue's work (a follow-up, a sub-issue, an issue its run creates), Paperclip links the new issue to that issue's execution workspace (`reuse_existing`), and every run on it asks for that one workspace. No project or instance setting turns this off. It goes wrong in two ways:
+
+- **The workspace is closed.** Paperclip closes an issue's isolated workspace when the issue finishes, but leaves the links on other issues. Every run on them then fails before the agent starts: `setup_failed`, "Issue … requested inherited execution workspace reuse for …, but the workspace could not be restored". Retry and comments fail the same way.
+- **The workspace belongs to another issue that is still open.** The new issue's commits land on that issue's branch. An agent that notices blocks the issue and asks for a "workspace ruling".
+
+`pch workspace ISSUE` shows the link: whose workspace, its status and branch. For a closed one it also lists the other open issues still linked to it. `--apply` makes the same change as **New isolated workspace** in the issue's Workspace picker: the link is cleared, and the next run gets a new worktree branched from the project's base branch. With a closed workspace, every open issue linked to it is changed; with a live one, only the issue you named, because a live workspace may be shared on purpose. Nothing is posted and no status changes. The command prints the comment that tells the assignee to carry on.
+
+```text
+$ pch workspace ACM-416
+ACM-416: blocked — Intermittent: SelfTest on elevated Windows
+Workspace: reuses ACM-318's workspace 0b4a273f (archived 2026-10-16T06:36:12.000Z, branch ACM-318-recovery): every run fails at setup
+Also linked to it: ACM-415 (in_review)
+
+--apply gives these 2 issues a new isolated workspace on the next run,
+branched from the project's base branch, like "New isolated workspace" in the issue's Workspace picker.
+The closed workspace and its branch are left as they are.
+  pch workspace ACM-416 --apply
+```
+
+It leaves alone an issue with a run queued or running, and an issue that is done or cancelled.
+
+Paperclip only accepts this change while **Instance settings → Experimental → Enable Isolated Workspaces** is on. While it's off, the Workspace picker is hidden and Paperclip drops the change without an error. The command checks the setting first and reads each issue back afterwards, so it says so instead of reporting a change that didn't happen.
+
+`pch why` recommends this command when the issue is linked to a closed workspace, or when its assignee's last run failed restoring one. It also recommends it when an agent has blocked the issue with a note about its workspace or branch while it is linked to another issue's live workspace.
 
 ## Debugging with an LLM
 

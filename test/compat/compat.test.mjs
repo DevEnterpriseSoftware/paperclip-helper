@@ -71,6 +71,8 @@ const HELPER_ENDPOINTS = [
   ["GET", "/api/issues/{id}/queued-comments"],
   ["POST", "/api/issues/{id}/queued-comments/interrupt"],
   ["GET", "/api/execution-workspaces/{id}/workspace-operations"],
+  ["GET", "/api/execution-workspaces/{id}"],
+  ["GET", "/api/instance/settings/experimental"],
 ];
 const templateRegex = (template) => new RegExp(`^${template.replace(/\{[^}]+\}/g, "[^/]+")}$`);
 

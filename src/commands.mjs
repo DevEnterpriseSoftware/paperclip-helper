@@ -10,6 +10,16 @@ import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, signed } from ".
 import { createCostSync } from "./cost-sync.mjs";
 import { advise, excerpt, llmPrompt } from "./advice.mjs";
 import { holdFacts, releaseHold, releaseProblems, RELEASE_OUTCOMES, unprovable } from "./release.mjs";
+import {
+  clearLink,
+  clearProblems,
+  deadLinkWorkspaceId,
+  describeLink,
+  ENABLE_SETTING_HINT,
+  isolatedWorkspacesEnabled,
+  issuesLinkedTo,
+  linkFacts,
+} from "./workspace.mjs";
 
 export const USAGE = `Paperclip Helper
 
@@ -22,6 +32,8 @@ export const USAGE = `Paperclip Helper
   pch comment ISSUE text       comment as you (wakes the assignee)
   pch release ISSUE [--apply] [--outcome=mixed|completed|not_performed]
                                release an execution hold whose run can't prove it stopped (preview without --apply)
+  pch workspace ISSUE [--apply]  give an issue linked to a closed (or another issue's) workspace its own new one
+                               (preview without --apply; with a closed workspace, also the other open issues linked to it)
   pch costs                    preview what cost sync would post (changes nothing)
   pch costs --sessions         check whether resumed sessions report cumulative costs
   pch models                   every agent's adapter, model and effort
@@ -248,6 +260,11 @@ async function whyReport(ctx, identifier) {
   const full = await api.request("GET", `/api/issues/${id}`).catch(() => null);
   const assignee = await nameOf(full?.assigneeAgentId);
   if (assignee) out(`Assignee: ${assignee}`);
+  // A link to a closed workspace fails every run at setup; one to another
+  // issue's live workspace puts this issue's commits on that issue's branch.
+  const link = full ? await linkFacts(api, identifier, { issue: full }).catch(() => null) : null;
+  const linkLine = link ? describeLink(link) : null;
+  if (linkLine) out(`Workspace: ${linkLine}`);
   const hold = full?.executionBlocker;
   if (hold) {
     // Paperclip's recovery is holding the issue: new runs are refused until it's released.
@@ -300,6 +317,17 @@ async function whyReport(ctx, identifier) {
     lastComments.push({ author, body: c.body ?? "", createdAt: c.createdAt ?? null });
   }
   const assigneeAgent = full?.assigneeAgentId ? await api.request("GET", `/api/agents/${full.assigneeAgentId}`).catch(() => null) : null;
+  // The run list withholds error text; the run itself has it. Only a setup
+  // failure can be the dead workspace link.
+  const runList = Array.isArray(runs) ? runs : [];
+  const lastSetupFailure = runList.find((r) => r.agentId === full?.assigneeAgentId && r.status !== "cancelled");
+  let deadLinkRun = null;
+  if (lastSetupFailure?.status === "failed" && lastSetupFailure.errorCode === "setup_failed") {
+    const runId = lastSetupFailure.runId ?? lastSetupFailure.id;
+    const detail = await api.request("GET", `/api/heartbeat-runs/${runId}`).catch(() => null);
+    const wsId = deadLinkWorkspaceId(detail?.error);
+    if (wsId) deadLinkRun = { runId, workspaceId: wsId };
+  }
   return {
     identifier,
     issue: full ?? { status: issue.status },
@@ -308,7 +336,9 @@ async function whyReport(ctx, identifier) {
     nameOf: (agentId) => names.get(agentId) ?? null,
     blockers,
     wakes: (wakes?.events ?? []).filter((e) => e.kind === "wake_request"),
-    runs: Array.isArray(runs) ? runs : [],
+    runs: runList,
+    link,
+    deadLinkRun,
     recovery,
     queue,
     lastComment: lastComments[0] ?? null,
@@ -380,6 +410,88 @@ export async function release(ctx, identifier, flags = []) {
   if (result.delivered) out(`Delivered ${result.delivered} saved message(s) to ${agent?.name ?? "the assignee"}.`);
   else if (result.waiting) out(`${result.waiting} saved message(s) are waiting; they start with the next run.`);
   else out(`No saved messages: \`pch comment ${identifier} "..."\` tells the assignee what to do next.`);
+}
+
+// ---------------------------------------------------------------- workspace
+
+// An issue linked to a closed workspace fails every run at setup; one linked to
+// another issue's live workspace works on that issue's branch (see workspace.mjs).
+// Shows the link; --apply gives the issue a new isolated workspace, like "New
+// isolated workspace" in its Workspace picker. With a closed workspace, the other
+// open issues still linked to it are fixed too: they'd fail the same way.
+export async function workspace(ctx, identifier, flags = []) {
+  if (!identifier || identifier.startsWith("--")) throw new Error("usage: workspace <ISSUE-ID> [--apply]");
+  const { api } = ctx;
+  const apply = flags.includes("--apply");
+  const facts = await linkFacts(api, identifier);
+  const { issue } = facts;
+  const label = (i) => i.identifier ?? String(i.id).slice(0, 8);
+  out(`${label(issue)}: ${issue.status}${issue.title ? ` — ${issue.title}` : ""}`);
+  const line = describeLink(facts);
+  out(`Workspace: ${line ?? "no link to another workspace; each run gets the one the project's policy says"}`);
+  if (facts.state === "none" || facts.state === "own") {
+    out("Nothing to clear.");
+    return;
+  }
+
+  const runsOf = async (ref) => {
+    const r = await api.request("GET", `/api/issues/${encodeURIComponent(ref)}/runs`).catch(() => []);
+    return Array.isArray(r) ? r : [];
+  };
+  const problems = clearProblems(facts, await runsOf(issue.id ?? identifier));
+  if (problems.length) throw new Error(`Not changing ${label(issue)}: ${problems.join("; ")}. Nothing changed.`);
+
+  // A closed workspace fails every issue linked to it; a live one may be shared
+  // on purpose, so only the issue you named is changed.
+  const others = facts.state === "dead" ? await issuesLinkedTo(api, issue.companyId, facts.workspaceId, { exceptId: issue.id }) : [];
+  if (others.length) {
+    out(`Also linked to it: ${others.map((i) => `${label(i)} (${i.status})`).join(", ")}`);
+  }
+  const targets = [issue, ...others];
+
+  const enabled = await isolatedWorkspacesEnabled(api);
+  if (enabled === false) throw new Error(`${ENABLE_SETTING_HINT} Nothing changed.`);
+
+  if (!apply) {
+    out("");
+    out(`--apply gives ${targets.length === 1 ? label(issue) : `these ${targets.length} issues`} a new isolated workspace on the next run,`);
+    out(`branched from the project's base branch, like "New isolated workspace" in the issue's Workspace picker.`);
+    if (facts.state === "foreign") {
+      out(`Its runs stop working on ${facts.owner?.identifier ?? "the other issue"}'s branch. Anything it already committed there stays there.`);
+    } else {
+      out("The closed workspace and its branch are left as they are.");
+    }
+    out(`  pch workspace ${identifier} --apply`);
+    return;
+  }
+
+  let failed = 0;
+  for (const target of targets) {
+    if (target !== issue) {
+      const p = clearProblems({ ...facts, issue: target }, await runsOf(target.id));
+      if (p.length) {
+        out(`${label(target)}: left alone (${p.join("; ")}).`);
+        continue;
+      }
+    }
+    const result = await clearLink(api, target.id ?? identifier);
+    if (!result.ok) {
+      failed += 1;
+      out(`${label(target)}: Paperclip kept the link.`);
+      continue;
+    }
+    out(`${label(target)}: linked to no other workspace now; the next run gets a new isolated one.`);
+  }
+  if (failed) {
+    throw new Error(enabled === null ? `${failed} issue(s) kept the link. ${ENABLE_SETTING_HINT}` : `${failed} issue(s) kept the link.`);
+  }
+  const who = issue.assigneeAgentId ? (await api.request("GET", `/api/agents/${issue.assigneeAgentId}`).catch(() => null))?.name : null;
+  out("");
+  out("Nothing restarts by itself. To have the assignee carry on:");
+  out(
+    `  pch comment ${identifier} "${who ? `${who}, the` : "The"} workspace is fixed: you have a new isolated workspace, ` +
+      `branched from the base branch. Please continue this issue."`,
+  );
 }
 
 // ---------------------------------------------------------------- decisions

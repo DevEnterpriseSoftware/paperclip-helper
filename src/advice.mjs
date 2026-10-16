@@ -41,6 +41,8 @@ export function advise(facts) {
     recovery = null, // the active recovery action, if any
     queue = null, // /queued-comments
     lastComment = null, // { body, author }
+    link = null, // workspace.mjs linkFacts
+    deadLinkRun = null, // { runId, workspaceId }: the assignee's last run failed restoring a linked workspace
     config = {},
     now = Date.now(),
   } = facts;
@@ -104,6 +106,32 @@ export function advise(facts) {
       what: `${other} still has a ${active[0].status} run on this issue; ${who} starts after it.`,
       steps: [`Wait for it to finish. If it has been ${active[0].status} for long, check ${other}'s agent page.`],
       watchdog: null,
+    };
+  }
+
+  // A link to a closed workspace: Paperclip fails every run at setup, so no
+  // retry, comment or nudge helps until the link is cleared.
+  const ws = (id) => String(id ?? "").slice(0, 8);
+  const ownerName = link?.owner ? link.owner.identifier ?? ws(link.owner.id) : null;
+  const fixed = comment(`${who}, the workspace is fixed: you have a new isolated workspace, branched from the base branch. Please continue this issue.`);
+  if (link?.state === "dead" || (deadLinkRun && link?.state === "unknown" && link.workspaceId === deadLinkRun.workspaceId)) {
+    return {
+      what:
+        `${who}'s runs can't start: the issue reuses ${ownerName ? `${ownerName}'s workspace` : "workspace"} ${ws(link.workspaceId)}, ` +
+        `which ${link.missing ? "no longer exists" : "is closed"}, so Paperclip fails every run at setup (setup_failed). Retries and comments fail the same way.`,
+      steps: [
+        `pch workspace ${identifier}   (shows the link, and other open issues linked to the same workspace)`,
+        `pch workspace ${identifier} --apply   (gives them a new isolated workspace, like "New isolated workspace" in the Workspace picker)`,
+        `Then: ${fixed}`,
+      ],
+      watchdog: "manual",
+    };
+  }
+  if (deadLinkRun && link?.state === "none") {
+    return {
+      what: `${who}'s last run failed because the issue was linked to a closed workspace (${ws(deadLinkRun.workspaceId)}). The link has been cleared since, but nothing has restarted ${who}.`,
+      steps: [fixed],
+      watchdog: "manual",
     };
   }
 
@@ -212,6 +240,22 @@ export function advise(facts) {
         what: "Every blocker is done, but the wake that should have restarted the issue was dropped.",
         steps: [comment(`${who}, every blocker is done. Please continue this issue.`)],
         watchdog: auto,
+      };
+    }
+    // Linked to another issue's live workspace: an agent that notices blocks the
+    // issue and asks for a ruling on the workspace or branch.
+    if (link?.state === "foreign" && /workspace|branch|worktree/i.test(lastComment?.body ?? "")) {
+      const branch = link.workspace?.branchName ? ` (branch ${link.workspace.branchName})` : "";
+      return {
+        what:
+          `${who} blocked this issue over its workspace: it is linked to ${ownerName ?? "another issue"}'s live workspace${branch}, ` +
+          `so its commits would land on that issue's branch.${note}`,
+        steps: [
+          `If it should have its own branch and PR: pch workspace ${identifier} --apply   (a new isolated workspace from the base branch)`,
+          `Then give the ruling: ${comment(`${who}, workspace ruling: you have your own isolated workspace now, branched from the base branch. Don't commit to ${ownerName ?? "the other issue"}'s branch. Please continue.`)}`,
+          `If it should build on ${ownerName ?? "that issue"}'s branch after all, say so in a comment instead.`,
+        ],
+        watchdog: "manual",
       };
     }
     const recentRuns = runs.filter((r) => mine(r) && now - ts(r.createdAt) < LOOP_WINDOW_MS);
