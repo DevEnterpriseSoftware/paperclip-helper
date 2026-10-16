@@ -145,6 +145,7 @@ export function loadConfig(env = process.env) {
     watchdogHealFailedFinalize: bool("WATCHDOG_HEAL_FAILED_FINALIZE", true),
     watchdogRetryDeferred: bool("WATCHDOG_RETRY_DEFERRED", true),
     watchdogReleaseHolds: bool("WATCHDOG_RELEASE_HOLDS", true),
+    watchdogClearDeadLinks: bool("WATCHDOG_CLEAR_DEAD_LINKS", true),
 
     // cost-sync.mjs: API-equivalent cost of subscription runs
     costSync: bool("COST_SYNC", true),

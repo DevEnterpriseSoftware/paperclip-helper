@@ -4,7 +4,14 @@ import { captureOutput, minutesAgo, setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import * as cmd from "../src/commands.mjs";
 import { advise } from "../src/advice.mjs";
-import { classifyLink, deadLinkWorkspaceId, ISOLATED_SELECTION } from "../src/workspace.mjs";
+import { classifyLink, deadLinkWorkspaceId, isolatedSelection } from "../src/workspace.mjs";
+
+// What the Workspace picker's "New isolated workspace" sends, for an issue whose settings are just the mode.
+const ISOLATED = {
+  executionWorkspaceId: null,
+  executionWorkspacePreference: "isolated_workspace",
+  executionWorkspaceSettings: { mode: "isolated_workspace", environmentId: null },
+};
 
 // DIR-318's workspace, closed after DIR-318 finished; DIR-415 and DIR-416 were
 // created from its work and still point at it.
@@ -97,7 +104,7 @@ test("workspace --apply clears the dead link on every open issue linked to it", 
   const { a, b, done, ws } = seed(env.db);
   const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", ["--apply"]))).join("\n");
   assert.deepEqual(env.db.patches.map((p) => p.identifier).sort(), ["ACM-415", "ACM-416"]);
-  for (const p of env.db.patches) assert.deepEqual(p.body, ISOLATED_SELECTION, "the same change as the Workspace picker");
+  for (const p of env.db.patches) assert.deepEqual(p.body, ISOLATED, "the same change as the Workspace picker");
   for (const i of [a, b]) {
     assert.equal(i.executionWorkspaceId, null);
     assert.equal(i.executionWorkspacePreference, "isolated_workspace");
@@ -157,15 +164,69 @@ test("workspace says so when Paperclip ignores workspace changes", async (t) => 
   assert.equal(a.executionWorkspaceId, ws.id);
 });
 
-test("workspace reads the workspace itself when the issue doesn't carry it, and a missing one is dead", async (t) => {
+test("a workspace whose row is gone is dead; a 404 from the workspace itself proves nothing", async (t) => {
+  const env = await setup();
+  t.after(env.close);
+  const { a, ws } = seed(env.db);
+  a.executionWorkspaceId = uuid(); // gone: the issue carries currentExecutionWorkspace: null
+  const gone = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415"))).join("\n");
+  assert.match(gone, /reuses workspace .{8}, which no longer exists: every run fails at setup/);
+
+  // An older Paperclip whose issues don't carry their workspace: it's read
+  // directly, and a 404 (missing, or private to the key) is not taken as closed.
+  env.db.noInlineWorkspace = true;
+  a.executionWorkspaceId = ws.id;
+  ws.status = "active";
+  ws.private = true;
+  const text = (await captureOutput(() => cmd.why(env.ctx, "ACM-415"))).join("\n");
+  assert.match(text, /Workspace: reuses workspace .{8} \(couldn't read it: not found, or not readable with this key\)/);
+  assert.doesNotMatch(text, /runs can't start/);
+  await assert.rejects(cmd.workspace(env.ctx, "ACM-415", ["--apply"]), /couldn't be read/);
+  assert.equal(env.db.patches.length, 0);
+
+  ws.private = false;
+  ws.status = "archived";
+  const read = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415"))).join("\n");
+  assert.match(read, /\(archived/);
+  assert.ok(env.fake.requests.some((r) => r.path === `/api/execution-workspaces/${ws.id}`));
+});
+
+test("workspace --apply keeps the issue's other workspace settings", async (t) => {
   const env = await setup();
   t.after(env.close);
   const { a } = seed(env.db);
-  env.db.noInlineWorkspace = true;
-  a.executionWorkspaceId = uuid(); // gone
-  const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415"))).join("\n");
-  assert.match(text, /reuses workspace .{8}, which no longer exists: every run fails at setup/);
-  assert.ok(env.fake.requests.some((r) => r.path === `/api/execution-workspaces/${a.executionWorkspaceId}`));
+  const envId = uuid();
+  a.executionWorkspaceSettings = {
+    mode: "isolated_workspace",
+    environmentId: envId,
+    workspaceStrategy: { type: "git_worktree", existingBranch: "feature/x" },
+    networkEgress: { allowFqdns: ["example.com"] },
+  };
+  await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", ["--apply"]));
+  assert.deepEqual(a.executionWorkspaceSettings, {
+    mode: "isolated_workspace",
+    environmentId: envId,
+    workspaceStrategy: { type: "git_worktree", existingBranch: "feature/x" },
+    networkEgress: { allowFqdns: ["example.com"] },
+  });
+  assert.equal(a.executionWorkspaceId, null);
+});
+
+test("workspace leaves alone a change already scheduled, and explains its own closed workspace", async (t) => {
+  const env = await setup();
+  t.after(env.close);
+  const { a, b, ws, owner } = seed(env.db);
+  b.workspacePendingSelection = { selection: "isolated_workspace" };
+  const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", ["--apply"]))).join("\n");
+  assert.match(text, /ACM-416: left alone \(a workspace change is already scheduled for its next run\)/);
+  assert.equal(b.executionWorkspaceId, ws.id);
+  await assert.rejects(cmd.workspace(env.ctx, "ACM-416", ["--apply"]), /already scheduled/);
+
+  // A finished issue reopened after its own workspace was closed.
+  Object.assign(owner, { status: "todo", executionWorkspacePreference: "reuse_existing", assigneeAgentId: a.assigneeAgentId });
+  const own = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-318"))).join("\n");
+  assert.match(own, /reuses its own workspace .{8} \(archived/);
+  assert.match(own, /It is the issue's own workspace: the new one starts from the base branch/);
 });
 
 test("workspace --apply on a live workspace another issue owns changes only that issue", async (t) => {
@@ -198,7 +259,9 @@ test("pch why: a dead link outranks the blocked note and recommends pch workspac
   assert.match(text, /1\. pch workspace ACM-416 /);
   assert.match(text, /2\. pch workspace ACM-416 --apply /);
   assert.match(text, /3\. Then: pch comment ACM-416 "Gilfoyle, the workspace is fixed/);
-  assert.match(text, /The watchdog leaves this one to you/);
+  assert.match(text, /The watchdog clears the link by itself within a minute/);
+  const off = (await captureOutput(() => cmd.why(env.makeCtx({ WATCHDOG_CLEAR_DEAD_LINKS: "false" }), "ACM-416"))).join("\n");
+  assert.match(off, /The watchdog leaves this one to you/);
 });
 
 test("pch why: once the link is cleared, a failed run is retried with a comment", async (t) => {
@@ -208,7 +271,7 @@ test("pch why: once the link is cleared, a failed run is retried with a comment"
   const failed = setupFailed(agent.id, ws.id, "ACM-415");
   env.db.issueRuns[a.id] = [failed];
   env.db.heartbeatRuns.push({ id: failed.runId, companyId: ids.company, agentId: agent.id, status: "failed", error: failed.error, createdAt: failed.createdAt });
-  Object.assign(a, ISOLATED_SELECTION, { status: "todo" });
+  Object.assign(a, isolatedSelection(a), { status: "todo" });
 
   const text = (await captureOutput(() => cmd.why(env.ctx, "ACM-415"))).join("\n");
   assert.doesNotMatch(text, /^Workspace:/m);

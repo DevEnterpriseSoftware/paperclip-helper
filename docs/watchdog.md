@@ -1,6 +1,6 @@
 # The watchdog: wake stalled work
 
-Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for seven situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment.
+Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for eight situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment.
 
 | In Paperclip you see… | The watchdog… |
 |---|---|
@@ -11,6 +11,7 @@ Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog 
 | **"Automatic recovery blocked"**, board decision required, after a hand-off. | Delivers the saved messages to the current owner, as **Interrupt** does. |
 | **"Automatic recovery blocked … the original assignee is not invokable"**, after you paused and resumed an agent. | Comments on the issue once the agent is back, which un-parks it and wakes the agent. |
 | **"Automatic recovery of this task stopped"**, with every message saved behind "The previous run has no verified stop record". | Releases the hold, as `pch release --apply` does, and delivers the saved messages. |
+| Every run fails at once with **`setup_failed`: "requested inherited execution workspace reuse … could not be restored"**. | Clears the issue's link to the closed workspace, as `pch workspace --apply` does, and restarts the agent if that run was its last. |
 
 ## 1. Dropped hand-offs
 
@@ -87,6 +88,21 @@ With `WATCHDOG_RELEASE_HOLDS` on, the watchdog releases such a hold the way `pch
 
 This was verified against Paperclip 2026.916.1, 2026.1001.0, 2026.1005.0 and 2026.1012.0 by the compatibility suite, which reproduces the hold with an agent whose command doesn't exist.
 
+## 8. Issues linked to a closed workspace
+
+An issue an agent creates from another issue's work is linked to that issue's execution workspace. When that issue finishes, Paperclip closes its workspace but leaves the links on other issues. Every run on them then fails before the agent starts, with `setup_failed` and "Issue … requested inherited execution workspace reuse for …, but the workspace could not be restored". Retry and comments fail the same way.
+
+With `WATCHDOG_CLEAR_DEAD_LINKS` on, the watchdog looks at every open issue (backlog to blocked) linked to another workspace. When that workspace is archived or no longer exists, it clears the link, as `pch workspace ISSUE --apply` does: the next run gets a new isolated workspace. The issue's other workspace settings, such as a pinned branch or its environment, are kept.
+
+- It doesn't wait for the stall window: a run on that issue can only fail until the link is cleared.
+- It judges the workspace the way Paperclip does when it starts a run: from the issue's own copy of it. The workspace's own page answers "not found" for one your key may not read, so that alone is never taken as closed.
+- It waits while a run on the issue is queued or running, and leaves done and cancelled issues alone, and any issue with a workspace change already scheduled for its next run.
+- It clears each issue's link to a given workspace once. If Paperclip refuses the change, it tries again a stall window later, `WATCHDOG_MAX_NUDGES` times in all, then logs that it leaves it to you. If Paperclip ignores the change, it logs that once.
+- If the assignee's last run failed on that link and the issue is todo or in progress, it also comments, which restarts the agent. A blocked issue, or one in review, only has its link cleared. A comment there would move it on without your decision, so `pch why` gives you the comment to send.
+- It never touches a link to a live workspace, even another issue's. That may be shared on purpose; `pch workspace` changes it when you decide.
+- It leaves an issue linked to its own closed workspace (a finished issue you reopened) to you, and logs it once: unarchiving that workspace may be the better fix.
+- Paperclip ignores the change while **Instance settings → Experimental → Enable Isolated Workspaces** is off. The watchdog then changes nothing, and logs once a day which issues are affected.
+
 ## Limits
 
 Each nudge mentions the assignee and says what stalled. Each situation gets at most `WATCHDOG_MAX_NUDGES` comments or presses, spaced by the stall window. The counts are kept in `data/state.json`, so a restart doesn't repeat them.
@@ -110,6 +126,7 @@ These look similar in Paperclip, and `pch why ISSUE` tells them apart:
 | `WATCHDOG_HEAL_FAILED_FINALIZE` | `true` | Repair blockers stuck on a failed clean-up. This edits the issue's **Blocked by**. |
 | `WATCHDOG_RETRY_DEFERRED` | `true` | Ask Paperclip to retry a wake deferred behind a stopped run, and release a hand-off's recovery hold (4 and 5 above). |
 | `WATCHDOG_RELEASE_HOLDS` | `true` | Release a hold Paperclip can never release by itself, once its run has been over for the stall window (7 above). |
+| `WATCHDOG_CLEAR_DEAD_LINKS` | `true` | Clear an open issue's link to a closed workspace, and restart its agent if its last run failed on it (8 above). |
 
 
 ---

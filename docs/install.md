@@ -15,7 +15,7 @@ The installer shows everything before it writes it, and you can re-run it at any
 5. **Logs in.** It prints an approval link, you approve it in Paperclip, and it saves a named board key.
 6. **Asks about each component:**
    - **Relay** (default: yes): your GitHub login, the repositories, and the issue prefixes (detected from your companies). Then it asks whether to post new PRs' URLs, whether to send PRs with merge conflicts back to their agents (default: no; it then asks for a [GitHub token](relay.md#the-github-token), typed hidden), and the port and path. It generates the webhook secret.
-   - **Watchdog** (default: yes): its timing, if you want to change it, and its two repairs: blockers stuck on a failed clean-up, and wakes deferred behind a stopped run.
+   - **Watchdog** (default: yes): its timing, if you want to change it, and its repairs: blockers stuck on a failed clean-up, wakes deferred behind a stopped run, holds Paperclip can never release by itself, and links to a closed workspace.
    - **Cost sync** (default: yes): it shows `pch costs` first, and whether to include runs that already finished.
 7. **Writes `compose.yml`, `.env` (mode 600 on Linux and macOS) and `data/`**, then starts the service and shows its first log lines.
 8. **Sets up the webhook.** It checks your public webhook URL. It can create the GitHub webhook with `gh`; otherwise it prints the manual steps.

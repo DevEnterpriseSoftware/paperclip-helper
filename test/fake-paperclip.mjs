@@ -226,8 +226,10 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       const rest = m[2] ?? "";
       if (rest === "" && req.method === "GET") {
         // Like Paperclip (routes/issues.ts): the issue carries a compact copy of its workspace.
-        const ws = db.executionWorkspaces.find((w) => w.id === issue.executionWorkspaceId);
-        return send(200, ws && !db.noInlineWorkspace ? { ...issue, currentExecutionWorkspace: { ...ws } } : issue);
+        // null when the issue has no workspace or its row is gone; read without a privacy check.
+        if (db.noInlineWorkspace) return send(200, issue);
+        const ws = issue.executionWorkspaceId ? db.executionWorkspaces.find((w) => w.id === issue.executionWorkspaceId) : null;
+        return send(200, { ...issue, currentExecutionWorkspace: ws ? { ...ws } : null });
       }
       if (rest === "" && req.method === "PATCH") {
         if (body.comment && issue.paused) return send(409, { error: "Task is paused. Resume it before sending a message." });
@@ -306,7 +308,8 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       return send(200, db.experimental);
     }
     if ((m = p.match(/^\/api\/execution-workspaces\/([^/]+)$/)) && req.method === "GET") {
-      const ws = db.executionWorkspaces.find((w) => w.id === m[1]);
+      // Like Paperclip's assertWorkspacePrivacy: one the key may not read is a 404 too.
+      const ws = db.executionWorkspaces.find((w) => w.id === m[1] && !w.private);
       return ws ? send(200, ws) : send(404, { error: "Execution workspace not found" });
     }
     if ((m = p.match(/^\/api\/execution-workspaces\/([^/]+)\/workspace-operations$/))) {

@@ -213,7 +213,9 @@ export async function why(ctx, identifier, { prompt = false } = {}) {
   out("");
   out(`Recommendation: ${advice.what}`);
   advice.steps.forEach((step, i) => out(`  ${i + 1}. ${step}`));
-  if (advice.watchdog === "auto") {
+  if (advice.watchdog === "auto" && advice.autoNote) {
+    out(`  ${advice.autoNote}`);
+  } else if (advice.watchdog === "auto") {
     out(`  The watchdog does this by itself once the issue has been quiet for ${ctx.config.watchdogStallSec}s. Do it by hand only if you don't want to wait.`);
   } else if (advice.watchdog === "manual") {
     out("  The watchdog leaves this one to you.");
@@ -455,9 +457,11 @@ export async function workspace(ctx, identifier, flags = []) {
   if (!apply) {
     out("");
     out(`--apply gives ${targets.length === 1 ? label(issue) : `these ${targets.length} issues`} a new isolated workspace on the next run,`);
-    out(`branched from the project's base branch, like "New isolated workspace" in the issue's Workspace picker.`);
+    out(`like "New isolated workspace" in the issue's Workspace picker. Its other workspace settings (a pinned branch, the environment) are kept.`);
     if (facts.state === "foreign") {
       out(`Its runs stop working on ${facts.owner?.identifier ?? "the other issue"}'s branch. Anything it already committed there stays there.`);
+    } else if (facts.ownClosed) {
+      out("It is the issue's own workspace: the new one starts from the base branch, not from that workspace's branch, which is left as it is.");
     } else {
       out("The closed workspace and its branch are left as they are.");
     }
@@ -467,14 +471,22 @@ export async function workspace(ctx, identifier, flags = []) {
 
   let failed = 0;
   for (const target of targets) {
+    // The full issue, for its current settings (list rows don't carry them) and state.
+    const full = target === issue ? issue : await api.request("GET", `/api/issues/${target.id}`).catch(() => null);
+    if (!full) {
+      out(`${label(target)}: left alone (couldn't read it).`);
+      continue;
+    }
     if (target !== issue) {
-      const p = clearProblems({ ...facts, issue: target }, await runsOf(target.id));
+      const p = full.executionWorkspaceId !== facts.workspaceId
+        ? ["its link changed meanwhile"]
+        : clearProblems({ ...facts, issue: full }, await runsOf(full.id), full);
       if (p.length) {
         out(`${label(target)}: left alone (${p.join("; ")}).`);
         continue;
       }
     }
-    const result = await clearLink(api, target.id ?? identifier);
+    const result = await clearLink(api, full);
     if (!result.ok) {
       failed += 1;
       out(`${label(target)}: Paperclip kept the link.`);
@@ -489,8 +501,8 @@ export async function workspace(ctx, identifier, flags = []) {
   out("");
   out("Nothing restarts by itself. To have the assignee carry on:");
   out(
-    `  pch comment ${identifier} "${who ? `${who}, the` : "The"} workspace is fixed: you have a new isolated workspace, ` +
-      `branched from the base branch. Please continue this issue."`,
+    `  pch comment ${identifier} "${who ? `${who}, the` : "The"} workspace is fixed: you have a new isolated workspace. ` +
+      `Please continue this issue."`,
   );
 }
 
@@ -629,7 +641,8 @@ export async function status(ctx) {
       w?.on
         ? `Watchdog: on, last check ${ago(w.lastTickAt)} (${w.lastTickMs ?? "?"} ms), ${w.nudges} nudges and ${w.heals} repairs since start` +
             `${w.stuck ? `; ${w.stuck} issues stuck behind a deferred wake (see the log)` : ""}` +
-            `${w.retries ? `; ${w.retries} deferred wakes retried` : ""}${w.lastError ? `; last error: ${w.lastError}` : ""}`
+            `${w.retries ? `; ${w.retries} deferred wakes retried` : ""}` +
+            `${w.deadLinks ? `; ${w.deadLinks} links to a closed workspace cleared` : ""}${w.lastError ? `; last error: ${w.lastError}` : ""}`
         : "Watchdog: off",
     );
     const c = s.costSync;

@@ -8,8 +8,9 @@
 // `what` says what is going on in one sentence, `steps` what you can do about it
 // (commands are written out, ready to paste), and `watchdog` whether the
 // watchdog deals with it by itself ("auto"), will not ("manual"), or the
-// question doesn't arise (null). Each rule mirrors a situation in watchdog.mjs or
-// one the watchdog deliberately leaves to the board, so keep the two in step.
+// question doesn't arise (null); `autoNote`, when set, says how it does. Each
+// rule mirrors a situation in watchdog.mjs or one the watchdog deliberately
+// leaves to the board, so keep the two in step.
 
 import { approvalWaitingOn, ts } from "./util.mjs";
 
@@ -113,7 +114,7 @@ export function advise(facts) {
   // retry, comment or nudge helps until the link is cleared.
   const ws = (id) => String(id ?? "").slice(0, 8);
   const ownerName = link?.owner ? link.owner.identifier ?? ws(link.owner.id) : null;
-  const fixed = comment(`${who}, the workspace is fixed: you have a new isolated workspace, branched from the base branch. Please continue this issue.`);
+  const fixed = comment(`${who}, the workspace is fixed: you have a new isolated workspace. Please continue this issue.`);
   if (link?.state === "dead" || (deadLinkRun && link?.state === "unknown" && link.workspaceId === deadLinkRun.workspaceId)) {
     return {
       what:
@@ -124,13 +125,17 @@ export function advise(facts) {
         `pch workspace ${identifier} --apply   (gives them a new isolated workspace, like "New isolated workspace" in the Workspace picker)`,
         `Then: ${fixed}`,
       ],
-      watchdog: "manual",
+      watchdog: config.watchdog === false || config.watchdogClearDeadLinks === false ? "manual" : "auto",
+      autoNote:
+        "The watchdog clears the link by itself within a minute, and restarts the agent if the issue is todo or in progress. " +
+        'It can\'t while Instance settings → Experimental → "Enable Isolated Workspaces" is off.',
     };
   }
   if (deadLinkRun && link?.state === "none") {
     return {
       what: `${who}'s last run failed because the issue was linked to a closed workspace (${ws(deadLinkRun.workspaceId)}). The link has been cleared since, but nothing has restarted ${who}.`,
       steps: [fixed],
+      // The watchdog restarts an assignee only right after clearing the link itself.
       watchdog: "manual",
     };
   }
@@ -252,7 +257,7 @@ export function advise(facts) {
           `so its commits would land on that issue's branch.${note}`,
         steps: [
           `If it should have its own branch and PR: pch workspace ${identifier} --apply   (a new isolated workspace from the base branch)`,
-          `Then give the ruling: ${comment(`${who}, workspace ruling: you have your own isolated workspace now, branched from the base branch. Don't commit to ${ownerName ?? "the other issue"}'s branch. Please continue.`)}`,
+          `Then give the ruling: ${comment(`${who}, workspace ruling: you have your own isolated workspace now. Don't commit to ${ownerName ?? "the other issue"}'s branch. Please continue.`)}`,
           `If it should build on ${ownerName ?? "that issue"}'s branch after all, say so in a comment instead.`,
         ],
         watchdog: "manual",

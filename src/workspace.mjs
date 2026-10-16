@@ -13,9 +13,9 @@
 //   agent's commits would land on that issue's branch, and an agent that
 //   notices blocks the issue and asks for a "workspace ruling".
 //
-// The fix in both cases is the one the issue's Workspace picker makes with
-// "New isolated workspace": clear the link, so the next run gets a fresh
-// worktree from the base branch. `pch workspace` and `pch why` share this module.
+// The fix in both cases is what the issue's Workspace picker does with "New
+// isolated workspace": clear the link, so the next run gets a fresh worktree.
+// `pch workspace`, `pch why` and the watchdog share this module.
 
 const UUID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
@@ -26,16 +26,23 @@ export const DEAD_LINK_ERROR = new RegExp(
   "i",
 );
 
-// What "New isolated workspace" in the issue's Workspace picker sends
-// (buildWorkspaceSelectionUpdate, ui/src/lib/issue-workspace-selection.ts).
-export const ISOLATED_SELECTION = Object.freeze({
-  executionWorkspaceId: null,
-  executionWorkspacePreference: "isolated_workspace",
-  executionWorkspaceSettings: { mode: "isolated_workspace", environmentId: null },
-});
-
 const OPEN = (status) => status !== "done" && status !== "cancelled";
 const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
+
+// The change "New isolated workspace" in the issue's Workspace picker makes
+// (buildWorkspaceSelectionUpdate, ui/src/lib/issue-workspace-selection.ts),
+// except that the issue's other workspace settings are kept: Paperclip replaces
+// executionWorkspaceSettings whole on update, so sending only the mode would
+// drop a pinned branch, the environment, network egress or runtime settings.
+export function isolatedSelection(issue) {
+  const current = issue?.executionWorkspaceSettings;
+  const kept = current && typeof current === "object" ? { ...current } : {};
+  return {
+    executionWorkspaceId: null,
+    executionWorkspacePreference: "isolated_workspace",
+    executionWorkspaceSettings: { ...kept, mode: "isolated_workspace", environmentId: kept.environmentId ?? null },
+  };
+}
 
 // The workspace id a setup_failed run couldn't restore, from its error text.
 export function deadLinkWorkspaceId(errorText) {
@@ -48,6 +55,7 @@ export function deadLinkWorkspaceId(errorText) {
 //   dead     linked to a workspace that is archived or no longer exists: every run fails at setup
 //   foreign  linked to a live workspace another issue owns: runs work on that issue's branch
 //   own      linked to its own live workspace: nothing wrong
+//   unknown  linked, but whether the workspace is alive couldn't be told
 export function classifyLink(issue, workspace, { missing = false } = {}) {
   const id = issue?.executionWorkspaceId ?? null;
   if (!id || issue.executionWorkspacePreference !== "reuse_existing") return "none";
@@ -57,35 +65,43 @@ export function classifyLink(issue, workspace, { missing = false } = {}) {
   return "own";
 }
 
+// The issue's workspace as Paperclip resolves it for runs. `GET /api/issues/:id`
+// carries it as currentExecutionWorkspace, read without a privacy check, and
+// null when the row is gone: that is what heartbeat sees. The workspace's own
+// endpoint answers 404 both for a missing workspace and for one the key may not
+// read (issue privacy), so a 404 there proves nothing. Returns
+// { workspace, missing, known }; known is false when the issue doesn't carry
+// the field (an older Paperclip) and the workspace couldn't be read either.
+export async function linkedWorkspace(api, issue) {
+  const wsId = issue.executionWorkspaceId;
+  if (Object.hasOwn(issue, "currentExecutionWorkspace")) {
+    const inline = issue.currentExecutionWorkspace;
+    if (inline === null) return { workspace: null, missing: true, known: true };
+    if (inline?.id === wsId && inline.status) return { workspace: inline, missing: false, known: true };
+  }
+  try {
+    return { workspace: await api.request("GET", `/api/execution-workspaces/${wsId}`), missing: false, known: true };
+  } catch (err) {
+    return { workspace: null, missing: false, known: false, readError: err.status === 404 ? "not found, or not readable with this key" : err.message };
+  }
+}
+
 // Everything `pch workspace` and `pch why` need about one issue's link.
 // `issue` may be passed when the caller already read it.
 export async function linkFacts(api, issueRef, { issue = null } = {}) {
   const current = issue ?? (await api.request("GET", `/api/issues/${encodeURIComponent(issueRef)}`));
   const wsId = current?.executionWorkspaceId ?? null;
-  let workspace = null;
-  let missing = false;
-  let readError = null;
-  if (wsId && current.executionWorkspacePreference === "reuse_existing") {
-    // The issue carries a compact copy of its workspace (status, sourceIssueId,
-    // branchName, closedAt); older Paperclips don't, so read it when it's absent.
-    const inline = current.currentExecutionWorkspace;
-    if (inline?.id === wsId && inline.status) workspace = inline;
-    else {
-      try {
-        workspace = await api.request("GET", `/api/execution-workspaces/${wsId}`);
-      } catch (err) {
-        if (err.status === 404) missing = true;
-        else readError = err.message;
-      }
-    }
-  }
+  let found = { workspace: null, missing: false, known: true };
+  if (wsId && current.executionWorkspacePreference === "reuse_existing") found = await linkedWorkspace(api, current);
+  const { workspace, missing, readError = null } = found;
   const state = classifyLink(current, workspace, { missing });
   let owner = null;
   if (workspace?.sourceIssueId && workspace.sourceIssueId !== current.id) {
     const o = await api.request("GET", `/api/issues/${workspace.sourceIssueId}`).catch(() => null);
     owner = o ? { id: o.id, identifier: o.identifier ?? null, status: o.status ?? null } : { id: workspace.sourceIssueId, identifier: null, status: null };
   }
-  return { issue: current, workspaceId: wsId, workspace, missing, readError, state, owner };
+  const ownClosed = state === "dead" && workspace?.sourceIssueId === current.id;
+  return { issue: current, workspaceId: wsId, workspace, missing, readError, state, owner, ownClosed };
 }
 
 // One line describing the link, for `why` and `workspace`.
@@ -93,7 +109,7 @@ export function describeLink(facts) {
   const { state, workspaceId, workspace, owner } = facts;
   if (state === "none") return null;
   const short = String(workspaceId).slice(0, 8);
-  const whose = owner ? `${owner.identifier ?? owner.id.slice(0, 8)}'s workspace` : "workspace";
+  const whose = owner ? `${owner.identifier ?? owner.id.slice(0, 8)}'s workspace` : facts.ownClosed ? "its own workspace" : "workspace";
   const branch = workspace?.branchName ? `, branch ${workspace.branchName}` : "";
   if (state === "dead") {
     return facts.missing
@@ -118,15 +134,20 @@ export async function issuesLinkedTo(api, companyId, workspaceId, { exceptId = n
   );
 }
 
-// Why the link can't be cleared right now; empty when it can.
-export function clearProblems(facts, runs = []) {
+// Why this issue's link shouldn't be changed right now; empty when it can.
+// `issue` is the issue as read (a list row or GET /api/issues/:id).
+export function clearProblems(facts, runs = [], issue = facts.issue) {
   const problems = [];
   if (facts.state === "none") problems.push("it has no workspace link to clear");
   if (facts.state === "own") problems.push("it is linked to its own live workspace, which is what it should use");
   if (facts.state === "unknown") problems.push("its linked workspace couldn't be read");
-  if (!OPEN(facts.issue.status)) problems.push(`it is ${facts.issue.status}`);
+  if (!OPEN(issue.status)) problems.push(`it is ${issue.status}`);
+  if (issue.executionRunId || issue.checkoutRunId) problems.push("a run holds it");
   const active = runs.find((r) => ACTIVE_RUN.has(r.status));
   if (active) problems.push(`a run is ${active.status} on it`);
+  // A change already scheduled for the next run fixes the link by itself, and
+  // a new change would cancel it.
+  if (issue.workspacePendingSelection) problems.push("a workspace change is already scheduled for its next run");
   return problems;
 }
 
@@ -147,9 +168,10 @@ export const ENABLE_SETTING_HINT =
 
 // Clears the link, then reads the issue back: Paperclip drops the change
 // without an error when isolated workspaces are off, and that has to show.
-export async function clearLink(api, issueRef) {
-  const id = encodeURIComponent(issueRef);
-  await api.request("PATCH", `/api/issues/${id}`, ISOLATED_SELECTION);
+// `issue` is the full issue (GET /api/issues/:id), for its current settings.
+export async function clearLink(api, issue) {
+  const id = encodeURIComponent(issue.id ?? issue.identifier);
+  await api.request("PATCH", `/api/issues/${id}`, isolatedSelection(issue));
   const after = await api.request("GET", `/api/issues/${id}`);
   const ok = !after.executionWorkspaceId || after.executionWorkspacePreference !== "reuse_existing";
   return { ok, issue: after };

@@ -196,7 +196,7 @@ function Install-PaperclipHelper {
     'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'GITHUB_TOKEN', 'GITHUB_TOKEN_FILE', 'GITHUB_TOKEN_HOST_FILE',
     'RELAY_HOST', 'RELAY_PORT', 'RELAY_PATH',
     'WATCHDOG', 'WATCHDOG_INTERVAL_SEC', 'WATCHDOG_STALL_SEC', 'WATCHDOG_MAX_NUDGES', 'WATCHDOG_HEAL_FAILED_FINALIZE',
-    'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'COST_SYNC', 'COST_SYNC_SINCE')
+    'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'WATCHDOG_CLEAR_DEAD_LINKS', 'COST_SYNC', 'COST_SYNC_SINCE')
 
   function Get-EnvText {
     $lines = @(
@@ -521,6 +521,7 @@ $network
   $s.WATCHDOG_HEAL_FAILED_FINALIZE = Pick 'WATCHDOG_HEAL_FAILED_FINALIZE' 'true'
   $s.WATCHDOG_RETRY_DEFERRED = Pick 'WATCHDOG_RETRY_DEFERRED' 'true'
   $s.WATCHDOG_RELEASE_HOLDS = Pick 'WATCHDOG_RELEASE_HOLDS' 'true'
+  $s.WATCHDOG_CLEAR_DEAD_LINKS = Pick 'WATCHDOG_CLEAR_DEAD_LINKS' 'true'
   Say 'It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without'
   Say 'anything picking them up, and repairs blockers stuck on a failed workspace clean-up.'
   if (Confirm 'Turn the watchdog on?' (Truthy $s.WATCHDOG)) {
@@ -535,6 +536,9 @@ $network
     $s.WATCHDOG_RETRY_DEFERRED = if (Confirm 'Press it for such wakes (never interrupts a running run)?' (Truthy $s.WATCHDOG_RETRY_DEFERRED)) { 'true' } else { 'false' }
     Say 'A run that stopped without a record Paperclip can verify leaves its issue held for good.'
     $s.WATCHDOG_RELEASE_HOLDS = if (Confirm 'Release such holds (the run has stopped; the agent checks its branch before continuing)?' (Truthy $s.WATCHDOG_RELEASE_HOLDS)) { 'true' } else { 'false' }
+    Say 'An issue created from another issue''s work is linked to that issue''s workspace. Once that'
+    Say 'workspace is closed, every run on the issue fails at setup until the link is cleared.'
+    $s.WATCHDOG_CLEAR_DEAD_LINKS = if (Confirm 'Clear such links (the next run gets a new isolated workspace; live workspaces are never touched)?' (Truthy $s.WATCHDOG_CLEAR_DEAD_LINKS)) { 'true' } else { 'false' }
   } else {
     $s.WATCHDOG = 'false'
   }

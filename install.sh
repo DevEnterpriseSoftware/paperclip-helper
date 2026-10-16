@@ -236,7 +236,7 @@ EOF
   } >"$1"
 }
 
-MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS GITHUB_TOKEN GITHUB_TOKEN_FILE GITHUB_TOKEN_HOST_FILE RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS COST_SYNC COST_SYNC_SINCE"
+MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS GITHUB_TOKEN GITHUB_TOKEN_FILE GITHUB_TOKEN_HOST_FILE RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS WATCHDOG_CLEAR_DEAD_LINKS COST_SYNC COST_SYNC_SINCE"
 
 write_env() {
   local key
@@ -546,6 +546,7 @@ main() {
   WATCHDOG_HEAL_FAILED_FINALIZE="$(pick WATCHDOG_HEAL_FAILED_FINALIZE true)"
   WATCHDOG_RETRY_DEFERRED="$(pick WATCHDOG_RETRY_DEFERRED true)"
   WATCHDOG_RELEASE_HOLDS="$(pick WATCHDOG_RELEASE_HOLDS true)"
+  WATCHDOG_CLEAR_DEAD_LINKS="$(pick WATCHDOG_CLEAR_DEAD_LINKS true)"
   say "It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without"
   say "anything picking them up, and repairs blockers stuck on a failed workspace clean-up."
   local wd_default=y; truthy "$WATCHDOG" || wd_default=n
@@ -564,6 +565,10 @@ main() {
     local holds=y; truthy "$WATCHDOG_RELEASE_HOLDS" || holds=n
     say "A run that stopped without a record Paperclip can verify leaves its issue held for good."
     if confirm "Release such holds (the run has stopped; the agent checks its branch before continuing)?" "$holds"; then WATCHDOG_RELEASE_HOLDS=true; else WATCHDOG_RELEASE_HOLDS=false; fi
+    local links=y; truthy "$WATCHDOG_CLEAR_DEAD_LINKS" || links=n
+    say "An issue created from another issue's work is linked to that issue's workspace. Once that"
+    say "workspace is closed, every run on the issue fails at setup until the link is cleared."
+    if confirm "Clear such links (the next run gets a new isolated workspace; live workspaces are never touched)?" "$links"; then WATCHDOG_CLEAR_DEAD_LINKS=true; else WATCHDOG_CLEAR_DEAD_LINKS=false; fi
   else
     WATCHDOG=false
   fi

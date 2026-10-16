@@ -54,14 +54,33 @@
 //    `pch release --apply` does. Once per held run; a hold whose run may still be
 //    running, holds a lease or has a live process is only reported.
 //
+// 8. Issues linked to a closed workspace. An issue an agent creates from another
+//    issue's work is linked to that issue's execution workspace (reuse_existing).
+//    Paperclip closes the workspace when its issue finishes but leaves the links,
+//    and every run on a linked issue then fails at setup ("requested inherited
+//    execution workspace reuse … could not be restored"); retries fail the same
+//    way. With WATCHDOG_CLEAR_DEAD_LINKS on, the watchdog clears the link on every
+//    open issue linked to an archived or missing workspace, as `pch workspace
+//    --apply` does: the next run gets a new isolated workspace, with the issue's
+//    other workspace settings kept. Once per issue and workspace; an issue with a
+//    run in progress or a workspace change already scheduled waits. When the
+//    assignee's last run failed on the link and the issue is todo or in
+//    progress, it also comments to restart the assignee. A link to a live
+//    workspace, or to the issue's own closed one, is never touched.
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
 import { companyAgents, listIssues } from "./paperclip.mjs";
 import { agentMention, every, mapLimit, ts } from "./util.mjs";
 import { holdFacts, releaseHold, releaseProblems, unprovable } from "./release.mjs";
+import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
 
 const WATCHED_STATUSES = "todo,in_progress,in_review";
+const OPEN_STATUSES = "backlog,todo,in_progress,in_review,blocked";
+// Statuses where a comment restarts the assignee without overriding a decision:
+// a blocked issue may be blocked for a reason, and one in review waits on a reviewer.
+const RESTARTABLE = new Set(["todo", "in_progress"]);
 const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
 const PENDING_WAKE = new Set(["queued", "claimed", "deferred_issue_execution"]);
 const CONCURRENCY = 4;
@@ -97,13 +116,20 @@ const record = {
   release: (issue, runId) => `release:${issue.id}:${runId}`, // the one automatic release of a hold Paperclip can't release
   releaseReported: (issue, runId) => `release-report:${issue.id}:${runId}`, // such a hold that isn't safe to release, reported once
   releaseNudge: (issue, runId) => `release-nudge:${issue.id}:${runId}`, // the comment after a release with no saved messages
+  deadLink: (issue, wsId) => `dead-link:${issue.id}:${wsId}`, // the one clearing of a link to a closed workspace
+  deadLinkNudge: (issue, wsId) => `dead-link-nudge:${issue.id}:${wsId}`, // the comment that restarts the assignee after it
+  deadLinkFail: (issue, wsId) => `dead-link-fail:${issue.id}:${wsId}`, // failed attempts to clear it, retried a stall window apart
+  deadLinkOwn: (issue, wsId) => `dead-link-own:${issue.id}:${wsId}`, // a link to the issue's own closed workspace, reported once
+  deadLinkOff: () => "dead-link-off", // isolated workspaces off, so links can't be cleared: reported once a day
 };
 
 export function createWatchdog(ctx, state) {
   const { config, api, log } = ctx;
   const records = state.nudges;
-  const stats = { ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, lastError: null };
+  const stats = { ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, lastError: null };
   const stallMs = config.watchdogStallSec * 1000;
+  const liveWorkspaces = new Map(); // workspaceId → when it was last seen live
+  const dryRunSeen = new Set(); // dead links a dry run already logged, this process only
   const now = () => ctx.now();
 
   async function agentFor(id, agents) {
@@ -634,6 +660,158 @@ export function createWatchdog(ctx, state) {
     });
   }
 
+  // ---------------------------------------------------------------- 8. dead workspace links
+
+  // Open issues linked (reuse_existing) to a workspace that is archived or gone.
+  // List rows carry executionWorkspaceId and executionWorkspacePreference. Each
+  // linked workspace is judged from an issue that links to it, the way heartbeat
+  // sees it (linkedWorkspace); a live one is looked at again a stall window later.
+  async function checkDeadLinks(companyId, agents) {
+    const rows = (await listIssues(api, companyId, OPEN_STATUSES)).filter(
+      (i) => i.executionWorkspaceId && i.executionWorkspacePreference === "reuse_existing",
+    );
+    const due = rows.filter((i) => {
+      const ws = i.executionWorkspaceId;
+      if (records.has(record.deadLink(i, ws)) || records.has(record.deadLinkOwn(i, ws)) || dryRunSeen.has(record.deadLink(i, ws))) return false;
+      const failed = records.get(record.deadLinkFail(i, ws));
+      return !failed || (failed.count < config.watchdogMaxNudges && now() - failed.at >= stallMs);
+    });
+    if (!due.length) return;
+    const byWorkspace = new Map();
+    for (const i of due) byWorkspace.set(i.executionWorkspaceId, [...(byWorkspace.get(i.executionWorkspaceId) ?? []), i]);
+
+    const dead = new Map(); // workspaceId → linkedWorkspace() result
+    for (const [wsId, linked] of byWorkspace) {
+      const seen = liveWorkspaces.get(wsId);
+      if (seen && now() - seen < stallMs) continue;
+      const full = await api.request("GET", `/api/issues/${linked[0].id}`).catch(() => null);
+      if (!full || full.executionWorkspaceId !== wsId) continue;
+      const found = await linkedWorkspace(api, full);
+      if (found.known && !found.missing && found.workspace?.status !== "archived") {
+        liveWorkspaces.set(wsId, now());
+        continue;
+      }
+      dead.set(wsId, found);
+    }
+    if (!dead.size) return;
+
+    // Paperclip drops workspace changes while isolated workspaces are off. Say
+    // so once a day instead of "clearing" links every minute to no effect.
+    if ((await isolatedWorkspacesEnabled(api)) === false) {
+      const key = record.deadLinkOff();
+      const prior = records.get(key);
+      if (!prior || now() - prior.at > PARKED_BUDGET_RESET_MS) {
+        records.set(key, { count: 1, at: now() });
+        state.touch();
+        log.warn(
+          'watchdog: issues are linked to a closed workspace, and every run on them fails at setup. Paperclip ignores workspace changes while Instance settings → Experimental → "Enable Isolated Workspaces" is off: turn it on and the watchdog clears the links',
+          { issues: [...dead.keys()].flatMap((id) => byWorkspace.get(id).map((i) => i.identifier ?? i.id)) },
+        );
+      }
+      return;
+    }
+
+    for (const [wsId, found] of dead) {
+      for (const issue of byWorkspace.get(wsId)) {
+        try {
+          await clearDeadLink(issue, wsId, found, agents);
+        } catch (err) {
+          log.warn("watchdog: dead workspace link check failed", { issue: issue.identifier ?? issue.id, error: err.message });
+        }
+      }
+    }
+  }
+
+  // The assignee's last run, if it failed restoring this workspace.
+  async function failedOnLink(list, assignee, wsId) {
+    const last = latestRun(list.filter((r) => r.agentId === assignee && r.status !== "cancelled"));
+    if (last?.status !== "failed" || last.errorCode !== "setup_failed") return null;
+    const detail = await api.request("GET", `/api/heartbeat-runs/${last.runId ?? last.id}`).catch(() => null);
+    return deadLinkWorkspaceId(detail?.error) === wsId ? last : null;
+  }
+
+  async function clearDeadLink(row, wsId, found, agents) {
+    const who = row.identifier ?? row.id;
+    // A run in progress is using whatever it has: change nothing under it.
+    if (row.executionRunId || row.checkoutRunId) return;
+    const runs = await api.request("GET", `/api/issues/${row.id}/runs`).catch(() => []);
+    const list = Array.isArray(runs) ? runs : [];
+    if (list.some((r) => ACTIVE_RUN.has(r.status))) return;
+    // The row may be a tick old, and has no settings: act on the issue as it is now.
+    const full = await api.request("GET", `/api/issues/${row.id}`);
+    if (full.executionWorkspaceId !== wsId || full.executionWorkspacePreference !== "reuse_existing") return;
+    if (full.status === "done" || full.status === "cancelled") return;
+    if (full.executionRunId || full.checkoutRunId) return;
+    // A change you scheduled for the next run fixes the link; a new one would cancel it.
+    if (full.workspacePendingSelection) return;
+    const extra = { issue: who, workspace: wsId, missing: found.missing };
+
+    // Its own workspace, closed (a finished issue reopened): unarchiving it may
+    // be the better fix, so that stays your decision.
+    if (found.workspace?.sourceIssueId === full.id) {
+      records.set(record.deadLinkOwn(row, wsId), { count: 1, at: now() });
+      state.touch();
+      log.warn("watchdog: an issue is linked to its own closed workspace and every run fails at setup; `pch workspace` gives it a new one", extra);
+      return;
+    }
+    // On a Paperclip whose issues don't carry their workspace, a workspace the
+    // key can't read isn't proof it's gone: only a run that failed on it is.
+    const assignee = full.assigneeAgentId;
+    const failed = assignee ? await failedOnLink(list, assignee, wsId) : null;
+    if (!found.known && !failed) return;
+
+    const owner = found.workspace?.sourceIssueId
+      ? await api.request("GET", `/api/issues/${found.workspace.sourceIssueId}`).catch(() => null)
+      : null;
+    const ownerName = owner?.identifier ?? null;
+    extra.owner = ownerName;
+    if (config.dryRun) {
+      dryRunSeen.add(record.deadLink(row, wsId));
+      log("watchdog: would clear a link to a closed workspace (dry run)", extra);
+      return;
+    }
+    let result;
+    try {
+      result = await clearLink(api, full);
+    } catch (err) {
+      // Tried again a stall window later, up to WATCHDOG_MAX_NUDGES times.
+      const key = record.deadLinkFail(row, wsId);
+      const count = (records.get(key)?.count ?? 0) + 1;
+      records.set(key, { count, at: now() });
+      state.touch();
+      const giveUp = count >= config.watchdogMaxNudges;
+      log.warn(`watchdog: couldn't clear a link to a closed workspace${giveUp ? "; leaving it to you (`pch workspace`)" : ""}`, {
+        ...extra,
+        attempt: count,
+        error: err.message,
+      });
+      return;
+    }
+    records.set(record.deadLink(row, wsId), { count: 1, at: now() });
+    state.touch();
+    if (!result.ok) {
+      log.warn("watchdog: Paperclip kept the link to a closed workspace; `pch workspace` says why", extra);
+      return;
+    }
+    stats.deadLinks += 1;
+    log("watchdog: cleared a link to a closed workspace; the next run gets a new isolated one", extra);
+
+    // Restart the assignee only when its last run failed on this link: nothing
+    // retries a setup failure. Anything else starts as it would have. A blocked
+    // issue, or one in review, waits for your decision.
+    if (!failed || !RESTARTABLE.has(full.status)) return;
+    const agent = await agentFor(assignee, agents).catch(() => null);
+    if (!agent || asleep(agent)) return;
+    await nudge(
+      full,
+      record.deadLinkNudge(row, wsId),
+      agent,
+      `this issue was linked to ${ownerName ? `${ownerName}'s workspace` : "a workspace"}, which is closed, so Paperclip failed ` +
+        `every run at setup. The watchdog cleared the link: your next run gets a new isolated workspace. Please continue this issue.`,
+      { reason: "closed workspace link", workspace: wsId },
+    );
+  }
+
   async function tick() {
     const started = now();
     const { companyIds = [] } = await ctx.identity();
@@ -641,6 +819,7 @@ export function createWatchdog(ctx, state) {
       for (const companyId of companyIds) {
         const list = await companyAgents(api, companyId).catch(() => []);
         const agents = new Map(list.map((a) => [a.id, a]));
+        if (config.watchdogClearDeadLinks) await checkDeadLinks(companyId, agents);
         await checkBlocked(companyId, agents);
         await checkHandOffs(companyId, agents);
       }
@@ -668,6 +847,7 @@ export function createWatchdog(ctx, state) {
         healFailedFinalize: config.watchdogHealFailedFinalize,
         retryDeferred: config.watchdogRetryDeferred,
         releaseHolds: config.watchdogReleaseHolds,
+        clearDeadLinks: config.watchdogClearDeadLinks,
       });
       loop = every("watchdog", config.watchdogIntervalSec, 5_000, tick, log);
     },

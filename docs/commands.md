@@ -85,7 +85,7 @@ When an agent creates an issue from another issue's work (a follow-up, a sub-iss
 - **The workspace is closed.** Paperclip closes an issue's isolated workspace when the issue finishes, but leaves the links on other issues. Every run on them then fails before the agent starts: `setup_failed`, "Issue … requested inherited execution workspace reuse for …, but the workspace could not be restored". Retry and comments fail the same way.
 - **The workspace belongs to another issue that is still open.** The new issue's commits land on that issue's branch. An agent that notices blocks the issue and asks for a "workspace ruling".
 
-`pch workspace ISSUE` shows the link: whose workspace, its status and branch. For a closed one it also lists the other open issues still linked to it. `--apply` makes the same change as **New isolated workspace** in the issue's Workspace picker: the link is cleared, and the next run gets a new worktree branched from the project's base branch. With a closed workspace, every open issue linked to it is changed; with a live one, only the issue you named, because a live workspace may be shared on purpose. Nothing is posted and no status changes. The command prints the comment that tells the assignee to carry on.
+`pch workspace ISSUE` shows the link: whose workspace, its status and branch. For a closed one it also lists the other open issues still linked to it. `--apply` makes the same change as **New isolated workspace** in the issue's Workspace picker: the link is cleared, and the next run gets a new worktree. Unlike the picker, it keeps the issue's other workspace settings, such as a pinned branch or its environment. With a closed workspace, every open issue linked to it is changed; with a live one, only the issue you named, because a live workspace may be shared on purpose. Nothing is posted and no status changes. The command prints the comment that tells the assignee to carry on.
 
 ```text
 $ pch workspace ACM-416
@@ -94,14 +94,16 @@ Workspace: reuses ACM-318's workspace 0b4a273f (archived 2026-10-16T06:36:12.000
 Also linked to it: ACM-415 (in_review)
 
 --apply gives these 2 issues a new isolated workspace on the next run,
-branched from the project's base branch, like "New isolated workspace" in the issue's Workspace picker.
+like "New isolated workspace" in the issue's Workspace picker. Its other workspace settings (a pinned branch, the environment) are kept.
 The closed workspace and its branch are left as they are.
   pch workspace ACM-416 --apply
 ```
 
-It leaves alone an issue with a run queued or running, and an issue that is done or cancelled.
+It leaves alone an issue with a run queued or running, an issue that is done or cancelled, and an issue with a workspace change already scheduled for its next run. On a Paperclip whose issues don't carry a copy of their workspace, it won't act on a workspace it can't read: "not found" there can also mean your key may not read it.
 
 Paperclip only accepts this change while **Instance settings → Experimental → Enable Isolated Workspaces** is on. While it's off, the Workspace picker is hidden and Paperclip drops the change without an error. The command checks the setting first and reads each issue back afterwards, so it says so instead of reporting a change that didn't happen.
+
+[The watchdog](watchdog.md#8-issues-linked-to-a-closed-workspace) clears links to a closed workspace by itself (`WATCHDOG_CLEAR_DEAD_LINKS`). Use the command for a link to another issue's live workspace, or to clear one without waiting.
 
 `pch why` recommends this command when the issue is linked to a closed workspace, or when its assignee's last run failed restoring one. It also recommends it when an agent has blocked the issue with a note about its workspace or branch while it is linked to another issue's live workspace.
 
