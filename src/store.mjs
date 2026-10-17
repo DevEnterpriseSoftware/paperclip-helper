@@ -90,7 +90,10 @@ export function createStateStore(file, { now = () => Date.now() } = {}) {
     save({ force = false } = {}) {
       if (!dirty && !force) return;
       // Forget nudge records nobody has touched for a week.
+      // A question card routed to an issue that is still open is kept however
+      // old: forgetting it would route the card again (watchdog.mjs, 10).
       for (const [key, value] of nudges.entries()) {
+        if (key.startsWith("question:") && value?.relayId && !value.settled) continue;
         if (now() - (value?.at ?? 0) > WEEK) nudges.delete(key);
       }
       writeJson(file, {

@@ -1,6 +1,6 @@
 # Paperclip Helper
 
-Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that show up as soon as agents do real work: reviews you can't approve from the issue, agents that silently stop when work changes hands, and a Costs page that reads $0. **Paperclip Helper is one small container that runs beside Paperclip and closes those gaps**, using Paperclip's own API and a board key of yours.
+Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that show up as soon as agents do real work: reviews you can't approve from the issue, agents that silently stop when work changes hands, questions agents ask each other that never arrive, and a Costs page that reads $0. **Paperclip Helper is one small container that runs beside Paperclip and closes those gaps**, using Paperclip's own API and a board key of yours.
 
 > Paperclip Helper is an independent project. It is not made by or affiliated with the Paperclip team.
 
@@ -9,6 +9,7 @@ Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that 
 | In Paperclip you see… | With the helper… |
 |---|---|
 | **"Approval pending with You", and no Approve button** on the issue. | **[Relay](docs/relay.md).** Merge the PR on GitHub and the issue is approved. **Request changes** on GitHub sends it back to the engineer, with your review as the brief. |
+| **A board full of blocked issues, and nothing in Decisions.** Follow the chain far enough and it ends at an agent's question card to a teammate (*"Please rule on…"*) that has waited for days. Paperclip never delivers a card to a teammate who isn't the issue's assignee: the wake is cancelled before it starts. | **[Watchdog](docs/watchdog.md#10-question-cards-addressed-to-a-teammate).** It gives the teammate an issue that says which card to answer, and closes it once the card is answered; the asker wakes with the answer. **[`pch blocked`](docs/commands.md#blocked-what-the-blocked-issues-wait-on)** shows what every blocked issue waits on and which cards are stuck, and `pch why` recommends the fix on the asker's issue. |
 | **An agent that never starts** after an issue is handed to it. | **[Watchdog](docs/watchdog.md).** It spots the wake Paperclip dropped and wakes the new owner with a comment. |
 | **A blocked issue that stays blocked** after its blockers are done, or whose done blocker is "finalizing" forever. | **Watchdog.** It wakes the owner, and removes a blocker stuck on a failed workspace clean-up. |
 | **"Waiting for execution recovery"** or **"Automatic recovery blocked"** after a hand-off, with your message saved but never delivered. | **Watchdog.** It presses Paperclip's own **send queued messages now** / **Interrupt** for you. |
@@ -25,7 +26,7 @@ Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that 
 
 - **One container, no npm dependencies.** It calls Paperclip's API directly with a named board key, so everything it does appears in Paperclip under your name.
 - **Three components, each with its own switch:** the relay receives signed GitHub webhooks, the watchdog checks every minute, and cost sync posts every 15 minutes.
-- **It works through Paperclip's API, as you would in the UI:** comments, review decisions, blocker edits and cost events. It never merges, pushes or deletes anything. On GitHub it only reads pull requests and, if you turn that on, comments on the ones it sends back.
+- **It works through Paperclip's API, as you would in the UI:** comments, review decisions, blocker edits, cost events, and issues for the questions Paperclip didn't deliver. It never merges, pushes or deletes anything. On GitHub it only reads pull requests and, if you turn that on, comments on the ones it sends back.
 - **`DRY_RUN=true`** makes every component log what it would do and change nothing.
 
 ## Quick start
@@ -64,7 +65,7 @@ It acts only on events signed with your webhook secret, from your repositories, 
 
 ### Watchdog: wake stalled work
 
-Most stalls start the same way: an issue changes hands, Paperclip cancels a run at that moment, and the next wake is refused and never retried. Every minute the watchdog looks for the stalls in the table above, eight situations in all. It acts only after an issue has been quiet for three minutes, at most twice per situation, and never interrupts a running run. A hold Paperclip can never release by itself is released once its run has been over for three minutes; a hold whose cause it can't be sure of is logged and left to you. A link to a closed workspace, which fails every run at setup, is cleared at once. Details and settings: **[docs/watchdog.md](docs/watchdog.md)**.
+Most stalls start the same way: an issue changes hands, Paperclip cancels a run at that moment, and the next wake is refused and never retried. Every minute the watchdog looks for the stalls in the table above, ten situations in all. It acts only after an issue has been quiet for three minutes, at most twice per situation, and never interrupts a running run. A hold Paperclip can never release by itself is released once its run has been over for three minutes; a hold whose cause it can't be sure of is logged and left to you. A link to a closed workspace, which fails every run at setup, is cleared at once. Details and settings: **[docs/watchdog.md](docs/watchdog.md)**.
 
 ### Cost sync: what your subscription runs would have cost
 
@@ -79,6 +80,7 @@ Paperclip records $0 for runs billed to a subscription. Cost sync posts one cost
 | `pch status` | What the service is doing, its last checks and counts, Paperclip's version and build commit, and when the key expires. |
 | `pch check [ISSUE]` | Who the key belongs to, its companies and prefixes. With an issue, its stage, current participant, and whether a merge would approve it. |
 | `pch why ISSUE` | Why nobody is working on an issue, and what to do about it. `--prompt` prints it as a prompt for an LLM chat. |
+| `pch blocked` | Why each blocked issue is blocked, which issues the chains of blocked issues end at and what those wait on, and every question card that is waiting. |
 | `pch approve ISSUE [comment]` | Approves an issue whose approval is waiting on you. It refuses otherwise. |
 | `pch changes ISSUE comment` | Requests changes. The comment is required and becomes the brief. |
 | `pch comment ISSUE text` | Comments as you, which wakes the assignee. |
@@ -105,7 +107,7 @@ Examples and sample output: **[docs/commands.md](docs/commands.md)**.
 - **Paperclip's API is never exposed.** Only the relay's path needs to be public.
 - **The container** runs as a non-root user with a read-only filesystem, no capabilities, and `no-new-privileges`.
 - **Logs** are one JSON line per event. Anything that looks like a key or secret is masked.
-- **What it never does:** merge, push, delete, or change anything outside what's described here. The watchdog's only edit beyond comments is the failed-finalize repair, which you can switch off.
+- **What it never does:** merge, push, delete, or change anything outside what's described here. Beyond comments, the watchdog's edits are the failed-finalize repair, clearing links to a closed workspace, and the issues it creates (and closes) for undelivered question cards; each has its own switch.
 
 ## Upgrading
 
@@ -126,7 +128,7 @@ Examples and sample output: **[docs/commands.md](docs/commands.md)**.
 |---|---|
 | [docs/install.md](docs/install.md) | What the installer does, unattended and manual installs, general settings, networking, the hostname guard, exposing the relay, upgrading, uninstalling. |
 | [docs/relay.md](docs/relay.md) | Every GitHub event and what it does, how the issue is found, PRs with merge conflicts and the GitHub token, safety rules, the webhook, settings. |
-| [docs/watchdog.md](docs/watchdog.md) | The seven situations in detail, limits, what it leaves to you, settings. |
+| [docs/watchdog.md](docs/watchdog.md) | The ten situations in detail, limits, what it leaves to you, settings. |
 | [docs/cost-sync.md](docs/cost-sync.md) | How costs are worked out, what to know before turning it on, settings. |
 | [docs/commands.md](docs/commands.md) | Every `pch` command, with `set-model` and `why` examples. |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptoms, causes and fixes. |

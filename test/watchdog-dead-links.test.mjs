@@ -261,3 +261,61 @@ test("dry run and WATCHDOG_CLEAR_DEAD_LINKS=false change nothing", async (t) => 
   assert.equal(off.db.patches.length, 0);
   assert.notEqual(b.executionWorkspaceId, null);
 });
+
+test("an agent that scheduled its own workspace is woken once its run has ended", async (t) => {
+  let clock = Date.now();
+  const env = await watchdogEnv(t, {}, () => clock);
+  const agent = { id: uuid(), companyId: ids.company, name: "Carla", status: "idle" };
+  env.db.agents.push(agent);
+  const issue = {
+    id: uuid(),
+    identifier: "ACM-508",
+    companyId: ids.company,
+    status: "todo",
+    assigneeAgentId: agent.id,
+    updatedAt: minutesAgo(5),
+    workspaceBindingRevision: 4,
+    workspacePendingSelection: { version: 1, requestKey: "own-workspace-ACM-508", expectedBindingRevision: 4 },
+  };
+  env.db.issues.push(issue);
+  env.db.issueRuns[issue.id] = [{ runId: uuid(), agentId: agent.id, status: "running", createdAt: minutesAgo(6) }];
+
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 0, "not while its run is still going");
+
+  env.db.issueRuns[issue.id][0].status = "succeeded";
+  env.db.issueRuns[issue.id][0].finishedAt = minutesAgo(5);
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 1);
+  assert.ok(env.db.comments[0].body.startsWith(`[@Carla](agent://${agent.id}) the workspace you scheduled for this issue applies from this run`));
+
+  issue.updatedAt = minutesAgo(5);
+  clock += 4 * 60_000;
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 2, "a second nudge, a stall window later");
+  clock += 4 * 60_000;
+  issue.updatedAt = new Date(clock - 5 * 60_000).toISOString();
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 2, "capped at WATCHDOG_MAX_NUDGES");
+});
+
+test("no wake without a scheduled workspace, outside todo, or with the setting off", async (t) => {
+  const env = await watchdogEnv(t);
+  const agent = { id: uuid(), companyId: ids.company, name: "Carla", status: "idle" };
+  env.db.agents.push(agent);
+  const base = { companyId: ids.company, assigneeAgentId: agent.id, updatedAt: minutesAgo(5) };
+  const plain = { ...base, id: uuid(), identifier: "ACM-1", status: "todo" };
+  const progress = { ...base, id: uuid(), identifier: "ACM-2", status: "in_progress", workspacePendingSelection: { version: 1 } };
+  env.db.issues.push(plain, progress);
+  for (const i of [plain, progress]) env.db.issueRuns[i.id] = [{ runId: uuid(), agentId: agent.id, status: "succeeded", createdAt: minutesAgo(6), finishedAt: minutesAgo(5) }];
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.length, 0);
+
+  const off = await watchdogEnv(t, { WATCHDOG_CLEAR_DEAD_LINKS: "false" });
+  off.db.agents.push(agent);
+  const pending = { ...base, id: uuid(), identifier: "ACM-3", status: "todo", workspacePendingSelection: { version: 1 } };
+  off.db.issues.push(pending);
+  off.db.issueRuns[pending.id] = [{ runId: uuid(), agentId: agent.id, status: "succeeded", createdAt: minutesAgo(6), finishedAt: minutesAgo(5) }];
+  await off.watchdog.tick();
+  assert.equal(off.db.comments.length, 0);
+});

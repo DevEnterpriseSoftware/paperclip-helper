@@ -7,6 +7,7 @@
 | `pch status` | What the service is doing, its last checks and counts, Paperclip's version and build commit, and when the key expires. |
 | `pch check [ISSUE]` | Who the key belongs to, its companies and prefixes. With an issue, its stage, current participant, and whether a merge would approve it. With `RELAY_FIX_CONFLICTS` on, also whether the GitHub token (`GITHUB_TOKEN`, or the one in `GITHUB_TOKEN_FILE`) can read each repository. |
 | `pch why ISSUE` | Why nobody is working on an issue, and what to do about it: Paperclip's own diagnosis (wakes, blockers, workspace clean-ups, runs and leases, recovery), then a recommendation. `--prompt` prints it all as a prompt for an LLM chat. |
+| `pch blocked` | Why each blocked issue is blocked, which issues the chains of blocked issues end at and what those wait on, and every question card that is waiting. See [`blocked`](#blocked-what-the-blocked-issues-wait-on). |
 | `pch approve ISSUE [comment]` | Approves an issue whose approval is waiting on you. It refuses otherwise. |
 | `pch changes ISSUE comment` | Requests changes. The comment is required and becomes the brief. |
 | `pch comment ISSUE text` | Comments as you, which wakes the assignee. |
@@ -20,6 +21,36 @@
 | `pch secret` | Prints a random webhook secret. |
 | `pch update` | Updates the helper to the latest release of its major version, and restarts it (see [Upgrading](install.md#upgrading)). It doesn't update Paperclip. |
 | `pch version`, `pch help` | Version, and this list. |
+
+## `blocked`: what the blocked issues wait on
+
+A board full of blocked issues is hard to read in Paperclip. Most are blocked by other issues, which are blocked by others in turn, and the issue at the bottom of the chain is in review or in progress, so the list of blocked issues never leads you to it. Paperclip's **Decisions** page shows only reviews waiting on you, and no question card. `pch blocked` reads it all at once:
+
+```text
+$ pch blocked
+ACM: 96 blocked issues
+  95 wait on other open issues. Those chains end at 13 issues:
+    ACM-479    in_review    Carla          holds 31  ← a question card to Gilfoyle, 30 h old, never delivered (routed to ACM-530)
+    ACM-517    in_review                   holds 12  ← its approval is waiting on you (Decisions)
+    ACM-284    in_review    Jian-Yang      holds 9   ← review by Jian-Yang
+    …
+  1 blocked by their agent with no blocking issue linked. These wait on someone, often you:
+    ACM-490    Carla          "Which signing certificate should the installer use?"
+    `pch why ISSUE` for each, then answer in a comment.
+
+  8 question cards addressed to an agent that isn't the issue's assignee. Paperclip never wakes that agent for them:
+    ACM-413    Carla → Gilfoyle         2 days   routed to ACM-529
+      DIR-413 is implemented at 299bc3fbc (PR #130), but verification is red. Please route…
+    …
+```
+
+- **Waiting on other open issues:** each chain is followed to the issues that aren't blocked themselves. `holds` counts the blocked issues waiting on each one, directly or not, and the arrow says what that issue waits on: a question card and who it's for, your approval, a reviewer, or a run.
+- **Every blocker done, a failed workspace clean-up, parked by recovery, held for reconciliation:** the watchdog's cases, listed with what happens next.
+- **Blocked by the agent with no blocking issue linked:** the agent's own note, usually a question. These are the ones most likely waiting on you.
+- **Question cards addressed to an agent that isn't the assignee:** Paperclip cancels the wake such a card sends, so nobody sees it ([the watchdog, 10](watchdog.md#10-question-cards-addressed-to-a-teammate)). Each line says whether the watchdog has routed it, and to which issue.
+- **Other question cards:** for you, a board user, a person, or anyone.
+
+It reads only, and looks at every open issue's cards, so on a large company it takes a few seconds.
 
 ## `set-model`: every model and effort level
 
@@ -63,6 +94,7 @@ The recommendation names what is going on, gives the steps as commands you can p
 - a link to a closed workspace, which fails every run at setup;
 - an execution hold, and an issue Paperclip's recovery parked;
 - saved messages waiting behind an earlier run;
+- a question card the asker waits on: one Paperclip never delivered to the teammate it's addressed to (with the issue the watchdog routed it to), or one for you;
 - a blocked issue: waiting on open blockers, on a workspace clean-up, with every blocker done, blocked by an agent over another issue's workspace or with a note of its own, or an agent re-running every few minutes while it waits on you;
 - a dropped hand-off, runs Paperclip refused before they started, a failed run, and a run that finished without moving the issue on.
 

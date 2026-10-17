@@ -68,6 +68,24 @@
 //    progress, it also comments to restart the assignee. A link to a live
 //    workspace, or to the issue's own closed one, is never touched.
 //
+// 9. Issues waiting for a workspace their agent scheduled. An agent that finds
+//    its issue on another issue's branch schedules a workspace of its own for
+//    its next run (PUT /api/issues/:id/workspace; Paperclip applies it at the
+//    next admission) and leaves the issue in todo. Nothing starts that next run.
+//    Once the issue has been quiet for the stall window with a pending workspace
+//    selection and no run, the watchdog comments, which wakes the assignee. Part
+//    of WATCHDOG_CLEAR_DEAD_LINKS.
+//
+// 10. Question cards addressed to a teammate who never sees them. An agent asks
+//    a teammate (addresseeAgentId) with a card on its own issue. Paperclip wakes
+//    the addressee, then cancels that run before it starts ("issue_assignee_changed"),
+//    because the addressee isn't the issue's assignee. The card waits for good,
+//    and so does everything blocked behind the asker. With WATCHDOG_ROUTE_QUESTIONS
+//    on, once such a card has waited for the stall window and the addressee has
+//    had no run on the issue since, the watchdog creates an issue assigned to the
+//    addressee that says which card to answer and how (see questions.mjs). It
+//    closes that issue once the card is answered or withdrawn. Once per card.
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
@@ -75,6 +93,7 @@ import { companyAgents, listIssues } from "./paperclip.mjs";
 import { agentMention, every, mapLimit, ts } from "./util.mjs";
 import { holdFacts, releaseHold, releaseProblems, unprovable } from "./release.mjs";
 import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
+import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue, strandedCard } from "./questions.mjs";
 
 const WATCHED_STATUSES = "todo,in_progress,in_review";
 const OPEN_STATUSES = "backlog,todo,in_progress,in_review,blocked";
@@ -121,15 +140,18 @@ const record = {
   deadLinkFail: (issue, wsId) => `dead-link-fail:${issue.id}:${wsId}`, // failed attempts to clear it, retried a stall window apart
   deadLinkOwn: (issue, wsId) => `dead-link-own:${issue.id}:${wsId}`, // a link to the issue's own closed workspace, reported once
   deadLinkOff: () => "dead-link-off", // isolated workspaces off, so links can't be cleared: reported once a day
+  question: (card) => `question:${card.id}`, // the issue that routed a stranded card to its addressee
+  scheduledWorkspace: (issue) => `workspace-scheduled:${issue.id}:${issue.workspaceBindingRevision ?? "?"}`, // nudges to start a run on a scheduled workspace
 };
 
 export function createWatchdog(ctx, state) {
   const { config, api, log } = ctx;
   const records = state.nudges;
-  const stats = { ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, lastError: null };
+  const stats = { ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, questions: 0, lastError: null };
   const stallMs = config.watchdogStallSec * 1000;
   const liveWorkspaces = new Map(); // workspaceId → when it was last seen live
-  const dryRunSeen = new Set(); // dead links a dry run already logged, this process only
+  const dryRunSeen = new Set(); // dead links and cards a dry run already logged, this process only
+  const questionScanAt = new Map(); // companyId → when its cards were last looked at
   const now = () => ctx.now();
 
   async function agentFor(id, agents) {
@@ -442,13 +464,32 @@ export function createWatchdog(ctx, state) {
 
   // Cancelled by Paperclip at admission, before any work: see stalledHandOff.
   const refused = (run) => run.status === "cancelled" && run.errorCode === "execution_reconciliation_required";
+  const neverStarted = (run) => run.status === "cancelled" && run.errorCode === "issue_assignee_changed" && !run.startedAt;
+
+  // A question card's wake to a teammate becomes a run Paperclip cancels before
+  // it starts (questions.mjs). It was never the teammate's turn on the issue:
+  // counted, it would look like a hand-off and get the asker nudged as the
+  // "new owner" while it waits on its card. Only runs of an agent a card on the
+  // issue was addressed to are left out; any other never-started run still counts.
+  async function cardWakesLeftOut(issue, runs) {
+    if (!Array.isArray(runs) || !runs.some(neverStarted)) return runs;
+    const cards = await api.request("GET", `/api/issues/${issue.id}/interactions`).catch(() => []);
+    const asked = new Map(); // addressee → when it was first asked
+    for (const c of Array.isArray(cards) ? cards : []) {
+      if (c?.addresseeAgentId && (!asked.has(c.addresseeAgentId) || ts(c.createdAt) < asked.get(c.addresseeAgentId))) {
+        asked.set(c.addresseeAgentId, ts(c.createdAt));
+      }
+    }
+    if (!asked.size) return runs;
+    return runs.filter((r) => !(neverStarted(r) && asked.has(r.agentId) && ts(r.createdAt) >= asked.get(r.agentId)));
+  }
 
   async function stalledHandOff(issue, agents) {
     const assignee = issue.assigneeAgentId;
     const agent = await agentFor(assignee, agents);
     if (asleep(agent)) return null;
 
-    const runs = await api.request("GET", `/api/issues/${issue.id}/runs`);
+    const runs = await cardWakesLeftOut(issue, await api.request("GET", `/api/issues/${issue.id}/runs`));
     if (!Array.isArray(runs) || runs.length === 0) return null; // never worked on: not a hand-off
     if (runs.some((r) => r.agentId === assignee && ACTIVE_RUN.has(r.status))) return null;
     const newest = (list) => list.reduce((a, b) => (ts(b.createdAt) > ts(a.createdAt) ? b : a));
@@ -812,6 +853,167 @@ export function createWatchdog(ctx, state) {
     );
   }
 
+  // ---------------------------------------------------------------- 9. scheduled workspaces
+
+  // List rows don't carry workspacePendingSelection, so only quiet todo issues
+  // touched in the last day are read in full: that is where an agent leaves one.
+  async function checkScheduledWorkspaces(companyId, agents) {
+    const issues = (await listIssues(api, companyId, "todo")).filter(
+      (i) => candidate(i) && now() - ts(i.updatedAt) < PARKED_BUDGET_RESET_MS,
+    );
+    await mapLimit(issues, CONCURRENCY, async (issue) => {
+      try {
+        const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+        if (!full?.workspacePendingSelection || full.status !== "todo" || !full.assigneeAgentId) return;
+        const agent = await agentFor(full.assigneeAgentId, agents).catch(() => null);
+        if (!agent || asleep(agent)) return;
+        const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
+        if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return;
+        if (await hasPendingWake(full, runs, agents)) return;
+        await nudge(
+          full,
+          record.scheduledWorkspace(full),
+          agent,
+          "the workspace you scheduled for this issue applies from this run: you are on a new branch of your own. Please continue this issue.",
+          { reason: "scheduled workspace" },
+        );
+      } catch (err) {
+        log.warn("watchdog: scheduled workspace check failed", { issue: issue.identifier ?? issue.id, error: err.message });
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------- 10. stranded question cards
+
+  // Every open issue's cards, once per stall window per company: a card that
+  // waits less than that isn't routed anyway, and each issue costs a request.
+  async function checkQuestions(companyId, agents) {
+    const last = questionScanAt.get(companyId);
+    if (last && now() - last < stallMs) return;
+    questionScanAt.set(companyId, now());
+    const issues = await listIssues(api, companyId, QUESTION_STATUSES);
+    const pending = new Map(); // card id → { card, issue }
+    await mapLimit(issues, CONCURRENCY, async (issue) => {
+      try {
+        for (const card of await pendingCards(api, issue.id)) pending.set(card.id, { card, issue });
+      } catch (err) {
+        log.debug("watchdog: couldn't read an issue's cards", { issue: issue.identifier ?? issue.id, error: err.message });
+      }
+    });
+    await settleRoutedCards(companyId, pending);
+    for (const { card, issue } of pending.values()) {
+      const key = record.question(card);
+      if (records.has(key) || dryRunSeen.has(key)) continue;
+      if (!strandedCard(card, issue) || now() - ts(card.createdAt) < stallMs) continue;
+      try {
+        await routeCard(companyId, card, issue, agents);
+      } catch (err) {
+        log.warn("watchdog: routing a question card failed", { issue: issue.identifier ?? issue.id, card: card.id, error: err.message });
+      }
+    }
+  }
+
+  async function routeCard(companyId, card, issue, agents) {
+    const who = issue.identifier ?? issue.id;
+    const addressee = await agentFor(card.addresseeAgentId, agents).catch(() => null);
+    // A paused agent can't answer either way; it's routed once it's back.
+    if (!addressee || asleep(addressee)) return;
+    const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
+    if (addresseeReached(card, runs)) return;
+    const asker = card.createdByAgentId ? await agentFor(card.createdByAgentId, agents).catch(() => null) : null;
+    const key = record.question(card);
+    const { title, description } = relayIssue({ card, source: issue, askerName: asker?.name, addresseeName: addressee.name });
+    const logExtra = { issue: who, card: card.id, addressee: addressee.name, asked: card.createdAt, question: cardText(card, 120) };
+    if (config.dryRun) {
+      dryRunSeen.add(key);
+      log("watchdog: would route a question card to its addressee (dry run)", logExtra);
+      return;
+    }
+    const body = { title, description, assigneeAgentId: addressee.id, status: "todo" };
+    if (issue.projectId) body.projectId = issue.projectId;
+    if (issue.priority) body.priority = issue.priority;
+    const base = { count: 1, companyId, sourceId: issue.id, source: who, relayId: null, relay: null };
+    // Recorded before the request: if Paperclip created the issue but the answer
+    // was lost, a second scan must not create another one.
+    records.set(key, { ...base, at: now() });
+    state.touch();
+    let created;
+    try {
+      created = await api.request("POST", `/api/companies/${companyId}/issues`, body);
+    } catch (err) {
+      // Certainly not created: try again next scan. Otherwise it may exist, so leave it to you.
+      if (err.neverSent || (err.status >= 400 && err.status < 500)) records.delete(key);
+      else log.warn("watchdog: creating a question card's issue may have failed; not retried", { ...logExtra, error: err.message });
+      state.touch();
+      throw err;
+    }
+    records.set(key, { ...base, at: now(), relayId: created?.id ?? null, relay: created?.identifier ?? null });
+    state.touch();
+    stats.questions += 1;
+    log("watchdog: routed a question card to its addressee", { ...logExtra, relay: created?.identifier ?? created?.id });
+  }
+
+  // Is the card still pending? Read from its own issue, so a scan that missed
+  // the issue (a failed read, or an issue moved to backlog) can't settle it.
+  // null when Paperclip can't tell.
+  async function cardStillPending(sourceId, cardId) {
+    try {
+      return (await pendingCards(api, sourceId)).some((c) => c.id === cardId);
+    } catch {
+      return null;
+    }
+  }
+
+  // Close the issues that routed a card once the card is no longer pending.
+  // A routed issue closed while its card still waits is left alone: the
+  // addressee decided not to answer (or left it to the board), logged once.
+  async function settleRoutedCards(companyId, pending) {
+    for (const [key, r] of records.entries()) {
+      if (!key.startsWith("question:") || r?.companyId !== companyId || !r.relayId || r.settled) continue;
+      const cardId = key.slice("question:".length);
+      const waiting = pending.has(cardId) || (r.sourceId ? await cardStillPending(r.sourceId, cardId) : true);
+      if (waiting === null) continue;
+      const relay = await api.request("GET", `/api/issues/${r.relayId}`).catch((err) => (err.status === 404 ? { gone: true } : null));
+      if (!relay) continue;
+      const closed = relay.gone || relay.status === "done" || relay.status === "cancelled";
+      if (waiting) {
+        if (closed && !r.leftOpen) {
+          records.set(key, { ...r, leftOpen: true, at: now() });
+          state.touch();
+          log("watchdog: the addressee closed its question issue without answering the card; left to you", {
+            issue: r.source,
+            relay: r.relay,
+            card: cardId,
+          });
+        }
+        continue;
+      }
+      if (closed) {
+        records.set(key, { ...r, settled: true, at: now() });
+        state.touch();
+        continue;
+      }
+      // The agent may be finishing up on it: let that run end first.
+      if (relay.executionRunId || relay.checkoutRunId) continue;
+      if (config.dryRun) {
+        log("watchdog: would close a question issue whose card is settled (dry run)", { issue: r.source, relay: r.relay });
+        continue;
+      }
+      try {
+        await api.request("PATCH", `/api/issues/${r.relayId}`, {
+          status: "done",
+          comment: `The card on ${r.source} is no longer waiting (answered, withdrawn or expired), so this issue is closed.\n\n_Sent automatically by Paperclip Helper's watchdog._`,
+        });
+      } catch (err) {
+        if (!pausedRefusal(err)) throw err;
+        continue;
+      }
+      records.set(key, { ...r, settled: true, at: now() });
+      state.touch();
+      log("watchdog: closed a question issue whose card is settled", { issue: r.source, relay: r.relay });
+    }
+  }
+
   async function tick() {
     const started = now();
     const { companyIds = [] } = await ctx.identity();
@@ -819,9 +1021,13 @@ export function createWatchdog(ctx, state) {
       for (const companyId of companyIds) {
         const list = await companyAgents(api, companyId).catch(() => []);
         const agents = new Map(list.map((a) => [a.id, a]));
-        if (config.watchdogClearDeadLinks) await checkDeadLinks(companyId, agents);
+        if (config.watchdogClearDeadLinks) {
+          await checkDeadLinks(companyId, agents);
+          await checkScheduledWorkspaces(companyId, agents);
+        }
         await checkBlocked(companyId, agents);
         await checkHandOffs(companyId, agents);
+        if (config.watchdogRouteQuestions) await checkQuestions(companyId, agents);
       }
       stats.lastError = null;
     } catch (err) {
@@ -848,6 +1054,7 @@ export function createWatchdog(ctx, state) {
         retryDeferred: config.watchdogRetryDeferred,
         releaseHolds: config.watchdogReleaseHolds,
         clearDeadLinks: config.watchdogClearDeadLinks,
+        routeQuestions: config.watchdogRouteQuestions,
       });
       loop = every("watchdog", config.watchdogIntervalSec, 5_000, tick, log);
     },

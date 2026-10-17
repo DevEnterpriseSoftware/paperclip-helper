@@ -13,6 +13,7 @@
 // leaves to the board, so keep the two in step.
 
 import { approvalWaitingOn, ts } from "./util.mjs";
+import { cardText, strandedCard } from "./questions.mjs";
 
 const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
 const ASLEEP = new Set(["paused", "terminated", "pending_approval"]);
@@ -44,6 +45,8 @@ export function advise(facts) {
     lastComment = null, // { body, author }
     link = null, // workspace.mjs linkFacts
     deadLinkRun = null, // { runId, workspaceId }: the assignee's last run failed restoring a linked workspace
+    cards = [], // the issue's pending question cards (questions.mjs)
+    routed = {}, // card id → the issue the watchdog routed it to
     config = {},
     now = Date.now(),
   } = facts;
@@ -219,13 +222,51 @@ export function advise(facts) {
     };
   }
 
+  // A question card addressed to a teammate who isn't the assignee: Paperclip
+  // cancels the teammate's wake before it starts, so the asker waits for good.
+  const stranded = cards.filter((c) => strandedCard(c, issue));
+  if (stranded.length) {
+    const c = stranded[0];
+    const to = nameOf(c.addresseeAgentId) ?? "the addressee";
+    const from = nameOf(c.createdByAgentId) ?? who;
+    const relay = routed[c.id];
+    const more = stranded.length > 1 ? ` (and ${stranded.length - 1} more card${stranded.length > 2 ? "s" : ""} like it)` : "";
+    const off = config.watchdog === false || config.watchdogRouteQuestions === false;
+    return {
+      what:
+        `${from} is waiting on a question card addressed to ${to}, asked ${mins(now - ts(c.createdAt))} ago${more}: "${cardText(c, 160)}" ` +
+        `Paperclip never delivers it: ${to} isn't the assignee, so the wake the card sends is cancelled before it starts (issue_assignee_changed).`,
+      steps: relay
+        ? [`The watchdog gave ${to} ${relay} to answer it. pch why ${relay} if nothing is happening there.`]
+        : [
+            `Answer the card yourself in the issue's thread, if it's your call; answering wakes ${from}.`,
+            `Or create an issue assigned to ${to}: "Answer the question card on ${identifier}". Any run of ${to} can answer it, and answering wakes ${from}.`,
+          ],
+      watchdog: relay ? null : off ? "manual" : "auto",
+      autoNote: `The watchdog does the second by itself once the card has waited ${config.watchdogStallSec ?? 180}s, and closes that issue once the card is answered.`,
+    };
+  }
+  // A card for you, a person, or anyone: Paperclip's own waiting path, so nothing is stalled but you.
+  const forPeople = cards.filter((c) => !c.addresseeAgentId);
+  if (forPeople.length && (issue.status === "in_review" || issue.status === "blocked")) {
+    const c = forPeople[0];
+    const forYou = c.addresseeUserId && c.addresseeUserId === me;
+    return {
+      what:
+        `${nameOf(c.createdByAgentId) ?? who} is waiting on a question card ${forYou ? "addressed to you" : c.addresseeUserId ? "addressed to a board user" : "anyone may answer"}, ` +
+        `asked ${mins(now - ts(c.createdAt))} ago: "${cardText(c, 160)}"`,
+      steps: ["Answer the card in the issue's thread; answering wakes the agent."],
+      watchdog: "manual",
+    };
+  }
+
   if (issue.status === "blocked") {
     const finalizing = linked.filter((b) => b.isPendingFinalize);
     const open = linked.filter((b) => b.status !== "done" && b.status !== "cancelled");
     if (open.length) {
       return {
         what: `It is waiting on ${open.map((b) => `${b.identifier ?? b.id} (${b.status})`).join(", ")}.`,
-        steps: open.slice(0, 3).map((b) => `pch why ${b.identifier ?? b.id}`),
+        steps: [...open.slice(0, 3).map((b) => `pch why ${b.identifier ?? b.id}`), "pch blocked   (follows every chain of blocked issues to the issue it ends at, and says what that one waits on)"],
         watchdog: null,
       };
     }

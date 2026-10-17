@@ -41,6 +41,8 @@ export function emptyDb() {
     costEvents: [],
     activity: [],
     budgets: { policies: [] },
+    interactions: {}, // issueId → [{ id, kind, status, addresseeAgentId, addresseeUserId, createdByAgentId, payload, createdAt }]
+    created: [], // issues created through POST /api/companies/:id/issues
   };
 }
 
@@ -170,6 +172,17 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       // Like Paperclip, list rows don't carry the execution state.
       return send(200, list.slice(0, limit).map((i) => ({ ...i, executionState: null })));
     }
+    if ((m = p.match(/^\/api\/companies\/([^/]+)\/issues$/)) && req.method === "POST") {
+      // Like Paperclip's issue create: a title is required; the identifier is the next number.
+      if (!body?.title) return send(400, { error: "Validation error" });
+      const company = db.companies.find((c) => c.id === m[1]);
+      if (!company) return send(404, { error: "Company not found" });
+      const n = 1 + Math.max(0, ...db.issues.map((i) => Number(String(i.identifier ?? "").split("-")[1]) || 0));
+      const issue = { id: uuid(), identifier: `${company.issuePrefix}-${n}`, companyId: m[1], status: "backlog", updatedAt: new Date().toISOString(), ...body };
+      db.issues.push(issue);
+      db.created.push(issue);
+      return send(201, issue);
+    }
     if ((m = p.match(/^\/api\/companies\/([^/]+)\/heartbeat-runs$/))) {
       const limit = Math.min(Number(q.get("limit") ?? 1000), 1000);
       const list = db.heartbeatRuns
@@ -261,6 +274,10 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         return send(201, { id: uuid(), body: body.body });
       }
       if (rest === "/runs") return send(200, db.issueRuns[issue.id] ?? []);
+      if (rest === "/interactions" && req.method === "GET") {
+        if (db.noInteractions) return send(404, { error: "Not found" });
+        return send(200, db.interactions[issue.id] ?? []);
+      }
       if (rest === "/work-products") return send(200, db.workProducts[issue.id] ?? []);
       if (rest === "/diagnostics/wakes") {
         return send(200, { issue: { id: issue.id, identifier: issue.identifier, status: issue.status, title: issue.title }, diagnosis: null, events: db.wakes[issue.id] ?? [] });
@@ -327,6 +344,9 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     requests,
     fail(method, path, status, { times = 1, body, hang = false } = {}) {
       failures.push({ method, path: path instanceof RegExp ? path : new RegExp(`^${path}$`), status, times, body, hang });
+    },
+    clearFailures() {
+      failures.length = 0;
     },
     approve(challengeId) {
       const ch = db.challenges[challengeId];

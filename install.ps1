@@ -196,7 +196,7 @@ function Install-PaperclipHelper {
     'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'GITHUB_TOKEN', 'GITHUB_TOKEN_FILE', 'GITHUB_TOKEN_HOST_FILE',
     'RELAY_HOST', 'RELAY_PORT', 'RELAY_PATH',
     'WATCHDOG', 'WATCHDOG_INTERVAL_SEC', 'WATCHDOG_STALL_SEC', 'WATCHDOG_MAX_NUDGES', 'WATCHDOG_HEAL_FAILED_FINALIZE',
-    'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'WATCHDOG_CLEAR_DEAD_LINKS', 'COST_SYNC', 'COST_SYNC_SINCE')
+    'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'WATCHDOG_CLEAR_DEAD_LINKS', 'WATCHDOG_ROUTE_QUESTIONS', 'COST_SYNC', 'COST_SYNC_SINCE')
 
   function Get-EnvText {
     $lines = @(
@@ -522,6 +522,7 @@ $network
   $s.WATCHDOG_RETRY_DEFERRED = Pick 'WATCHDOG_RETRY_DEFERRED' 'true'
   $s.WATCHDOG_RELEASE_HOLDS = Pick 'WATCHDOG_RELEASE_HOLDS' 'true'
   $s.WATCHDOG_CLEAR_DEAD_LINKS = Pick 'WATCHDOG_CLEAR_DEAD_LINKS' 'true'
+  $s.WATCHDOG_ROUTE_QUESTIONS = Pick 'WATCHDOG_ROUTE_QUESTIONS' 'true'
   Say 'It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without'
   Say 'anything picking them up, and repairs blockers stuck on a failed workspace clean-up.'
   if (Confirm 'Turn the watchdog on?' (Truthy $s.WATCHDOG)) {
@@ -539,6 +540,9 @@ $network
     Say 'An issue created from another issue''s work is linked to that issue''s workspace. Once that'
     Say 'workspace is closed, every run on the issue fails at setup until the link is cleared.'
     $s.WATCHDOG_CLEAR_DEAD_LINKS = if (Confirm 'Clear such links (the next run gets a new isolated workspace; live workspaces are never touched)?' (Truthy $s.WATCHDOG_CLEAR_DEAD_LINKS)) { 'true' } else { 'false' }
+    Say 'Paperclip never delivers a question card an agent addresses to a teammate who isn''t the issue''s'
+    Say 'assignee: the card waits for good. `pch blocked` lists them either way.'
+    $s.WATCHDOG_ROUTE_QUESTIONS = if (Confirm 'Give the teammate an issue that asks it to answer the card (closed once it''s answered)?' (Truthy $s.WATCHDOG_ROUTE_QUESTIONS)) { 'true' } else { 'false' }
   } else {
     $s.WATCHDOG = 'false'
   }

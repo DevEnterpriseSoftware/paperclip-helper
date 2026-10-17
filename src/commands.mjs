@@ -9,6 +9,8 @@ import { companyAgents, companyPrefixes } from "./paperclip.mjs";
 import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, signed } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
 import { advise, excerpt, llmPrompt } from "./advice.mjs";
+import { blocked as blockedReport } from "./blocked.mjs";
+import { pendingCards } from "./questions.mjs";
 import { holdFacts, releaseHold, releaseProblems, RELEASE_OUTCOMES, unprovable } from "./release.mjs";
 import {
   clearLink,
@@ -27,6 +29,7 @@ export const USAGE = `Paperclip Helper
   pch status                   what the running helper is doing, and when the key expires
   pch check [ISSUE]            who the key belongs to; with an issue, what a merge would do to it
   pch why ISSUE [--prompt]     why nobody is working on an issue, and what to do about it (--prompt: as an LLM prompt)
+  pch blocked                  why each blocked issue is blocked, what the chains wait on, and every question card waiting
   pch approve ISSUE [comment]  approve an issue whose approval is waiting on you
   pch changes ISSUE comment    request changes (the comment becomes the brief)
   pch comment ISSUE text       comment as you (wakes the assignee)
@@ -306,6 +309,16 @@ async function whyReport(ctx, identifier) {
     ctx.identity().catch(() => null),
   ]);
   const recovery = parked?.active ?? null;
+  // Pending question cards, and where the watchdog routed any of them.
+  const cards = full?.id ? await pendingCards(api, full.id).catch(() => []) : [];
+  const routedRecords = cards.length ? readJson(ctx.config.stateFile, {})?.nudges ?? {} : {};
+  const routed = {};
+  for (const c of cards) {
+    if (routedRecords[`question:${c.id}`]?.relay) routed[c.id] = routedRecords[`question:${c.id}`].relay;
+    const [from, to] = [await nameOf(c.createdByAgentId), c.addresseeAgentId ? await nameOf(c.addresseeAgentId) : null];
+    const toWhom = to ?? (c.addresseeUserId ? (c.addresseeUserId === me?.userId ? "you" : "a board user") : "anyone");
+    out(`Question card: ${from ?? "?"} → ${toWhom}, ${c.kind}, asked ${c.createdAt}${routed[c.id] ? `, routed to ${routed[c.id]}` : ""}`);
+  }
   if (recovery) {
     out(`Recovery: ${recovery.kind ?? recovery.cause ?? "unknown"}, waiting on ${recovery.ownerType ?? "?"} since ${recovery.createdAt ?? "?"}`);
     if (recovery.nextAction) out(`  Next action: ${recovery.nextAction}`);
@@ -343,11 +356,19 @@ async function whyReport(ctx, identifier) {
     deadLinkRun,
     recovery,
     queue,
+    cards,
+    routed,
     lastComment: lastComments[0] ?? null,
     lastComments,
     config: ctx.config,
     now: ctx.now(),
   };
+}
+
+// ---------------------------------------------------------------- blocked
+
+export async function blocked(ctx) {
+  await blockedReport(ctx, out);
 }
 
 // ---------------------------------------------------------------- release
@@ -642,7 +663,8 @@ export async function status(ctx) {
         ? `Watchdog: on, last check ${ago(w.lastTickAt)} (${w.lastTickMs ?? "?"} ms), ${w.nudges} nudges and ${w.heals} repairs since start` +
             `${w.stuck ? `; ${w.stuck} issues stuck behind a deferred wake (see the log)` : ""}` +
             `${w.retries ? `; ${w.retries} deferred wakes retried` : ""}` +
-            `${w.deadLinks ? `; ${w.deadLinks} links to a closed workspace cleared` : ""}${w.lastError ? `; last error: ${w.lastError}` : ""}`
+            `${w.deadLinks ? `; ${w.deadLinks} links to a closed workspace cleared` : ""}` +
+            `${w.questions ? `; ${w.questions} undelivered question cards routed` : ""}${w.lastError ? `; last error: ${w.lastError}` : ""}`
         : "Watchdog: off",
     );
     const c = s.costSync;

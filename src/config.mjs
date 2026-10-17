@@ -146,6 +146,9 @@ export function loadConfig(env = process.env) {
     watchdogRetryDeferred: bool("WATCHDOG_RETRY_DEFERRED", true),
     watchdogReleaseHolds: bool("WATCHDOG_RELEASE_HOLDS", true),
     watchdogClearDeadLinks: bool("WATCHDOG_CLEAR_DEAD_LINKS", true),
+    // Give an agent an issue for each question card a teammate addressed to it
+    // that Paperclip never delivered (its wake is cancelled for a non-assignee).
+    watchdogRouteQuestions: bool("WATCHDOG_ROUTE_QUESTIONS", true),
 
     // cost-sync.mjs: API-equivalent cost of subscription runs
     costSync: bool("COST_SYNC", true),

@@ -1,6 +1,6 @@
 # The watchdog: wake stalled work
 
-Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for eight situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment.
+Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for ten situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment.
 
 | In Paperclip you see… | The watchdog… |
 |---|---|
@@ -12,6 +12,8 @@ Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog 
 | **"Automatic recovery blocked … the original assignee is not invokable"**, after you paused and resumed an agent. | Comments on the issue once the agent is back, which un-parks it and wakes the agent. |
 | **"Automatic recovery of this task stopped"**, with every message saved behind "The previous run has no verified stop record". | Releases the hold, as `pch release --apply` does, and delivers the saved messages. |
 | Every run fails at once with **`setup_failed`: "requested inherited execution workspace reuse … could not be restored"**. | Clears the issue's link to the closed workspace, as `pch workspace --apply` does, and restarts the agent if that run was its last. |
+| An agent scheduled a workspace of its own and left the issue in **todo**, and nothing started its next run. | Comments on it, which wakes the agent on its new workspace. |
+| A **question card** an agent addressed to a teammate sits unanswered for days, and the issues blocked behind it with it. It isn't in **Decisions**, because it isn't waiting on you. | Creates an issue assigned to the teammate that says which card to answer, and closes it once the card is answered. |
 
 ## 1. Dropped hand-offs
 
@@ -103,6 +105,32 @@ With `WATCHDOG_CLEAR_DEAD_LINKS` on, the watchdog looks at every open issue (bac
 - It leaves an issue linked to its own closed workspace (a finished issue you reopened) to you, and logs it once: unarchiving that workspace may be the better fix.
 - Paperclip ignores the change while **Instance settings → Experimental → Enable Isolated Workspaces** is off. The watchdog then changes nothing, and logs once a day which issues are affected.
 
+## 9. Issues waiting for a workspace their agent scheduled
+
+An agent can't change its own workspace during a run, but it can schedule one for its next run (`PUT /api/issues/:id/workspace`). The agent instructions in this setup have an engineer do that when its branch carries another issue's pull request, instead of asking you. It then leaves the issue in `todo`, and nothing starts the next run.
+
+With `WATCHDOG_CLEAR_DEAD_LINKS` on, the watchdog looks at `todo` issues touched in the last day that have been quiet for the stall window. If one has a workspace selection waiting for its next run, no run in progress and no wake pending, it comments, which wakes the assignee on its new workspace. It nudges at most `WATCHDOG_MAX_NUDGES` times per scheduled selection.
+
+## 10. Question cards addressed to a teammate
+
+An agent asks a teammate a question by saving a card on its own issue, addressed to that teammate (`addresseeAgentId`), and waits in review. Paperclip wakes the teammate (`interaction_pending`), but its run admission then cancels the run before it starts: "Cancelled because issue assignee changed before the queued run could start". Nothing changed hands. Only the assignee, a review participant or a comment's wake may run on an issue, and a card's wake is none of them. The card waits for good, and every issue blocked behind the asker waits with it. Seen on Paperclip 2026.1012.0, and still so on `main` in October 2026 (`decideQueuedRunStaleness`, `server/src/modules/run-dispatch/domain/policy.ts`). Reported upstream as paperclipai/paperclip#11932 (also #13518 and #16409), with fixes open in #11939, #14378 and #15991. Once one ships, the watchdog finds nothing to route; it can stay on or be turned off.
+
+Any run of the teammate may answer the card, whatever issue the run is for. So with `WATCHDOG_ROUTE_QUESTIONS` on, the watchdog looks at every open issue's pending cards once per stall window. For a card where all of these hold:
+
+- it's addressed to an agent other than the issue's assignee;
+- it has waited for the stall window;
+- that agent has had no run on the issue since (one that started, or is about to, means the wake got through);
+- that agent isn't paused, terminated or awaiting approval;
+
+it creates an issue assigned to that agent, in the same project and with the same priority, titled "Answer Carla's question on ACM-479". The issue quotes the question and says which card to answer, with the route for its kind (`respond` for questions, `accept`/`reject` for confirmations). Answering the card wakes the asker. A comment wouldn't record an answer.
+
+- Once the card is answered, withdrawn or expired, the watchdog closes that issue, if the agent hasn't already. It waits while a run holds the issue.
+- If the agent closes the issue without answering, for example because its instructions leave the call to the board, the watchdog logs it once and leaves the card to you.
+- Each card is routed once. If Paperclip doesn't answer the request that creates the issue, the issue may exist anyway, so it isn't tried again: the log says so.
+- A card addressed to a person, or to anyone, is left alone: `pch blocked` lists those.
+
+The hand-off check (1) also ignores the teammate's cancelled run. That run never started, so it isn't the issue changing hands, and nudging the asker would only make it check its card again.
+
 ## Limits
 
 Each nudge mentions the assignee and says what stalled. Each situation gets at most `WATCHDOG_MAX_NUDGES` comments or presses, spaced by the stall window. The counts are kept in `data/state.json`, so a restart doesn't repeat them.
@@ -113,6 +141,7 @@ These look similar in Paperclip, and `pch why ISSUE` tells them apart:
 
 - **An agent waiting on you.** An issue an agent blocked with a note of its own, such as a pending approval or a missing permission, has no blocker linked. Paperclip can keep waking the agent, which re-checks and stops again, a run each time. Decide the approval, or pause the issue.
 - **A recovery hold or recovery action of another kind,** such as a stalled review. A message from you to the agent is the board decision Paperclip is waiting for.
+- **A question card addressed to you, or to anyone.** `pch blocked` lists every card that is waiting, with who it waits on.
 - **A run that stays queued.** The watchdog sees a queued run as work on its way, and doesn't check how long it has waited.
 
 ## Watchdog settings
@@ -126,7 +155,8 @@ These look similar in Paperclip, and `pch why ISSUE` tells them apart:
 | `WATCHDOG_HEAL_FAILED_FINALIZE` | `true` | Repair blockers stuck on a failed clean-up. This edits the issue's **Blocked by**. |
 | `WATCHDOG_RETRY_DEFERRED` | `true` | Ask Paperclip to retry a wake deferred behind a stopped run, and release a hand-off's recovery hold (4 and 5 above). |
 | `WATCHDOG_RELEASE_HOLDS` | `true` | Release a hold Paperclip can never release by itself, once its run has been over for the stall window (7 above). |
-| `WATCHDOG_CLEAR_DEAD_LINKS` | `true` | Clear an open issue's link to a closed workspace, and restart its agent if its last run failed on it (8 above). |
+| `WATCHDOG_CLEAR_DEAD_LINKS` | `true` | Clear an open issue's link to a closed workspace, and restart its agent if its last run failed on it (8 above). Wake an agent waiting on a workspace it scheduled (9 above). |
+| `WATCHDOG_ROUTE_QUESTIONS` | `true` | Give an agent an issue for each question card a teammate addressed to it that Paperclip never delivered, and close it once the card is answered (10 above). `false` leaves them to you; `pch blocked` lists them. |
 
 
 ---

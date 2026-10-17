@@ -57,7 +57,8 @@ test("advice: blocked issues — open blocker, done blockers, an agent's own not
   const blocked = { status: "blocked", assigneeAgentId: A };
   const open = advise(base({ issue: blocked, blockers: { blockers: [{ identifier: "ACM-2", status: "in_progress" }] } }));
   assert.match(open.what, /waiting on ACM-2 \(in_progress\)/);
-  assert.deepEqual(open.steps, ["pch why ACM-2"]);
+  assert.deepEqual(open.steps.slice(0, 1), ["pch why ACM-2"]);
+  assert.match(open.steps.at(-1), /^pch blocked/);
 
   const done = advise(base({ issue: blocked, blockers: { blockers: [{ identifier: "ACM-2", status: "done" }] } }));
   assert.match(done.what, /Every blocker is done/);
