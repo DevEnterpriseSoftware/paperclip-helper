@@ -81,6 +81,7 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
       }
       m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)(\/jobs|\/rerun-failed-jobs)?$/);
       if (m) {
+        if (!m[3] && req.method === "GET" && fail["GET run"]) return send(res, fail["GET run"], { message: "Resource not accessible by integration" });
         const run = runs[m[1]]?.[m[2]];
         if (!run) return send(res, 404, { message: "Not Found" });
         if (m[3] === "/jobs" && req.method === "GET") return send(res, 200, { total_count: (run.jobs ?? []).length, jobs: run.jobs ?? [] });

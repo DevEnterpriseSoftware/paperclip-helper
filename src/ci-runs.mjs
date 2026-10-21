@@ -52,9 +52,16 @@ export function waitingText(comments, agentId, monitor) {
 
 // The same, with when the agent said it: a comment written after the run finished
 // means the agent saw the result (it watched the run within its own run).
+//
+// An agent often names the run once and follows up without repeating it
+// ("blocked on run X", then "cleared a dependency; still waiting on CI"). When
+// its latest comment names no run, its most recent one that does counts. When it
+// spoke is still its latest comment, so a run that finished before the agent last
+// spoke is never reported: it may have seen the result.
 export function waitingOn(comments, agentId, monitor) {
-  const mine = (Array.isArray(comments) ? comments : []).find((c) => c?.authorAgentId === agentId);
-  return { text: [mine?.body ?? "", monitor?.notes ?? ""].join("\n"), saidAt: mine?.createdAt ?? null };
+  const mine = (Array.isArray(comments) ? comments : []).filter((c) => c?.authorAgentId === agentId);
+  const named = mine.find((c) => runRefs(c.body).length > 0) ?? mine[0];
+  return { text: [named?.body ?? "", monitor?.notes ?? ""].join("\n"), saidAt: mine[0]?.createdAt ?? null };
 }
 
 // Conclusions that say nothing about the change: a run cancelled (often by a newer
@@ -62,8 +69,21 @@ export function waitingOn(comments, agentId, monitor) {
 export const UNINFORMATIVE = new Set(["cancelled", "skipped", "neutral", "action_required", "stale"]);
 
 // A Paperclip monitor that will still wake the agent by itself: leave it to that.
+// Only a scheduled monitor fires. A triggered one has fired and waits for the
+// agent to schedule it again, and a cleared one is done, so neither wakes anyone
+// by itself. A scheduled one counts while its next check is ahead (or only just
+// due: Paperclip's scheduler fires it within seconds), before its timeout, and
+// while it has attempts left.
+const MONITOR_GRACE_MS = 2 * 60_000;
 export function monitorPending(monitor, now) {
-  return monitor?.status === "scheduled" && ts(monitor.nextCheckAt) > now && !(ts(monitor.timeoutAt) && ts(monitor.timeoutAt) <= now);
+  if (monitor?.status !== "scheduled") return false;
+  const next = ts(monitor.nextCheckAt);
+  if (!next || next + MONITOR_GRACE_MS <= now) return false;
+  const timeout = ts(monitor.timeoutAt);
+  if (timeout && timeout <= now) return false;
+  const max = Number(monitor.maxAttempts);
+  if (max > 0 && Number(monitor.attemptCount ?? 0) >= max) return false;
+  return true;
 }
 
 const FAILED = new Set(["failure", "timed_out", "startup_failure"]);

@@ -7,7 +7,7 @@ import { minutesAgo, setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { startFakeGitHub } from "./fake-github.mjs";
 import { createWatchdog } from "../src/watchdog.mjs";
-import { ciMessage, monitorPending, onlyFlaky, runRefs, waitingText } from "../src/ci-runs.mjs";
+import { ciMessage, monitorPending, onlyFlaky, runRefs, waitingOn, waitingText } from "../src/ci-runs.mjs";
 import { answerText, escalatedReview } from "../src/board-held.mjs";
 
 async function watchdogEnv(t, extra = {}, { github = true } = {}) {
@@ -48,12 +48,20 @@ test("waitingText reads the agent's latest comment and its monitor's notes", () 
   assert.deepEqual(runRefs(waitingText([], "a1", { notes: "poll run 39496790108" })), [{ repo: null, id: "39496790108" }]);
 });
 
-test("a scheduled monitor still to fire is left to Paperclip; a timed-out or triggered one isn't", () => {
+test("a scheduled monitor still to fire is left to Paperclip; a timed-out, used-up or triggered one isn't", () => {
   const now = Date.now();
   const iso = (ms) => new Date(now + ms).toISOString();
-  assert.equal(monitorPending({ status: "scheduled", nextCheckAt: iso(60_000) }, now), true);
-  assert.equal(monitorPending({ status: "scheduled", nextCheckAt: iso(60_000), timeoutAt: iso(-1000) }, now), false);
-  assert.equal(monitorPending({ status: "triggered", nextCheckAt: null }, now), false);
+  const scheduled = { status: "scheduled", nextCheckAt: iso(60_000), timeoutAt: iso(3_600_000), attemptCount: 3, maxAttempts: 12 };
+  assert.equal(monitorPending(scheduled, now), true, "a check still to come");
+  assert.equal(monitorPending({ ...scheduled, nextCheckAt: iso(-30_000) }, now), true, "just due: Paperclip fires it within seconds");
+  assert.equal(monitorPending({ ...scheduled, nextCheckAt: iso(-10 * 60_000) }, now), false, "long overdue: it isn't firing");
+  assert.equal(monitorPending({ ...scheduled, nextCheckAt: null }, now), false, "no next check");
+  assert.equal(monitorPending({ ...scheduled, timeoutAt: iso(-1000) }, now), false, "timed out");
+  assert.equal(monitorPending({ ...scheduled, attemptCount: 12 }, now), false, "attempts used up");
+  // What a monitor looks like once it has fired: it waits for the agent to schedule it again.
+  assert.equal(monitorPending({ status: "triggered", nextCheckAt: null, timeoutAt: iso(-60_000), attemptCount: 12, maxAttempts: 12 }, now), false);
+  assert.equal(monitorPending({ status: "triggered", nextCheckAt: null, timeoutAt: iso(60_000), attemptCount: 1, maxAttempts: 12 }, now), false);
+  assert.equal(monitorPending({ ...scheduled, status: "cleared" }, now), false);
   assert.equal(monitorPending(null, now), false);
 });
 
@@ -63,6 +71,18 @@ test("a dispatched run that ends without a verdict says so, not that something b
   assert.match(text, /\*\*cancelled\*\*/);
   assert.match(text, /gave no verdict/);
   assert.doesNotMatch(text, /fix what your change broke/);
+});
+
+test("when the agent's latest comment names no run, its latest one that does counts", () => {
+  const comments = [
+    { authorAgentId: "a1", body: "Cleared a finished dependency; still waiting on CI.", createdAt: "2026-10-21T13:10:08Z" },
+    { authorUserId: "u", body: "run 22222222222 from someone else" },
+    { authorAgentId: "a1", body: "Blocked on [the Windows job](https://github.com/org/app/actions/runs/39498202022/job/1).", createdAt: "2026-10-21T13:09:25Z" },
+    { authorAgentId: "a1", body: "older: run 11111111111", createdAt: "2026-10-21T12:00:00Z" },
+  ];
+  const said = waitingOn(comments, "a1", null);
+  assert.deepEqual(runRefs(said.text), [{ repo: "org/app", id: "39498202022" }]);
+  assert.equal(said.saidAt, "2026-10-21T13:10:08Z", "when the agent last spoke is still its latest comment");
 });
 
 test("only runs whose failed jobs are all known flaky are re-run", () => {
@@ -178,6 +198,91 @@ test("a run named only in a monitor's notes counts too", async (t) => {
   issue.executionState = { monitor: { status: "triggered", serviceName: "github-actions", notes: "CI run 39498202022 on acm-192" } };
   await env.watchdog.tick();
   assert.equal(helperComments(env.db, issue).length, 1);
+});
+
+// The agent named the run, then followed up without repeating it; its monitor
+// had used up its attempts and fired for the last time before the run finished.
+test("a run named before the agent's latest comment is reported once its monitor has given up", async (t) => {
+  const env = await watchdogEnv(t);
+  const { carla, issue } = waitingOnCi(env, { comment: "Blocked on queued CI: https://github.com/org/app/actions/runs/39498202022/job/1. The monitor's attempts are used up." });
+  env.db.comments.find((c) => c.issueId === issue.id).createdAt = minutesAgo(61);
+  env.db.comments.push({ issueId: issue.id, body: "Cleared a finished dependency; still waiting on CI. Monitor exhausted.", authorAgentId: carla.id, createdAt: minutesAgo(60) });
+  const ago = (min) => new Date(env.clock.now - min * 60_000).toISOString();
+  issue.executionState = { monitor: { status: "triggered", notes: null, nextCheckAt: null, timeoutAt: ago(20), attemptCount: 12, maxAttempts: 12 } };
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 1);
+  assert.match(helperComments(env.db, issue)[0].body, /run 39498202022/);
+});
+
+test("a run that finished before the agent's latest comment isn't reported, even when that comment names no run", async (t) => {
+  const env = await watchdogEnv(t);
+  const { carla, issue } = waitingOnCi(env, { comment: "Waiting on run 39498202022." });
+  env.db.comments.push({ issueId: issue.id, body: "Saw CI; resubmitting.", authorAgentId: carla.id, createdAt: minutesAgo(20) });
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 0);
+});
+
+// The monitor fired once; its wake to the agent was never delivered and sat in
+// Paperclip's queue while the run finished. A comment would have started a run.
+test("a wake that has waited longer than the stall window doesn't silence the report; a fresh one does", async (t) => {
+  const env = await watchdogEnv(t);
+  const { carla, issue } = waitingOnCi(env, { finishedMin: 20 });
+  const ago = (min) => new Date(env.clock.now - min * 60_000).toISOString();
+  issue.executionState = { monitor: { status: "triggered", nextCheckAt: null, timeoutAt: ago(-60), attemptCount: 1, maxAttempts: 12 } };
+  env.db.wakes[issue.id] = [{ kind: "wake_request", agentId: carla.id, status: "queued", reason: "issue_monitor_due", requestedAt: ago(1) }];
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 0, "a wake requested a minute ago gets its chance to start");
+  assert.equal(env.logs.filter((l) => l.level === "debug" && l.reason === "a wake for the agent is waiting to start").length, 1);
+
+  env.later(10);
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 1, "ten minutes on and still waiting: it may never start");
+});
+
+test("a deferred monitor wake that never started doesn't silence the report", async (t) => {
+  const env = await watchdogEnv(t);
+  const { carla, issue } = waitingOnCi(env, { finishedMin: 20 });
+  // Requested after the agent's last run (so not stale), deferred ever since.
+  env.db.wakes[issue.id] = [{ kind: "wake_request", agentId: carla.id, status: "deferred_issue_execution", reason: "issue_monitor_due", requestedAt: minutesAgo(55) }];
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 1);
+});
+
+test("why a finished run isn't reported is logged at debug level, once per run and reason", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue } = waitingOnCi(env, { finishedMin: 1 });
+  const quiet = () => env.logs.filter((l) => l.msg === "watchdog: a finished CI run an agent waits on isn't reported");
+  await env.watchdog.tick();
+  env.later(1); // within the stall window: no new scan
+  await env.watchdog.tick();
+  assert.equal(quiet().length, 1);
+  assert.equal(quiet()[0].reason, "finished less than the stall window ago");
+  assert.equal(quiet()[0].issue, issue.identifier);
+  issue.executionState = { monitor: { status: "scheduled", nextCheckAt: new Date(env.clock.now + 3_600_000).toISOString() } };
+  env.later(10);
+  await env.watchdog.tick();
+  env.later(10);
+  await env.watchdog.tick();
+  assert.deepEqual(quiet().map((l) => l.reason), ["finished less than the stall window ago", "the agent's Paperclip monitor will still fire"]);
+  assert.equal(helperComments(env.db, issue).length, 0);
+});
+
+test("a token that may not read a repository's runs is warned about once", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue } = waitingOnCi(env, { comment: "waiting on https://github.com/org/app/actions/runs/39498202022" });
+  env.gh.fail["GET run"] = 403;
+  await env.watchdog.tick();
+  env.later(10);
+  await env.watchdog.tick();
+  const warned = env.logs.filter((l) => l.level === "warn" && /refused to show a CI run/.test(l.msg));
+  assert.equal(warned.length, 1);
+  assert.match(warned[0].error, /Actions: read/);
+  assert.equal(helperComments(env.db, issue).length, 0);
+
+  delete env.gh.fail["GET run"];
+  env.later(10);
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 1, "reported once the token can read it");
 });
 
 test("without a GitHub token the check is off; a run outside GITHUB_REPOS is never read", async (t) => {
