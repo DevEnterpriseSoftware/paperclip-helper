@@ -361,6 +361,23 @@ test("with a parent/subtask split, the URL goes to the subtask waiting on you", 
   assert.match(db.comments[0].body, /https:\/\/github\.com\/org\/app\/pull\/8\n\n_Relayed from GitHub by Paperclip Helper\._$/);
 });
 
+test("an opened PR's URL goes to its own issue, never to a blocker or another issue its body mentions that waits on you", async (t) => {
+  // DIR-448's PR #204 was linked on DIR-478, which waited on the board: the link
+  // followed the merge-decision search out to an issue that wasn't the PR's.
+  const { relay, db } = await relayEnv(t);
+  const blocker = { id: uuid(), identifier: "ACM-5", companyId: ids.company, status: "in_review", executionState: waitingOnMe };
+  const mentioned = { id: uuid(), identifier: "ACM-6", companyId: ids.company, status: "in_review", executionState: waitingOnMe };
+  const own = { id: uuid(), identifier: "ACM-1", companyId: ids.company, status: "in_progress", blockedBy: [{ id: blocker.id }] };
+  db.issues.push(own, blocker, mentioned);
+  const r = await relay.handle("pull_request", opened("opened", { body: "Builds on ACM-6." }));
+  assert.deepEqual(r, { identifier: "ACM-1", action: "comment" });
+  assert.deepEqual(db.comments.map((c) => c.identifier), ["ACM-1"]);
+
+  // The merge decision still goes where it waits on you.
+  const merged = await relay.handle("pull_request", { action: "closed", pull_request: pr({ body: "" }), repository: repo, sender: owner });
+  assert.equal(merged.identifier, "ACM-5");
+});
+
 test("RELAY_LINK_PRS=false ignores opened PRs; a PR that names no issue is ignored", async (t) => {
   const off = await relayEnv(t, { RELAY_LINK_PRS: "false" });
   seed(off.db);

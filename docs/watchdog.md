@@ -1,6 +1,6 @@
 # The watchdog: wake stalled work
 
-Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for ten situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment.
+Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for fourteen situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment. The last four are about work that waits on something outside the agent's run: CI, your answer, a review, a cancelled issue.
 
 | In Paperclip you see… | The watchdog… |
 |---|---|
@@ -14,6 +14,10 @@ Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog 
 | Every run fails at once with **`setup_failed`: "requested inherited execution workspace reuse … could not be restored"**. | Clears the issue's link to the closed workspace, as `pch workspace --apply` does, and restarts the agent if that run was its last. |
 | An agent scheduled a workspace of its own and left the issue in **todo**, and nothing started its next run. | Comments on it, which wakes the agent on its new workspace. |
 | A **question card** an agent addressed to a teammate sits unanswered for days, and the issues blocked behind it with it. It isn't in **Decisions**, because it isn't waiting on you. | Creates an issue assigned to the teammate that says which card to answer, and closes it once the card is answered. |
+| An agent said it **waits on a CI run** ("waiting on run 39498202022"), or its monitor gave up, and the issue sits for hours after the run finished. | Comments with the run's result, which wakes the agent. Optionally re-runs jobs you know to be flaky first. |
+| You **answered an agent's card** while the issue waited on your review, and the agent never acted on it. | Returns the issue to that agent with your answer quoted. |
+| A review lands with **you** after an agent requested changes, instead of going back to the implementer. | Nothing by default: that is Paperclip's review-round limit. With `WATCHDOG_RETURN_ESCALATED_REVIEWS` on, returns it to the implementer, twice per issue. |
+| An issue stays **blocked by a cancelled issue**. | Tells its agent why the blocker was cancelled, so it can remove or replace the blocker. |
 
 ## 1. Dropped hand-offs
 
@@ -131,7 +135,52 @@ it creates an issue assigned to that agent, in the same project and with the sam
 
 The hand-off check (1) also ignores the teammate's cancelled run. That run never started, so it isn't the issue changing hands, and nudging the asker would only make it check its card again.
 
+## 11. CI runs an agent waits on
+
+An agent that pushes and waits for CI usually says so in a comment ("Waiting on run 39498202022", or a link to the run) and stops, or schedules a Paperclip monitor to look again later. A monitor gives up after its timeout or its attempts, and a run that queues behind others (one self-hosted runner, a busy organization) can finish long after that. Nothing then wakes the agent: the issue sits blocked or in progress with CI long since green or red.
+
+With `WATCHDOG_CI_RUNS` on and a GitHub token (`GITHUB_TOKEN` or `GITHUB_TOKEN_FILE`, with **Actions: Read** on the repositories), the watchdog reads, once per stall window, the latest comment of each quiet issue's agent and its monitor's notes (Paperclip redacts a monitor's `externalRef`; its notes are readable). It looks for a run, by its Actions URL or by a run id of 9 digits or more next to the word "run", so PR and issue numbers never match. Once that run has finished, it comments with the result, which wakes the agent: the run, its attempt, branch and commit, the conclusion, and the failed jobs.
+
+- Only issues an agent owns, in todo, in progress, in review or blocked, touched in the last three days, with nothing running on them.
+- Only a run in `GITHUB_REPOS`. A run named by id alone is looked up in each of those repositories.
+- It waits until the run has been finished for the stall window, which leaves the agent's own monitor time to fire, and while a Paperclip monitor is still scheduled to check later.
+- When a comment names several runs, the newest is the one waited on; while it is still going, nothing is said about older ones.
+- Nothing is said when the agent has run on the issue since the run finished, or wrote its comment after the run finished (it watched the run within its own run): it has seen the result.
+- Nothing is said about a run that was cancelled (usually by a newer push), skipped or is waiting on an approval, or whose PR or branch has moved on to a newer commit since: that commit's run is what counts.
+- Once per run attempt: a run you (or an agent) re-run is reported again when its new attempt finishes.
+
+**Flaky jobs.** Set `WATCHDOG_CI_RERUN_JOBS` to a regular expression matching the names of jobs you know to be flaky, for example `^e2e \(windows\)$|^ci-gate$`. A finished run whose failed jobs *all* match is re-run instead of reported (GitHub's "Re-run failed jobs"), up to `WATCHDOG_CI_RERUN_MAX` times per run (default 2), and only while the run's commit is still its pull request's head: a newer push runs CI by itself. The agent hears nothing until an attempt passes or the re-runs are used up, and the comment then says how many re-runs there were. A run with any other failure is reported straight away. Re-runs need **Actions: Read and write**; if GitHub refuses one, the run is reported instead and the log says which permission is missing. Empty (the default) never re-runs anything.
+
+## 12. Answers that reach nobody
+
+While a review or approval stage waits on a person, Paperclip assigns the issue to that person. Nothing on it wakes an agent: a comment from you wakes the assignee, which is you, and on current Paperclip a mention wakes nobody (paperclipai/paperclip#14577). So when an agent asked you something with a card (a report to paste, a choice) and you answer it after the issue reached your stage, Paperclip delivers the answer to you, and the agent never hears it.
+
+With `WATCHDOG_DELIVER_ANSWERS` on, the watchdog looks at the issues waiting on your decision once per stall window. When the stage's return assignee (the agent that submitted the work) created a card on the issue that a person has answered, accepted or rejected, the answer is at least 30 minutes old (time for you to decide yourself), and no run of that agent on the issue was going when it came or has started since, the watchdog returns the issue to the agent: it records **changes requested** as you, the stage's participant, with a comment that quotes your answer and asks the agent to act on it and hand the issue back for review. Paperclip then assigns it to the agent and wakes it; its resubmission comes back to the same stage.
+
+- Only an issue whose decision waits on the helper's own user (the board key's), as `pch check ISSUE` reports it. Only that user can decide.
+- Only an answer Paperclip would have delivered: the card's `continuationPolicy` asks to wake the assignee on this answer (a card that asked for no wake, or the rejection of an accept-only card, is left alone).
+- Once per card. It waits while the agent is paused, terminated or awaiting approval, or a run is active on the issue. It reads the issue again just before deciding, and does nothing if you decided in the meantime.
+- Never on a review Paperclip escalated to you (13): that is only returned when you turn that on.
+- Your decision resets Paperclip's review-round count for the stage, as any decision of yours does.
+
+## 13. Reviews escalated by Paperclip's review-round limit
+
+When agents request changes on one review stage `maxReviewRounds` times in a row (3 unless the issue's execution policy says otherwise), Paperclip stops returning the work to its implementer and hands the review to the responsible person instead: the stage stays pending, with you as participant although you aren't one of its reviewers. That is deliberate, a guard against two agents bouncing work for ever, so the watchdog leaves it to you by default.
+
+If you'd rather the work went back to the implementer, there are two ways:
+
+- **Raise the limit** in your execution policies (`maxReviewRounds`, up to 50). Paperclip then keeps returning the work itself, and still escalates at the new limit.
+- **`WATCHDOG_RETURN_ESCALATED_REVIEWS=true`.** Once such an escalated review has been quiet for the stall window, the watchdog returns it to the implementer as your **changes requested**, quoting the latest comment of one of the stage's reviewers. A decision of yours resets Paperclip's round count, so each return gives the agents `maxReviewRounds` more rounds (with the defaults, 2 returns × 3 rounds). At most `WATCHDOG_MAX_NUDGES` returns per issue (counted for a week); after that the next escalation is logged and left to you. It leaves an issue alone while a card on it waits on a person, and when the implementer has run since the reviewer's comment.
+
+## 14. Issues blocked by a cancelled issue
+
+Paperclip counts a blocker as resolved only when it is **done**. A cancelled blocker stays unresolved until someone removes or replaces it in **Blocked by**, so the dependent stays blocked and nothing wakes its agent. Often the work landed elsewhere (another issue's PR carried the fix) and nobody updated the link.
+
+With `WATCHDOG_CANCELLED_BLOCKERS` on, once such an issue has been quiet for the stall window, the watchdog comments on it once, which wakes its agent: which blockers were cancelled, each one's last comment (usually why it was cancelled), and what to do. If the work landed elsewhere or isn't needed, remove the blocker (and link what replaced it); if it is still needed, say so and ask for a replacement. It waits while the agent is paused, terminated or awaiting approval, or a run is active or a wake pending on the issue.
+
 ## Limits
+
+With `DRY_RUN=true` the watchdog logs what it would do, once per situation, and records nothing, so turning dry run off leaves everything still to do.
 
 Each nudge mentions the assignee and says what stalled. Each situation gets at most `WATCHDOG_MAX_NUDGES` comments or presses, spaced by the stall window. The counts are kept in `data/state.json`, so a restart doesn't repeat them.
 
@@ -143,6 +192,8 @@ These look similar in Paperclip, and `pch why ISSUE` tells them apart:
 - **A recovery hold or recovery action of another kind,** such as a stalled review. A message from you to the agent is the board decision Paperclip is waiting for.
 - **A question card addressed to you, or to anyone.** `pch blocked` lists every card that is waiting, with who it waits on.
 - **A run that stays queued.** The watchdog sees a queued run as work on its way, and doesn't check how long it has waited.
+- **A review Paperclip escalated to you** after its review-round limit, unless you turn on `WATCHDOG_RETURN_ESCALATED_REVIEWS` (13 above).
+- **A card an agent addresses to you about who should do the work** (Paperclip refuses an agent delegating back to the agent that delegated to it, and the agent asks the board). Answering it on your behalf would defeat that guard.
 
 ## Watchdog settings
 
@@ -157,6 +208,12 @@ These look similar in Paperclip, and `pch why ISSUE` tells them apart:
 | `WATCHDOG_RELEASE_HOLDS` | `true` | Release a hold Paperclip can never release by itself, once its run has been over for the stall window (7 above). |
 | `WATCHDOG_CLEAR_DEAD_LINKS` | `true` | Clear an open issue's link to a closed workspace, and restart its agent if its last run failed on it (8 above). Wake an agent waiting on a workspace it scheduled (9 above). |
 | `WATCHDOG_ROUTE_QUESTIONS` | `true` | Give an agent an issue for each question card a teammate addressed to it that Paperclip never delivered, and close it once the card is answered (10 above). `false` leaves them to you; `pch blocked` lists them. |
+| `WATCHDOG_CI_RUNS` | `true` | Tell an agent that a CI run it said it waits on has finished (11 above). Needs `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE` with **Actions: Read**; without a token it is off. |
+| `WATCHDOG_CI_RERUN_JOBS` | none | A regular expression for jobs known to be flaky. A run whose failed jobs all match is re-run before it is reported. Needs **Actions: Read and write**. Empty: never re-run. |
+| `WATCHDOG_CI_RERUN_MAX` | `2` | Re-runs per run, at most. |
+| `WATCHDOG_DELIVER_ANSWERS` | `true` | Return an issue waiting on your decision to the agent whose card you answered meanwhile, as your "changes requested" (12 above). |
+| `WATCHDOG_RETURN_ESCALATED_REVIEWS` | `false` | Return a review Paperclip escalated to you after its review-round limit to the implementer, `WATCHDOG_MAX_NUDGES` times per issue (13 above). |
+| `WATCHDOG_CANCELLED_BLOCKERS` | `true` | Tell an agent once that its issue is blocked by a cancelled issue, with why it was cancelled (14 above). |
 
 
 ---

@@ -20,6 +20,8 @@ export const pull = (number, extra = {}) => ({
 
 export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" } = {}) {
   const pulls = {}; // "org/app" → [pull]
+  const runs = {}; // "org/app" → { [runId]: workflow run, with `jobs` (served on the jobs route) and `onRerun(run)` }
+  const reruns = []; // { repo, id }
   const comments = []; // { repo, number, body }
   const requests = [];
   const fail = {}; // "POST comments" or "GET pull 8" → status
@@ -57,6 +59,22 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
           : found.mergeable;
         return send(res, 200, { ...found, mergeable });
       }
+      m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)(\/jobs|\/rerun-failed-jobs)?$/);
+      if (m) {
+        const run = runs[m[1]]?.[m[2]];
+        if (!run) return send(res, 404, { message: "Not Found" });
+        if (m[3] === "/jobs" && req.method === "GET") return send(res, 200, { total_count: (run.jobs ?? []).length, jobs: run.jobs ?? [] });
+        if (m[3] === "/rerun-failed-jobs" && req.method === "POST") {
+          if (fail["POST rerun"]) return send(res, fail["POST rerun"], { message: "Resource not accessible by integration" });
+          reruns.push({ repo: m[1], id: m[2] });
+          run.onRerun?.(run);
+          return send(res, 201, {});
+        }
+        if (!m[3] && req.method === "GET") {
+          const { jobs, onRerun, ...rest } = run;
+          return send(res, 200, rest);
+        }
+      }
       m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments$/);
       if (m && req.method === "POST") {
         if (fail["POST comments"]) return send(res, fail["POST comments"], { message: "Resource not accessible by personal access token" });
@@ -73,6 +91,8 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
     token,
     current,
     pulls,
+    runs,
+    reruns,
     comments,
     requests,
     fail,

@@ -12,7 +12,7 @@ In Paperclip, the current participant of a review or approval stage records a de
 | **You approve** the PR in a GitHub review | Nothing. Merging is the approval. |
 | **You comment** or review anything else | Your text is copied to the issue as a comment, which wakes the assignee. |
 | **Someone else merges**, or the PR is **closed** without merging | A comment only. |
-| **The PR is opened, reopened or marked ready for review** | Its URL is posted on the issue, so Paperclip links the PR (`RELAY_LINK_PRS`). |
+| **The PR is opened, reopened or marked ready for review** | Its URL is posted on the PR's own issue (the first one its title, branch or body names, or that issue's subtask waiting on you), so Paperclip links the PR (`RELAY_LINK_PRS`). Never on a blocker or another issue it mentions: a link there would show the PR as that issue's. |
 | **A merge leaves another open PR with conflicts** | That PR's issue goes back to its agent to resolve them, and the PR gets a comment saying so (`RELAY_FIX_CONFLICTS`, [below](#prs-with-merge-conflicts)). |
 
 Every delivery's response body says what the relay did, for example `{"identifier":"ACM-2","action":"approve","status":"done"}`. `status` is read back from Paperclip after the decision, and a `warning` says when the issue didn't land where it was sent. You can see it in GitHub's webhook **Recent Deliveries**, and **Redeliver** retries a delivery that failed.
@@ -83,7 +83,7 @@ The relay needs a token to read pull requests and comment on them. A **fine-grai
 2. **Token name:** `paperclip-helper`. **Expiration:** your choice; when it expires the log says `GitHub rejected GITHUB_TOKEN`, and you create a new one.
 3. **Resource owner:** the account or organization that owns the repositories. An organization may have to approve the token first.
 4. **Repository access:** **Only select repositories**, and pick the ones in `GITHUB_REPOS`.
-5. **Permissions → Repository permissions → Pull requests: Read and write.** GitHub adds **Metadata: Read-only** by itself. Nothing else is needed. With `RELAY_CONFLICT_PR_COMMENT=false`, **Read-only** is enough.
+5. **Permissions → Repository permissions → Pull requests: Read and write.** GitHub adds **Metadata: Read-only** by itself. With `RELAY_CONFLICT_PR_COMMENT=false`, **Read-only** is enough. The watchdog uses the same token to read the CI runs agents wait on ([`WATCHDOG_CI_RUNS`](watchdog.md#11-ci-runs-an-agent-waits-on)): add **Actions: Read-only** for that, or **Read and write** if you set `WATCHDOG_CI_RERUN_JOBS` to re-run flaky jobs.
 6. **Generate token**, and copy it (`github_pat_…`). GitHub shows it once.
 7. Re-run the installer and answer yes to "Send PRs with merge conflicts back to their agents automatically?", or put it in `.env` yourself and run `docker compose up -d`:
 
@@ -114,7 +114,7 @@ The installer does all of it: answer **2** at "Token source" and give the file's
 
 A token file at `~/.cache/paperclip-github-app/token`, where the `paperclip-github-app` timer keeps one, is found and offered by itself. Any other program works as well, as long as it writes a file holding only the token.
 
-- **The App needs Pull requests: Read and write** on the repositories in `GITHUB_REPOS` (Read-only with `RELAY_CONFLICT_PR_COMMENT=false`), and the token mustn't be limited to fewer of them.
+- **The App needs Pull requests: Read and write** on the repositories in `GITHUB_REPOS` (Read-only with `RELAY_CONFLICT_PR_COMMENT=false`), and the token mustn't be limited to fewer of them. For the watchdog's CI-run check it also needs **Actions: Read** (Read and write to re-run flaky jobs).
 - **The PR comments are written by the App** (`your-app[bot]`), so they stand apart from yours.
 - **`pch check`** prints `GitHub: the token in GITHUB_TOKEN_FILE (/run/github-token/token) reads owner/repo (3 open PRs)`. If the program that renews the file stops, the log says how many minutes ago the file was written.
 - Set one of `GITHUB_TOKEN` and `GITHUB_TOKEN_FILE`, not both: the helper refuses to start with both.

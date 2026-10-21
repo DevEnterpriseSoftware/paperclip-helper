@@ -50,6 +50,17 @@ export function loadConfig(env = process.env) {
     }
     return value;
   };
+  const regex = (name) => {
+    const raw = get(name);
+    if (!raw) return "";
+    try {
+      new RegExp(raw, "i");
+    } catch (err) {
+      problems.push(`${name}=${raw} is not a regular expression (${err.message})`);
+      return "";
+    }
+    return raw;
+  };
   const date = (name) => {
     const raw = get(name);
     if (!raw) return null;
@@ -149,6 +160,22 @@ export function loadConfig(env = process.env) {
     // Give an agent an issue for each question card a teammate addressed to it
     // that Paperclip never delivered (its wake is cancelled for a non-assignee).
     watchdogRouteQuestions: bool("WATCHDOG_ROUTE_QUESTIONS", true),
+    // Tell an agent that a GitHub Actions run it said it waits on has finished, once it
+    // has and the agent hasn't run since (needs GITHUB_TOKEN or GITHUB_TOKEN_FILE).
+    watchdogCiRuns: bool("WATCHDOG_CI_RUNS", true),
+    // Known flaky jobs (a regular expression on the job name): a run whose failed jobs
+    // all match is re-run first, up to WATCHDOG_CI_RERUN_MAX times. Empty: never re-run.
+    watchdogCiRerunJobs: regex("WATCHDOG_CI_RERUN_JOBS"),
+    watchdogCiRerunMax: num("WATCHDOG_CI_RERUN_MAX", 2),
+    // Return an issue waiting on your review to its agent when you answered the agent's
+    // card meanwhile: Paperclip woke you with the answer, not the agent.
+    watchdogDeliverAnswers: bool("WATCHDOG_DELIVER_ANSWERS", true),
+    // Return a review Paperclip escalated to you after the agents used up their review
+    // rounds (maxReviewRounds) to its implementer. Off: that limit is deliberate.
+    watchdogReturnEscalatedReviews: bool("WATCHDOG_RETURN_ESCALATED_REVIEWS", false),
+    // Tell an agent its issue is blocked by a cancelled issue, which Paperclip never
+    // counts as resolved.
+    watchdogCancelledBlockers: bool("WATCHDOG_CANCELLED_BLOCKERS", true),
 
     // cost-sync.mjs: API-equivalent cost of subscription runs
     costSync: bool("COST_SYNC", true),

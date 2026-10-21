@@ -1,10 +1,12 @@
-// GitHub REST API client, for the relay: its conflict sweep, and its notes on a
-// PR when a decision you asked for wasn't recorded.
+// GitHub REST API client, for the relay (its conflict sweep, and its notes on a
+// PR when a decision you asked for wasn't recorded) and the watchdog's CI-run check.
 //
 // It lists open pull requests, reads whether each can be merged, and leaves a
 // comment on the ones it sends back or explains. It needs a token with "Pull requests"
 // access on the repositories in GITHUB_REPOS: read to look, read and write to
-// comment. It never merges, pushes, closes or deletes anything.
+// comment. The watchdog reads workflow runs and their jobs ("Actions: Read") and,
+// only for jobs you named as flaky, re-runs failed jobs ("Actions: Read and write").
+// It never merges, pushes, closes or deletes anything.
 //
 // The token is GITHUB_TOKEN as it is, or the contents of GITHUB_TOKEN_FILE, read
 // again for every request: a GitHub App installation token lasts an hour, and
@@ -78,8 +80,9 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
     }
     if (res.status === 403 || res.status === 404) {
       const need = method === "GET" ? "read" : "read and write";
+      const scope = /\/actions\//.test(path) ? "Actions" : "Pull requests";
       return new GitHubError(
-        `${method} ${path} → ${res.status}: ${detail}. ${source} needs "Pull requests: ${need}" on this repository.`,
+        `${method} ${path} → ${res.status}: ${detail}. ${source} needs "${scope}: ${need}" on this repository.`,
         meta,
       );
     }
@@ -138,5 +141,16 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
     // GitHub is still working it out).
     pull: (repo, number) => request("GET", `/repos/${repo}/pulls/${number}`),
     comment: (repo, number, body) => request("POST", `/repos/${repo}/issues/${number}/comments`, { body }),
+    // GitHub Actions, for the watchdog's CI-run check (needs "Actions: read"; a re-run "read and write").
+    // One workflow run: status, conclusion, run_attempt, head_sha, updated_at, pull_requests, html_url.
+    workflowRun: (repo, id) => request("GET", `/repos/${repo}/actions/runs/${id}`),
+    // The jobs of the run's latest attempt.
+    async workflowJobs(repo, id) {
+      const data = await request("GET", `/repos/${repo}/actions/runs/${id}/jobs?filter=latest&per_page=100`);
+      return Array.isArray(data?.jobs) ? data.jobs : [];
+    },
+    rerunFailedJobs: (repo, id) => request("POST", `/repos/${repo}/actions/runs/${id}/rerun-failed-jobs`, {}),
+    // A branch's head commit (commit.sha), to tell whether a run is still its branch's latest.
+    branch: (repo, name) => request("GET", `/repos/${repo}/branches/${encodeURIComponent(name)}`),
   };
 }

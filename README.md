@@ -16,6 +16,9 @@ Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that 
 | **"Automatic recovery of this task stopped"**, and every message or **Interrupt** is saved again with "The previous run has no verified stop record". | **Watchdog.** Paperclip wants proof that a run cut off at a hand-off has stopped, and that run never recorded any, so the hold never clears. The watchdog records that the run stopped, releases the hold and delivers the saved messages. **[`pch release ISSUE`](docs/commands.md#release-a-hold-messages-cant-clear)** does the same by hand. |
 | **Issues left blocked after you pause and resume agents** ("the original assignee is not invokable"). | **Watchdog.** Once the agent is back, it comments on each issue Paperclip parked, which un-parks it and wakes the agent. |
 | **A Costs page that shows $0**, because your agents run on a Claude or ChatGPT subscription. | **[Cost sync](docs/cost-sync.md).** It posts each run's API-equivalent cost: Claude Code's own figure, and for Codex, tokens × OpenAI list prices. |
+| **An issue that sits for hours after CI finished**, because the agent said "waiting on run …" and stopped, or its monitor gave up first. | **[Watchdog](docs/watchdog.md#11-ci-runs-an-agent-waits-on)** (with a GitHub token). It tells the agent the run's result once it finishes, and can re-run jobs you know to be flaky first. |
+| **You answered an agent's card, and nothing happened**, because the issue was waiting on your review. | **[Watchdog](docs/watchdog.md#12-answers-that-reach-nobody).** It returns the issue to the agent with your answer. |
+| **An issue blocked for good by a cancelled issue.** | **[Watchdog](docs/watchdog.md#14-issues-blocked-by-a-cancelled-issue).** It tells the agent why the blocker was cancelled, so it can remove or replace it. |
 | **Runs fail at once with `setup_failed`: "requested inherited execution workspace reuse … could not be restored"**, or an agent blocks an issue asking for a "workspace ruling". | **[`pch workspace ISSUE`](docs/commands.md#workspace-an-issue-linked-to-the-wrong-workspace)**. Issues an agent creates from another issue's work are linked to that issue's workspace. Once it's closed every run fails at setup, and while it's live their commits land on its branch. `--apply` gives them a new isolated workspace, and `pch why` recommends it when it sees either. **Watchdog** clears links to a closed workspace by itself. |
 | **A disk that keeps filling up** with hundreds of git worktrees under `.paperclip/worktrees`, for issues finished long ago. | **[`pch worktrees`](docs/commands.md#worktrees-finished-issues-worktrees-still-on-disk)** closes the workspaces of finished issues so Paperclip removes their worktrees, and lists those with uncommitted or unmerged work for you to look at. |
 | **A model drop-down that doesn't list** a new model id. | **[`pch set-model`](docs/commands.md)** moves every agent from one model to another and keeps the rest of their config, effort included. |
@@ -27,7 +30,7 @@ Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that 
 
 - **One container, no npm dependencies.** It calls Paperclip's API directly with a named board key, so everything it does appears in Paperclip under your name.
 - **Three components, each with its own switch:** the relay receives signed GitHub webhooks, the watchdog checks every minute, and cost sync posts every 15 minutes.
-- **It works through Paperclip's API, as you would in the UI:** comments, review decisions, blocker edits, cost events, and issues for the questions Paperclip didn't deliver. It never merges, pushes or deletes anything. On GitHub it only reads pull requests and, if you turn that on, comments on the ones it sends back.
+- **It works through Paperclip's API, as you would in the UI:** comments, review decisions, blocker edits, cost events, and issues for the questions Paperclip didn't deliver. It never merges, pushes or deletes anything. On GitHub it reads pull requests and the CI runs agents wait on, comments on the PRs it sends back if you turn that on, and re-runs failed jobs only if you name them as flaky.
 - **`DRY_RUN=true`** makes every component log what it would do and change nothing.
 
 ## Quick start
@@ -66,7 +69,7 @@ It acts only on events signed with your webhook secret, from your repositories, 
 
 ### Watchdog: wake stalled work
 
-Most stalls start the same way: an issue changes hands, Paperclip cancels a run at that moment, and the next wake is refused and never retried. Every minute the watchdog looks for the stalls in the table above, ten situations in all. It acts only after an issue has been quiet for three minutes, at most twice per situation, and never interrupts a running run. A hold Paperclip can never release by itself is released once its run has been over for three minutes; a hold whose cause it can't be sure of is logged and left to you. A link to a closed workspace, which fails every run at setup, is cleared at once. Details and settings: **[docs/watchdog.md](docs/watchdog.md)**.
+Most stalls start the same way: an issue changes hands, Paperclip cancels a run at that moment, and the next wake is refused and never retried. Every minute the watchdog looks for the stalls in the table above, fourteen situations in all. It acts only after an issue has been quiet for three minutes, at most twice per situation, and never interrupts a running run. A hold Paperclip can never release by itself is released once its run has been over for three minutes; a hold whose cause it can't be sure of is logged and left to you. A link to a closed workspace, which fails every run at setup, is cleared at once. Details and settings: **[docs/watchdog.md](docs/watchdog.md)**.
 
 ### Cost sync: what your subscription runs would have cost
 
@@ -105,11 +108,11 @@ Examples and sample output: **[docs/commands.md](docs/commands.md)**.
 - **Where it's stored:** `data/paperclip-token`, mode 600 on Linux and macOS. Only the container's user can read it, and it never leaves the machine.
 - **Revoking it:** `pch revoke` revokes it in Paperclip and deletes the file. Run `pch login` for a new one.
 - **The webhook secret** is in `.env` (mode 600 on Linux and macOS). GitHub signs every delivery with it, and unsigned or wrongly signed deliveries are rejected.
-- **The GitHub token** (optional, for sending back PRs with merge conflicts) is in `.env` too. Give it only the relay's repositories and only "Pull requests" access; the helper reads pull requests and comments on them, nothing else. See [the GitHub token](docs/relay.md#the-github-token).
+- **The GitHub token** (optional, for sending back PRs with merge conflicts, and for the CI runs agents wait on) is in `.env` too. Give it only the relay's repositories, "Pull requests" access and, for the CI-run check, "Actions: Read"; the helper reads pull requests and CI runs and comments on pull requests. With `WATCHDOG_CI_RERUN_JOBS` set it also re-runs the failed jobs you named as flaky ("Actions: Read and write"), nothing else. See [the GitHub token](docs/relay.md#the-github-token).
 - **Paperclip's API is never exposed.** Only the relay's path needs to be public.
 - **The container** runs as a non-root user with a read-only filesystem, no capabilities, and `no-new-privileges`.
 - **Logs** are one JSON line per event. Anything that looks like a key or secret is masked.
-- **What it never does:** merge, push, delete, or change anything outside what's described here. Beyond comments, the watchdog's edits are the failed-finalize repair, clearing links to a closed workspace, and the issues it creates (and closes) for undelivered question cards; each has its own switch.
+- **What it never does:** merge, push, delete, or change anything outside what's described here. Beyond comments, the watchdog's edits are the failed-finalize repair, clearing links to a closed workspace, the issues it creates (and closes) for undelivered question cards, and returning an issue waiting on your review to its agent (as your "changes requested") when you answered its card meanwhile; each has its own switch.
 
 ## Upgrading
 
@@ -130,7 +133,7 @@ Examples and sample output: **[docs/commands.md](docs/commands.md)**.
 |---|---|
 | [docs/install.md](docs/install.md) | What the installer does, unattended and manual installs, general settings, networking, the hostname guard, exposing the relay, upgrading, uninstalling. |
 | [docs/relay.md](docs/relay.md) | Every GitHub event and what it does, how the issue is found, PRs with merge conflicts and the GitHub token, safety rules, the webhook, settings. |
-| [docs/watchdog.md](docs/watchdog.md) | The ten situations in detail, limits, what it leaves to you, settings. |
+| [docs/watchdog.md](docs/watchdog.md) | The fourteen situations in detail, limits, what it leaves to you, settings. |
 | [docs/cost-sync.md](docs/cost-sync.md) | How costs are worked out, what to know before turning it on, settings. |
 | [docs/commands.md](docs/commands.md) | Every `pch` command, with `set-model` and `why` examples. |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptoms, causes and fixes. |

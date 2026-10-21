@@ -236,7 +236,7 @@ EOF
   } >"$1"
 }
 
-MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS GITHUB_TOKEN GITHUB_TOKEN_FILE GITHUB_TOKEN_HOST_FILE RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS WATCHDOG_CLEAR_DEAD_LINKS WATCHDOG_ROUTE_QUESTIONS COST_SYNC COST_SYNC_SINCE"
+MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS GITHUB_TOKEN GITHUB_TOKEN_FILE GITHUB_TOKEN_HOST_FILE RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS WATCHDOG_CLEAR_DEAD_LINKS WATCHDOG_ROUTE_QUESTIONS WATCHDOG_CI_RUNS WATCHDOG_CI_RERUN_JOBS WATCHDOG_CI_RERUN_MAX WATCHDOG_DELIVER_ANSWERS WATCHDOG_RETURN_ESCALATED_REVIEWS WATCHDOG_CANCELLED_BLOCKERS COST_SYNC COST_SYNC_SINCE"
 
 write_env() {
   local key
@@ -548,6 +548,12 @@ main() {
   WATCHDOG_RELEASE_HOLDS="$(pick WATCHDOG_RELEASE_HOLDS true)"
   WATCHDOG_CLEAR_DEAD_LINKS="$(pick WATCHDOG_CLEAR_DEAD_LINKS true)"
   WATCHDOG_ROUTE_QUESTIONS="$(pick WATCHDOG_ROUTE_QUESTIONS true)"
+  WATCHDOG_CI_RUNS="$(pick WATCHDOG_CI_RUNS true)"
+  WATCHDOG_CI_RERUN_JOBS="$(pick WATCHDOG_CI_RERUN_JOBS)"
+  WATCHDOG_CI_RERUN_MAX="$(pick WATCHDOG_CI_RERUN_MAX 2)"
+  WATCHDOG_DELIVER_ANSWERS="$(pick WATCHDOG_DELIVER_ANSWERS true)"
+  WATCHDOG_RETURN_ESCALATED_REVIEWS="$(pick WATCHDOG_RETURN_ESCALATED_REVIEWS false)"
+  WATCHDOG_CANCELLED_BLOCKERS="$(pick WATCHDOG_CANCELLED_BLOCKERS true)"
   say "It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without"
   say "anything picking them up, and repairs blockers stuck on a failed workspace clean-up."
   local wd_default=y; truthy "$WATCHDOG" || wd_default=n
@@ -574,6 +580,24 @@ main() {
     say "Paperclip never delivers a question card an agent addresses to a teammate who isn't the issue's"
     say "assignee: the card waits for good. \`pch blocked\` lists them either way."
     if confirm "Give the teammate an issue that asks it to answer the card (closed once it's answered)?" "$questions"; then WATCHDOG_ROUTE_QUESTIONS=true; else WATCHDOG_ROUTE_QUESTIONS=false; fi
+    local ci=y; truthy "$WATCHDOG_CI_RUNS" || ci=n
+    say "An agent that waits on a CI run often stops, or its monitor gives up, before the run finishes."
+    say "This uses the GitHub token (it needs \"Actions: Read\"); without a token it stays off."
+    if confirm "Tell the agent once the CI run it named has finished?" "$ci"; then
+      WATCHDOG_CI_RUNS=true
+      say "Jobs you know to be flaky can be re-run before the agent is told (needs \"Actions: Read and write\")."
+      ask WATCHDOG_CI_RERUN_JOBS "Flaky job names, as a regular expression (empty: never re-run)" "$WATCHDOG_CI_RERUN_JOBS"
+    else
+      WATCHDOG_CI_RUNS=false
+    fi
+    local answers=y; truthy "$WATCHDOG_DELIVER_ANSWERS" || answers=n
+    say "When you answer an agent's card while its issue waits on your review, Paperclip wakes you, not the agent."
+    if confirm "Return such an issue to the agent with your answer (your \"changes requested\")?" "$answers"; then WATCHDOG_DELIVER_ANSWERS=true; else WATCHDOG_DELIVER_ANSWERS=false; fi
+    local escalate=n; truthy "$WATCHDOG_RETURN_ESCALATED_REVIEWS" && escalate=y
+    say "After 3 agent change requests in a row, Paperclip hands a review to you instead of back to the implementer."
+    if confirm "Return such reviews to the implementer (at most $WATCHDOG_MAX_NUDGES times per issue)?" "$escalate"; then WATCHDOG_RETURN_ESCALATED_REVIEWS=true; else WATCHDOG_RETURN_ESCALATED_REVIEWS=false; fi
+    local cancelled=y; truthy "$WATCHDOG_CANCELLED_BLOCKERS" || cancelled=n
+    if confirm "Tell an agent when its issue is blocked by a cancelled issue (Paperclip never counts it resolved)?" "$cancelled"; then WATCHDOG_CANCELLED_BLOCKERS=true; else WATCHDOG_CANCELLED_BLOCKERS=false; fi
   else
     WATCHDOG=false
   fi

@@ -164,7 +164,11 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
   // issue while the work in review is its blocker). With several waiting, prefer
   // one that records this PR as a work product; if none does, decide nothing and
   // comment. With none waiting, the first issue the PR names gets a comment.
-  async function resolveTarget(pr, identifiers) {
+  // `own: true` looks only at the PR's own issue, the first one it names (title,
+  // then branch, then body), and that issue's subtasks: where a PR's link goes. A
+  // blocker, or another issue the body mentions, may be the right place for your
+  // merge decision, but a link there shows the PR as that issue's.
+  async function resolveTarget(pr, identifiers, { own = false } = {}) {
     const { userId } = await ctx.identity();
     const seen = new Map(); // identifier → issue
     const add = (issue) => {
@@ -193,6 +197,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       add(issue);
       named.push(issue);
       for (const child of await subtasks(issue)) add(child);
+      if (own) break;
     }
     if (seen.size === 0) return null;
     const first = seen.values().next().value;
@@ -200,7 +205,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
     let waiting = [...seen.values()].filter(isWaiting);
 
     const via = new Map(); // identifier → how a further issue was reached
-    if (waiting.length === 0) {
+    if (waiting.length === 0 && !own) {
       const namedIds = new Set(named.map((i) => i.id));
       const queue = [...seen.values()];
       const walked = new Set();
@@ -241,6 +246,8 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       if ((Array.isArray(products) ? products : []).some((wp) => isWorkProductOf(wp, pr))) return found(issue);
     }
     // Several wait on you and none records this PR: don't guess which to decide.
+    // A link then goes on the PR's own issue.
+    if (own) return { issue: first, waiting: false };
     return { issue: waiting[0], waiting: true, ambiguous: waiting.map((i) => i.identifier ?? i.id) };
   }
 
@@ -313,8 +320,8 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
 
   // Plain comments go where the review is waiting on you, if anywhere; else to
   // the first issue the PR names.
-  async function commentOnTarget(pr, identifiers, comment) {
-    const target = await resolveTarget(pr, identifiers).catch(() => null);
+  async function commentOnTarget(pr, identifiers, comment, options) {
+    const target = await resolveTarget(pr, identifiers, options).catch(() => null);
     return addComment(target?.issue?.identifier ?? identifiers[0], comment);
   }
 
@@ -389,7 +396,8 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
         const identifiers = findIdentifiers(pr, prefixes);
         if (!identifiers.length) return { ignored: `${prLabel(pr)} names no ${prefixLabel()} issue` };
         const verb = payload.action === "reopened" ? "reopened" : "opened";
-        return commentOnTarget(pr, identifiers, `${prLabel(pr)} ${verb} by @${payload.sender?.login}: ${pr.html_url}`);
+        // On the PR's own issue (or its subtask), never on a blocker or another issue it mentions.
+        return commentOnTarget(pr, identifiers, `${prLabel(pr)} ${verb} by @${payload.sender?.login}: ${pr.html_url}`, { own: true });
       }
       if (payload.action !== "closed") return { ignored: `pull_request.${payload.action}` };
       // Whoever merged it and whatever it names: the base branch moved.

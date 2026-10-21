@@ -196,7 +196,9 @@ function Install-PaperclipHelper {
     'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'GITHUB_TOKEN', 'GITHUB_TOKEN_FILE', 'GITHUB_TOKEN_HOST_FILE',
     'RELAY_HOST', 'RELAY_PORT', 'RELAY_PATH',
     'WATCHDOG', 'WATCHDOG_INTERVAL_SEC', 'WATCHDOG_STALL_SEC', 'WATCHDOG_MAX_NUDGES', 'WATCHDOG_HEAL_FAILED_FINALIZE',
-    'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'WATCHDOG_CLEAR_DEAD_LINKS', 'WATCHDOG_ROUTE_QUESTIONS', 'COST_SYNC', 'COST_SYNC_SINCE')
+    'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'WATCHDOG_CLEAR_DEAD_LINKS', 'WATCHDOG_ROUTE_QUESTIONS',
+    'WATCHDOG_CI_RUNS', 'WATCHDOG_CI_RERUN_JOBS', 'WATCHDOG_CI_RERUN_MAX', 'WATCHDOG_DELIVER_ANSWERS', 'WATCHDOG_RETURN_ESCALATED_REVIEWS',
+    'WATCHDOG_CANCELLED_BLOCKERS', 'COST_SYNC', 'COST_SYNC_SINCE')
 
   function Get-EnvText {
     $lines = @(
@@ -523,6 +525,12 @@ $network
   $s.WATCHDOG_RELEASE_HOLDS = Pick 'WATCHDOG_RELEASE_HOLDS' 'true'
   $s.WATCHDOG_CLEAR_DEAD_LINKS = Pick 'WATCHDOG_CLEAR_DEAD_LINKS' 'true'
   $s.WATCHDOG_ROUTE_QUESTIONS = Pick 'WATCHDOG_ROUTE_QUESTIONS' 'true'
+  $s.WATCHDOG_CI_RUNS = Pick 'WATCHDOG_CI_RUNS' 'true'
+  $s.WATCHDOG_CI_RERUN_JOBS = Pick 'WATCHDOG_CI_RERUN_JOBS' ''
+  $s.WATCHDOG_CI_RERUN_MAX = Pick 'WATCHDOG_CI_RERUN_MAX' '2'
+  $s.WATCHDOG_DELIVER_ANSWERS = Pick 'WATCHDOG_DELIVER_ANSWERS' 'true'
+  $s.WATCHDOG_RETURN_ESCALATED_REVIEWS = Pick 'WATCHDOG_RETURN_ESCALATED_REVIEWS' 'false'
+  $s.WATCHDOG_CANCELLED_BLOCKERS = Pick 'WATCHDOG_CANCELLED_BLOCKERS' 'true'
   Say 'It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without'
   Say 'anything picking them up, and repairs blockers stuck on a failed workspace clean-up.'
   if (Confirm 'Turn the watchdog on?' (Truthy $s.WATCHDOG)) {
@@ -543,6 +551,20 @@ $network
     Say 'Paperclip never delivers a question card an agent addresses to a teammate who isn''t the issue''s'
     Say 'assignee: the card waits for good. `pch blocked` lists them either way.'
     $s.WATCHDOG_ROUTE_QUESTIONS = if (Confirm 'Give the teammate an issue that asks it to answer the card (closed once it''s answered)?' (Truthy $s.WATCHDOG_ROUTE_QUESTIONS)) { 'true' } else { 'false' }
+    Say 'An agent that waits on a CI run often stops, or its monitor gives up, before the run finishes.'
+    Say 'This uses the GitHub token (it needs "Actions: Read"); without a token it stays off.'
+    if (Confirm 'Tell the agent once the CI run it named has finished?' (Truthy $s.WATCHDOG_CI_RUNS)) {
+      $s.WATCHDOG_CI_RUNS = 'true'
+      Say 'Jobs you know to be flaky can be re-run before the agent is told (needs "Actions: Read and write").'
+      $s.WATCHDOG_CI_RERUN_JOBS = Ask 'Flaky job names, as a regular expression (empty: never re-run)' $s.WATCHDOG_CI_RERUN_JOBS
+    } else {
+      $s.WATCHDOG_CI_RUNS = 'false'
+    }
+    Say 'When you answer an agent''s card while its issue waits on your review, Paperclip wakes you, not the agent.'
+    $s.WATCHDOG_DELIVER_ANSWERS = if (Confirm 'Return such an issue to the agent with your answer (your "changes requested")?' (Truthy $s.WATCHDOG_DELIVER_ANSWERS)) { 'true' } else { 'false' }
+    Say 'After 3 agent change requests in a row, Paperclip hands a review to you instead of back to the implementer.'
+    $s.WATCHDOG_RETURN_ESCALATED_REVIEWS = if (Confirm "Return such reviews to the implementer (at most $($s.WATCHDOG_MAX_NUDGES) times per issue)?" (Truthy $s.WATCHDOG_RETURN_ESCALATED_REVIEWS)) { 'true' } else { 'false' }
+    $s.WATCHDOG_CANCELLED_BLOCKERS = if (Confirm 'Tell an agent when its issue is blocked by a cancelled issue (Paperclip never counts it resolved)?' (Truthy $s.WATCHDOG_CANCELLED_BLOCKERS)) { 'true' } else { 'false' }
   } else {
     $s.WATCHDOG = 'false'
   }
