@@ -71,19 +71,21 @@ export const UNINFORMATIVE = new Set(["cancelled", "skipped", "neutral", "action
 // A Paperclip monitor that will still wake the agent by itself: leave it to that.
 // Only a scheduled monitor fires. A triggered one has fired and waits for the
 // agent to schedule it again, and a cleared one is done, so neither wakes anyone
-// by itself. A scheduled one counts while its next check is ahead (or only just
-// due: Paperclip's scheduler fires it within seconds), before its timeout, and
-// while it has attempts left.
+// by itself. A scheduled one acts when its next check comes (or only just came:
+// Paperclip's scheduler looks every 30 seconds by default). Past its timeout or
+// out of attempts, it is cleared then instead of fired, and wakes the agent only
+// under the default recovery policy, wake_owner (issue_monitor_recovery); the
+// others tell the board instead. (dispatchClaimedIssueMonitor and
+// issueMonitorLimitClearReason, server/src/services/heartbeat/scheduling.ts)
 const MONITOR_GRACE_MS = 2 * 60_000;
 export function monitorPending(monitor, now) {
   if (monitor?.status !== "scheduled") return false;
   const next = ts(monitor.nextCheckAt);
   if (!next || next + MONITOR_GRACE_MS <= now) return false;
   const timeout = ts(monitor.timeoutAt);
-  if (timeout && timeout <= now) return false;
   const max = Number(monitor.maxAttempts);
-  if (max > 0 && Number(monitor.attemptCount ?? 0) >= max) return false;
-  return true;
+  const spent = Boolean(timeout && timeout <= next) || (max > 0 && Number(monitor.attemptCount ?? 0) + 1 > max);
+  return !spent || (monitor.recoveryPolicy ?? "wake_owner") === "wake_owner";
 }
 
 const FAILED = new Set(["failure", "timed_out", "startup_failure"]);

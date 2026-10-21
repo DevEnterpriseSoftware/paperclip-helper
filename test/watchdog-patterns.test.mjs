@@ -48,7 +48,7 @@ test("waitingText reads the agent's latest comment and its monitor's notes", () 
   assert.deepEqual(runRefs(waitingText([], "a1", { notes: "poll run 39496790108" })), [{ repo: null, id: "39496790108" }]);
 });
 
-test("a scheduled monitor still to fire is left to Paperclip; a timed-out, used-up or triggered one isn't", () => {
+test("a scheduled monitor still to act is left to Paperclip; a triggered, cleared or overdue one isn't", () => {
   const now = Date.now();
   const iso = (ms) => new Date(now + ms).toISOString();
   const scheduled = { status: "scheduled", nextCheckAt: iso(60_000), timeoutAt: iso(3_600_000), attemptCount: 3, maxAttempts: 12 };
@@ -56,8 +56,14 @@ test("a scheduled monitor still to fire is left to Paperclip; a timed-out, used-
   assert.equal(monitorPending({ ...scheduled, nextCheckAt: iso(-30_000) }, now), true, "just due: Paperclip fires it within seconds");
   assert.equal(monitorPending({ ...scheduled, nextCheckAt: iso(-10 * 60_000) }, now), false, "long overdue: it isn't firing");
   assert.equal(monitorPending({ ...scheduled, nextCheckAt: null }, now), false, "no next check");
-  assert.equal(monitorPending({ ...scheduled, timeoutAt: iso(-1000) }, now), false, "timed out");
-  assert.equal(monitorPending({ ...scheduled, attemptCount: 12 }, now), false, "attempts used up");
+  // Past its timeout or out of attempts, Paperclip clears it at its next check and,
+  // under the default recovery policy, wakes the agent: still pending. The other
+  // policies tell the board instead.
+  assert.equal(monitorPending({ ...scheduled, timeoutAt: iso(-1000) }, now), true, "timed out, wake_owner by default");
+  assert.equal(monitorPending({ ...scheduled, attemptCount: 12 }, now), true, "attempts used up, wake_owner by default");
+  assert.equal(monitorPending({ ...scheduled, timeoutAt: iso(-1000), recoveryPolicy: "escalate_to_board" }, now), false);
+  assert.equal(monitorPending({ ...scheduled, attemptCount: 12, recoveryPolicy: "create_recovery_issue" }, now), false);
+  assert.equal(monitorPending({ ...scheduled, recoveryPolicy: "escalate_to_board" }, now), true, "within its limits it fires");
   // What a monitor looks like once it has fired: it waits for the agent to schedule it again.
   assert.equal(monitorPending({ status: "triggered", nextCheckAt: null, timeoutAt: iso(-60_000), attemptCount: 12, maxAttempts: 12 }, now), false);
   assert.equal(monitorPending({ status: "triggered", nextCheckAt: null, timeoutAt: iso(60_000), attemptCount: 1, maxAttempts: 12 }, now), false);
@@ -239,13 +245,14 @@ test("a wake that has waited longer than the stall window doesn't silence the re
   assert.equal(helperComments(env.db, issue).length, 1, "ten minutes on and still waiting: it may never start");
 });
 
-test("a deferred monitor wake that never started doesn't silence the report", async (t) => {
+test("a wake deferred behind an earlier run still holds the report: a comment would be deferred with it", async (t) => {
   const env = await watchdogEnv(t);
   const { carla, issue } = waitingOnCi(env, { finishedMin: 20 });
   // Requested after the agent's last run (so not stale), deferred ever since.
   env.db.wakes[issue.id] = [{ kind: "wake_request", agentId: carla.id, status: "deferred_issue_execution", reason: "issue_monitor_due", requestedAt: minutesAgo(55) }];
   await env.watchdog.tick();
-  assert.equal(helperComments(env.db, issue).length, 1);
+  assert.equal(helperComments(env.db, issue).length, 0);
+  assert.ok(env.logs.some((l) => l.reason === "a wake for the agent is waiting to start"));
 });
 
 test("why a finished run isn't reported is logged at debug level, once per run and reason", async (t) => {
@@ -264,6 +271,17 @@ test("why a finished run isn't reported is logged at debug level, once per run a
   env.later(10);
   await env.watchdog.tick();
   assert.deepEqual(quiet().map((l) => l.reason), ["finished less than the stall window ago", "the agent's Paperclip monitor will still fire"]);
+  // Back to an earlier reason, then the monitor again: each reason is logged once.
+  issue.executionState = null;
+  env.later(10);
+  env.db.wakes[issue.id] = [{ kind: "wake_request", agentId: issue.assigneeAgentId, status: "queued", requestedAt: new Date(env.clock.now).toISOString() }];
+  await env.watchdog.tick();
+  env.db.wakes[issue.id] = [];
+  issue.executionState = { monitor: { status: "scheduled", nextCheckAt: new Date(env.clock.now + 3_600_000).toISOString() } };
+  env.later(10);
+  await env.watchdog.tick();
+  assert.equal(quiet().length, 3);
+  assert.equal(quiet()[2].reason, "a wake for the agent is waiting to start");
   assert.equal(helperComments(env.db, issue).length, 0);
 });
 
