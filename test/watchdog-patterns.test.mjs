@@ -57,6 +57,14 @@ test("a scheduled monitor still to fire is left to Paperclip; a timed-out or tri
   assert.equal(monitorPending(null, now), false);
 });
 
+test("a dispatched run that ends without a verdict says so, not that something broke", () => {
+  const run = { id: 7, name: "verify", head_branch: "main", conclusion: "cancelled", updated_at: "2026-10-21T01:44:00Z" };
+  const text = ciMessage({ run, jobs: [] });
+  assert.match(text, /\*\*cancelled\*\*/);
+  assert.match(text, /gave no verdict/);
+  assert.doesNotMatch(text, /fix what your change broke/);
+});
+
 test("only runs whose failed jobs are all known flaky are re-run", () => {
   const p = /windows/i;
   const job = (name, conclusion) => ({ name, conclusion });

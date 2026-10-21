@@ -1183,7 +1183,12 @@ export function createWatchdog(ctx, state, deps = {}) {
     } catch (err) {
       if (!ciRepoWarned.has(repo)) {
         ciRepoWarned.add(repo);
-        log.warn("watchdog: couldn't read a repository's default branch; runs dispatched there wait until GitHub answers", { repo, error: err.message });
+        log.warn(
+          cached
+            ? "watchdog: couldn't read a repository's default branch; using the one read earlier"
+            : "watchdog: couldn't read a repository's default branch; runs dispatched there wait until GitHub answers",
+          { repo, error: err.message, ...(cached ? { defaultBranch: cached.branch } : {}) },
+        );
       }
       return cached ? cached.branch : undefined;
     }

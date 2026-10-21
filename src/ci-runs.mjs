@@ -86,6 +86,7 @@ export function ciMessage({ run, jobs, reruns = 0 }) {
     .filter(Boolean)
     .join(" at ");
   const conclusion = run.conclusion ?? "finished";
+  const noVerdict = UNINFORMATIVE.has(conclusion);
   const lines = [
     `the CI run you were waiting on has finished, and you haven't run on this issue since: ${label}${where ? ` on ${where}` : ""} ` +
       `finished ${new Date(ts(run.updated_at)).toISOString().replace(/\.\d+Z$/, "Z")} with **${conclusion}**. ${run.html_url ?? ""}`.trim(),
@@ -100,7 +101,9 @@ export function ciMessage({ run, jobs, reruns = 0 }) {
     "",
     conclusion === "success"
       ? "Please continue from where you were waiting on it (resubmit, or carry on with the next step)."
-      : "Please look at the failed jobs and continue: fix what your change broke, or say why it isn't yours.",
+      : noVerdict
+        ? "It gave no verdict on the change. If you still need one, start it again (or a new run), and say which run you wait on; otherwise continue."
+        : "Please look at the failed jobs and continue: fix what your change broke, or say why it isn't yours.",
   );
   return lines.join("\n");
 }
