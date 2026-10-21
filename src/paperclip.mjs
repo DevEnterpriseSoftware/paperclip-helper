@@ -60,7 +60,8 @@ export function createPaperclip({ config, readToken = () => "", log, fetchImpl =
     return new PaperclipError(`${method} ${apiPath} → ${status}: ${detail}`, { status, method, path: apiPath });
   }
 
-  async function request(method, apiPath, body, { token, retry = true } = {}) {
+  async function request(method, apiPath, body, { token, retry = true, timeoutMs: requestTimeoutMs } = {}) {
+    const limitMs = requestTimeoutMs ?? timeoutMs;
     const bearer = token === undefined ? readToken() : token;
     const shown = shownPath(apiPath);
     const idempotent = method === "GET" || method === "HEAD";
@@ -76,7 +77,7 @@ export function createPaperclip({ config, readToken = () => "", log, fetchImpl =
           method,
           headers,
           body: body === undefined ? undefined : JSON.stringify(body),
-          signal: AbortSignal.timeout(timeoutMs),
+          signal: AbortSignal.timeout(limitMs),
         });
         text = await res.text();
       } catch (err) {
@@ -88,7 +89,7 @@ export function createPaperclip({ config, readToken = () => "", log, fetchImpl =
         }
         const hint =
           code === "timeout"
-            ? `no answer within ${config.timeoutSec}s`
+            ? `no answer within ${Math.round(limitMs / 1000)}s`
             : `${code}; check PAPERCLIP_API and that Paperclip is running. From a container, 127.0.0.1 is the host only with network_mode: host`;
         const error = new PaperclipError(`cannot reach Paperclip at ${base} for ${method} ${shown} (${hint})`, {
           code: code === "timeout" ? "timeout" : "network",

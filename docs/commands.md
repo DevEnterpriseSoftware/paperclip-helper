@@ -13,6 +13,7 @@
 | `pch comment ISSUE text` | Comments as you, which wakes the assignee. |
 | `pch release ISSUE [--apply] [--outcome=…]` | Releases an execution hold whose run can't prove it stopped, so messages and Interrupt stay saved behind it. It previews unless you pass `--apply`. See [`release`](#release-a-hold-messages-cant-clear). |
 | `pch workspace ISSUE [--apply]` | Gives an issue linked to a closed workspace, or to another issue's live one, a new isolated workspace. It previews unless you pass `--apply`. See [`workspace`](#workspace-an-issue-linked-to-the-wrong-workspace). |
+| `pch worktrees [--apply]` | Closes the execution workspaces of finished issues, so Paperclip removes their git worktrees from disk. It previews unless you pass `--apply`. See [`worktrees`](#worktrees-finished-issues-worktrees-still-on-disk). |
 | `pch costs` | Previews what cost sync would post, and what it does to budgets. |
 | `pch costs --sessions` | Checks whether resumed sessions report cumulative costs (see [Compatibility](../README.md#compatibility)). |
 | `pch models` | Every agent's adapter, model, effort and status. |
@@ -138,6 +139,51 @@ Paperclip only accepts this change while **Instance settings → Experimental �
 [The watchdog](watchdog.md#8-issues-linked-to-a-closed-workspace) clears links to a closed workspace by itself (`WATCHDOG_CLEAR_DEAD_LINKS`). Use the command for a link to another issue's live workspace, or to clear one without waiting.
 
 `pch why` recommends this command when the issue is linked to a closed workspace, or when its assignee's last run failed restoring one. It also recommends it when an agent has blocked the issue with a note about its workspace or branch while it is linked to another issue's live workspace.
+
+## `worktrees`: finished issues' worktrees still on disk
+
+Each issue with an isolated workspace gets its own git worktree, and every one carries its own build output: a few hundred MB each for a .NET or Node project, more for one that builds a desktop app. Paperclip removes a worktree when its workspace is closed. Its reaper closes the workspaces of finished issues by itself, but only when all of these hold:
+
+- the issue, and every issue under it, is done or cancelled;
+- the worktree has no uncommitted changes, untracked files included;
+- Paperclip can prove the branch was delivered: a merged PR it can read through its own GitHub connection, or the branch's commits on the base branch. A squash merge leaves different commits on the base branch, so it proves nothing without the PR;
+- the issue finished at least `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS` ago (7 by default).
+
+Miss any one and the worktree stays. On a busy instance they pile up into hundreds of worktrees and tens of GB, inside a WSL or VM disk that doesn't shrink by itself.
+
+`pch worktrees` lists the open workspaces of issues finished at least a day ago (`--min-days=N` to change that), with what Paperclip's own close check (`close-readiness`) says about each:
+
+```text
+$ pch worktrees
+ACM: 231 open workspaces, 198 of them for issues finished 1+ days ago
+  Paperclip can close 171 and remove their worktrees:
+    ACM-296    done       14d  ACM-296-fody-weavers-compile-assets-only
+    ACM-326    cancelled  13d  ACM-326-regenerate-wirecontract
+    …
+  4 may hold work that isn't on GitHub. Look at these yourself:
+    ACM-51     done       14d  2 modified tracked files  ACM-51-module-settings-one-credential-key-rule
+    ACM-241    done       11d  2 commits not on master  ACM-241-protected-build-renames-nothing
+    …
+  Paperclip won't close 23:
+    ACM-305    done        6d  This workspace is still linked to an open issue.  ACM-305-…
+  Left alone: 31 of open issues, 2 of issues finished in the last day.
+
+--apply closes these 171 workspaces, as their Close button does: …
+  pch worktrees --apply
+```
+
+`--apply` closes the first group one at a time, as the workspace's **Close** button does (`PATCH /api/execution-workspaces/:id` with `status: "archived"`). Paperclip stops the workspace's runtime services, runs the project's clean-up and teardown commands, removes the worktree (`git worktree remove --force`, so untracked build output goes with it) and deletes the branch it created if that branch is merged. The issue, its history and the branch on GitHub stay. A workspace whose clean-up failed earlier (`cleanup_failed`) is closed again, which retries the clean-up. When a clean-up fails, the command prints the end of its output.
+
+What it leaves alone:
+
+- **Workspaces of open issues**, and of issues finished less than `--min-days` ago (default 1), in case one is reopened.
+- **Modified tracked files.** Always: commit or discard them yourself.
+- **Untracked files** (anything git doesn't ignore: scratch clones, new files nobody committed) unless you pass `--include-untracked`. Ignored build output (`bin/`, `obj/`, `node_modules/`) doesn't count.
+- **Commits not on the base branch** unless you pass `--include-unmerged`. A squash-merged branch looks like this; if its PR is merged, its commits are on GitHub and closing loses nothing.
+- **What Paperclip refuses**: a workspace another open issue is still linked to, or one whose git state it can't read (its folder may already be gone).
+- **An issue a run still holds.**
+
+The helper changes nothing on disk itself; Paperclip does the removal and records each step in the workspace's operations. To have Paperclip's reaper keep up by itself, shorten its cooldown with `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS` in Paperclip's environment. Reclaiming the freed space from a WSL or VM disk is a separate step (on WSL: `fstrim`, then compact the `.vhdx`).
 
 ## Debugging with an LLM
 

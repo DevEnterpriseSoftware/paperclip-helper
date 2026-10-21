@@ -34,7 +34,8 @@ export function emptyDb() {
     blockerDiagnostics: {}, // issueId → { readiness, blockers }
     workProducts: {}, // issueId → [...]
     workspaceOps: {}, // workspaceId → [...]
-    executionWorkspaces: [], // { id, companyId, sourceIssueId, mode, status, branchName, closedAt }
+    executionWorkspaces: [], // { id, companyId, sourceIssueId, mode, status, branchName, closedAt, readiness?, closeFails? }
+    workspaceCloses: [], // ids of workspaces closed through PATCH /api/execution-workspaces/:id
     experimental: { enableIsolatedWorkspaces: true }, // GET /api/instance/settings/experimental
     heartbeatRuns: [], // { id, companyId, agentId, status, finishedAt, usageJson, contextSnapshot, createdAt, resultJson }
     runEvents: {}, // runId → [{ seq, eventType, payload }], oldest first
@@ -323,6 +324,56 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     if (p === "/api/instance/settings/experimental" && req.method === "GET") {
       if (db.experimental === null) return send(404, { error: "Not found" });
       return send(200, db.experimental);
+    }
+    if ((m = p.match(/^\/api\/companies\/([^/]+)\/execution-workspaces$/)) && req.method === "GET") {
+      // Like Paperclip (services/execution-workspaces.ts list): status is a comma-separated filter.
+      let list = db.executionWorkspaces.filter((w) => w.companyId === m[1]);
+      if (q.get("status")) {
+        const statuses = q.get("status").split(",");
+        list = list.filter((w) => statuses.includes(w.status));
+      }
+      return send(200, list.map(({ readiness, closeFails, ...w }) => w));
+    }
+    if ((m = p.match(/^\/api\/execution-workspaces\/([^/]+)\/close-readiness$/)) && req.method === "GET") {
+      const ws = db.executionWorkspaces.find((w) => w.id === m[1]);
+      if (!ws) return send(404, { error: "Execution workspace not found" });
+      // Like Paperclip's getCloseReadiness: open issues linked to it block the close.
+      const linked = db.issues.filter((i) => i.executionWorkspaceId === ws.id);
+      const open = linked.filter((i) => !["done", "cancelled"].includes(i.status));
+      const r = {
+        workspaceId: ws.id,
+        deliveryState: "unknown",
+        blockingReasons: open.length ? [open.length === 1 ? "This workspace is still linked to an open issue." : `This workspace is still linked to ${open.length} open issues.`] : [],
+        warnings: [],
+        linkedIssues: linked.map((i) => ({ id: i.id, identifier: i.identifier, status: i.status })),
+        isSharedWorkspace: ws.mode === "shared_workspace",
+        isProjectPrimaryWorkspace: false,
+        ...ws.readiness,
+        git: { baseRef: "master", hasDirtyTrackedFiles: false, hasUntrackedFiles: false, dirtyEntryCount: 0, untrackedEntryCount: 0, aheadCount: 0, behindCount: 0, isMergedIntoBase: true, createdByRuntime: true, ...ws.readiness?.git },
+      };
+      r.state = r.blockingReasons.length ? "blocked" : "ready";
+      return send(200, r);
+    }
+    if ((m = p.match(/^\/api\/execution-workspaces\/([^/]+)$/)) && req.method === "PATCH") {
+      const ws = db.executionWorkspaces.find((w) => w.id === m[1]);
+      if (!ws) return send(404, { error: "Execution workspace not found" });
+      if (body.status === "archived" && ws.status !== "archived") {
+        const open = db.issues.filter((i) => i.executionWorkspaceId === ws.id && !["done", "cancelled"].includes(i.status));
+        if (open.length) return send(409, { error: "This workspace is still linked to an open issue." });
+        db.workspaceCloses.push(ws.id);
+        ws.closedAt = new Date().toISOString();
+        if (ws.closeFails) {
+          ws.status = "cleanup_failed";
+          ws.cleanupReason = ws.closeFails;
+          db.workspaceOps[ws.id] = [
+            { phase: "worktree_cleanup", status: "failed", exitCode: 128, startedAt: ws.closedAt, stderrExcerpt: `fatal: ${ws.closeFails}` },
+          ];
+        } else {
+          ws.status = "archived";
+        }
+      }
+      const { readiness, closeFails, ...rest } = ws;
+      return send(200, rest);
     }
     if ((m = p.match(/^\/api\/execution-workspaces\/([^/]+)$/)) && req.method === "GET") {
       // Like Paperclip's assertWorkspacePrivacy: one the key may not read is a 404 too.

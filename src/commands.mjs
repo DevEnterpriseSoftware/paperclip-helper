@@ -22,6 +22,7 @@ import {
   issuesLinkedTo,
   linkFacts,
 } from "./workspace.mjs";
+import { closeWorkspace, lastFailedOperation, plural, survey } from "./worktrees.mjs";
 
 export const USAGE = `Paperclip Helper
 
@@ -37,6 +38,9 @@ export const USAGE = `Paperclip Helper
                                release an execution hold whose run can't prove it stopped (preview without --apply)
   pch workspace ISSUE [--apply]  give an issue linked to a closed (or another issue's) workspace its own new one
                                (preview without --apply; with a closed workspace, also the other open issues linked to it)
+  pch worktrees [--apply] [--min-days=N] [--include-untracked] [--include-unmerged]
+                               close the workspaces of finished issues so Paperclip removes their worktrees
+                               (preview without --apply; issues finished at least N days ago, default 1)
   pch costs                    preview what cost sync would post (changes nothing)
   pch costs --sessions         check whether resumed sessions report cumulative costs
   pch models                   every agent's adapter, model and effort
@@ -525,6 +529,110 @@ export async function workspace(ctx, identifier, flags = []) {
     `  pch comment ${identifier} "${who ? `${who}, the` : "The"} workspace is fixed: you have a new isolated workspace. ` +
       `Please continue this issue."`,
   );
+}
+
+// ---------------------------------------------------------------- worktrees
+
+const WORKTREE_FLAGS = ["--apply", "--include-untracked", "--include-unmerged"];
+
+// Workspaces of finished issues still on disk (see worktrees.mjs). Lists what
+// Paperclip would remove, what it would throw away work for, and what it
+// refuses; --apply closes the first group one by one, as the Close button does.
+export async function worktrees(ctx, flags = []) {
+  const { api } = ctx;
+  const unknown = flags.filter((f) => !WORKTREE_FLAGS.includes(f) && !f.startsWith("--min-days="));
+  if (unknown.length) {
+    throw new Error(`unknown option ${unknown[0]}. usage: worktrees [--apply] [--min-days=N] [--include-untracked] [--include-unmerged]`);
+  }
+  const apply = flags.includes("--apply");
+  const minFlag = flags.find((f) => f.startsWith("--min-days="));
+  const minDays = minFlag ? Number(minFlag.slice("--min-days=".length)) : 1;
+  if (!Number.isFinite(minDays) || minDays < 0) throw new Error("--min-days must be a number of days, 0 or more");
+  const opts = { includeUntracked: flags.includes("--include-untracked"), includeUnmerged: flags.includes("--include-unmerged") };
+
+  const me = await ctx.identity();
+  const now = ctx.now();
+  const label = (i) => i.identifier ?? String(i.id).slice(0, 8);
+  const row = (r, note) => {
+    const days = r.days === null ? "   ?" : `${Math.floor(r.days)}d`.padStart(4);
+    const branch = r.ws.branchName ?? r.ws.name ?? r.ws.id.slice(0, 8);
+    return `    ${label(r.issue).padEnd(10)} ${r.issue.status.padEnd(9)} ${days}  ${note ? `${note}  ` : ""}${branch.length > 70 ? `${branch.slice(0, 69)}…` : branch}`;
+  };
+  const toClose = [];
+  let reviewCount = 0;
+
+  for (const companyId of me.companyIds ?? []) {
+    const company = await api.request("GET", `/api/companies/${companyId}`).catch(() => ({}));
+    const name = company.issuePrefix ?? company.name ?? companyId;
+    const { counts, results } = await survey(api, companyId, { now, minDays, flags: opts });
+    if (!counts.workspaces) {
+      out(`${name}: no open workspaces.`);
+      continue;
+    }
+    const close = results.filter((r) => r.action === "close");
+    const review = results.filter((r) => r.action === "review");
+    const skip = results.filter((r) => r.action === "skip");
+    out(`${name}: ${plural(counts.workspaces, "open workspace")}, ${results.length} of them for issues finished ${minDays ? `${minDays}+ days ago` : "at any time"}`);
+    if (close.length) {
+      out(`  Paperclip can close ${close.length} and remove their worktrees:`);
+      for (const r of close) out(row(r, r.reasons.length ? `(${r.reasons.join(", ")})` : ""));
+    }
+    if (review.length) {
+      out(`  ${review.length} may hold work that isn't on GitHub. Look at these yourself:`);
+      for (const r of review) out(row(r, r.reasons.join(", ")));
+    }
+    if (skip.length) {
+      out(`  Paperclip won't close ${skip.length}:`);
+      for (const r of skip) out(row(r, r.reasons[0]));
+    }
+    const notLooked = [
+      counts.open && `${counts.open} of open issues`,
+      counts.recent && `${counts.recent} of issues finished in the last ${minDays === 1 ? "day" : `${minDays} days`}`,
+      counts.noIssue && `${counts.noIssue} with no source issue`,
+    ].filter(Boolean);
+    if (notLooked.length) out(`  Left alone: ${notLooked.join(", ")}.`);
+    toClose.push(...close);
+    reviewCount += review.length;
+  }
+
+  if (!toClose.length) {
+    out("");
+    out("Nothing to close.");
+    return;
+  }
+  if (!apply) {
+    out("");
+    out(`--apply closes these ${plural(toClose.length, "workspace")}, as their Close button does: Paperclip stops their runtime services,`);
+    out("removes the git worktrees (untracked build output with them) and deletes the branches it created once they're merged.");
+    out("Issues and their history stay. Reopening an issue later gives it a new workspace.");
+    if (reviewCount && !opts.includeUntracked) out("--include-untracked also closes those with only untracked files; --include-unmerged those with commits not on the base branch.");
+    out(`  pch worktrees --apply${flags.filter((f) => f !== "--apply").map((f) => ` ${f}`).join("")}`);
+    return;
+  }
+
+  out("");
+  let closed = 0;
+  const failed = [];
+  for (const r of toClose) {
+    try {
+      const result = await closeWorkspace(api, r.ws);
+      if (result.ok) {
+        closed += 1;
+        out(`${label(r.issue)}: closed${result.cleanupReason ? ` (${excerpt(result.cleanupReason, 160)})` : ""}`);
+      } else {
+        failed.push(r);
+        out(`${label(r.issue)}: ${result.status}${result.cleanupReason ? `: ${excerpt(result.cleanupReason, 200)}` : ""}`);
+        const op = await lastFailedOperation(api, r.ws.id);
+        for (const line of op) out(`  | ${line}`);
+      }
+    } catch (err) {
+      failed.push(r);
+      out(`${label(r.issue)}: not closed: ${err.message}`);
+    }
+  }
+  out("");
+  out(`Closed ${plural(closed, "workspace")}.${failed.length ? ` ${failed.length} didn't close cleanly; their worktrees may still be on disk.` : ""}`);
+  if (failed.length) process.exitCode = 1;
 }
 
 // ---------------------------------------------------------------- decisions

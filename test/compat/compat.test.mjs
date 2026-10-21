@@ -69,9 +69,13 @@ const HELPER_ENDPOINTS = [
   ["GET", "/api/issues/{id}/diagnostics/wakes"],
   ["GET", "/api/issues/{id}/diagnostics/blockers"],
   ["GET", "/api/issues/{id}/queued-comments"],
+  ["GET", "/api/issues/{id}/interactions"],
   ["POST", "/api/issues/{id}/queued-comments/interrupt"],
   ["GET", "/api/execution-workspaces/{id}/workspace-operations"],
   ["GET", "/api/execution-workspaces/{id}"],
+  ["GET", "/api/companies/{companyId}/execution-workspaces"],
+  ["GET", "/api/execution-workspaces/{id}/close-readiness"],
+  ["PATCH", "/api/execution-workspaces/{id}"],
   ["GET", "/api/instance/settings/experimental"],
 ];
 const templateRegex = (template) => new RegExp(`^${template.replace(/\{[^}]+\}/g, "[^/]+")}$`);
@@ -350,6 +354,12 @@ if (!BASE) {
       assert.deepEqual(await s.ctx.api.request("GET", `/api/issues/${dependent.id}/work-products`), []);
       const unknown = await board("GET", "/api/execution-workspaces/00000000-0000-4000-8000-000000000001/workspace-operations");
       assert.equal(unknown.status, 404, "an unknown execution workspace is a 404, which the helper treats as no operations");
+      // What `pch worktrees` reads: the company's open workspaces (status is a comma-separated filter).
+      const open = await s.ctx.api.request("GET", `/api/companies/${full.companyId}/execution-workspaces?status=active,idle,in_review,cleanup_failed`);
+      assert.ok(Array.isArray(open), "execution workspaces are listed");
+      for (const w of open) hasKeys(w, ["id", "status", "sourceIssueId", "branchName", "cwd"], "an execution workspace");
+      const noReadiness = await board("GET", "/api/execution-workspaces/00000000-0000-4000-8000-000000000001/close-readiness");
+      assert.equal(noReadiness.status, 404, "close-readiness of an unknown workspace is a 404");
     });
 
     test("a board comment wakes the assignee, and runs and wakes read as expected", async () => {
