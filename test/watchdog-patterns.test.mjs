@@ -252,6 +252,39 @@ test("runs not dispatched on the default branch keep the head-moved, re-run and 
   }
 });
 
+test("the default branch is read once per repository; while GitHub won't say, a dispatched run waits, never re-run", async (t) => {
+  const env = await watchdogEnv(t, { WATCHDOG_CI_RERUN_JOBS: "windows|^ci-gate$" });
+  const { issue, run } = waitingOnCi(env, { conclusion: "failure" });
+  Object.assign(run, { event: "workflow_dispatch", head_branch: "main", pull_requests: [] });
+  env.gh.branches["org/app"] = { main: { commit: { sha: run.head_sha } } };
+  env.gh.fail["GET repo"] = 403;
+  const repoReads = () => env.gh.requests.filter((r) => r.method === "GET" && r.path === "/repos/org/app").length;
+  const warned = () => env.logs.filter((l) => l.level === "warn" && /default branch/.test(l.msg));
+
+  await env.watchdog.tick();
+  env.later(10);
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 0, "not reported while the default branch is unknown");
+  assert.equal(env.gh.reruns.length, 0, "and never re-run meanwhile");
+  assert.equal(warned().length, 1, "warned once, not every scan");
+  assert.match(warned()[0].error, /Metadata: read/);
+
+  delete env.gh.fail["GET repo"];
+  env.gh.repos["org/app"] = { default_branch: "main" };
+  env.later(10);
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 1, "reported once GitHub answers");
+  assert.equal(env.gh.reruns.length, 0);
+  const reads = repoReads();
+
+  // A second attempt finishing within the hour uses the branch already read.
+  Object.assign(run, { run_attempt: 2, updated_at: new Date(env.clock.now).toISOString() });
+  env.later(10);
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 2);
+  assert.equal(repoReads(), reads, "the default branch is kept for the hour");
+});
+
 test("known flaky jobs are re-run first, then the passing attempt is reported", async (t) => {
   const env = await watchdogEnv(t, { WATCHDOG_CI_RERUN_JOBS: "\\(windows\\)|^ci-gate$" });
   const { issue, run } = waitingOnCi(env, { conclusion: "failure" });

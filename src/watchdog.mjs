@@ -187,6 +187,7 @@ const record = {
 // any of these. Only those touched in the last few days: an older wait is stale.
 const CI_STATUSES = "todo,in_progress,in_review,blocked";
 const CI_LOOKBACK_MS = 3 * 24 * 60 * 60_000;
+const DEFAULT_BRANCH_TTL_MS = 60 * 60_000; // a renamed default branch is picked up within the hour
 // Issues waiting on your review (12, 13) are looked at once per stall window.
 const BOARD_STATUSES = "in_review";
 // How long after you answer an agent's card the watchdog waits before returning
@@ -210,6 +211,8 @@ export function createWatchdog(ctx, state, deps = {}) {
   const ciRuns = new Map(); // "repo#id" → finished run (with jobs), for one scan: a run can be re-run at any time
   const ciRepoOf = new Map(); // bare run id → the repository it was found in
   const ciMissing = new Set(); // "repo#id" (repo "*" for a bare id) found in none of GITHUB_REPOS
+  const ciDefaultBranch = new Map(); // repo → { branch, at }: its default branch as GitHub last said
+  const ciRepoWarned = new Set(); // repos whose default branch GitHub didn't give, warned once until it does
   const hasGitHubToken = Boolean(config.githubToken || config.githubTokenFile);
   const github = deps.github ?? (hasGitHubToken ? createGitHub({ config, log }) : null);
   const rerunPattern = (() => {
@@ -1165,6 +1168,27 @@ export function createWatchdog(ctx, state, deps = {}) {
     return { state: "missing" };
   }
 
+  // The repository's default branch, read from GitHub (never assumed) and kept
+  // for an hour. When GitHub doesn't answer, the last answer if there is one,
+  // else undefined: the caller waits for the next scan rather than guess. The
+  // failure is logged once per repository until GitHub answers again.
+  async function defaultBranch(repo) {
+    const cached = ciDefaultBranch.get(repo);
+    if (cached && now() - cached.at < DEFAULT_BRANCH_TTL_MS) return cached.branch;
+    try {
+      const branch = (await github.repository(repo))?.default_branch ?? null;
+      ciDefaultBranch.set(repo, { branch, at: now() });
+      ciRepoWarned.delete(repo);
+      return branch;
+    } catch (err) {
+      if (!ciRepoWarned.has(repo)) {
+        ciRepoWarned.add(repo);
+        log.warn("watchdog: couldn't read a repository's default branch; runs dispatched there wait until GitHub answers", { repo, error: err.message });
+      }
+      return cached ? cached.branch : undefined;
+    }
+  }
+
   // Has the run's branch moved on since? Its PR's head, or else the branch's.
   // null when GitHub can't tell (a fork's branch, a deleted branch).
   async function headMoved(repo, run) {
@@ -1258,11 +1282,16 @@ export function createWatchdog(ctx, state, deps = {}) {
     const { run } = found;
     const key = record.ciRun(issue, run);
     if ((records.get(key)?.count ?? 0) > 0 || dryRunSeen.has(key)) return; // reported (a paused task leaves a count of 0)
-    // A dispatch is a requested verdict, even after another merge. If repository
-    // metadata cannot be read, let the check retry later without re-running it.
-    const dispatchedOnDefault =
-      run.event === "workflow_dispatch" && Boolean(run.head_branch) &&
-      run.head_branch === (await github.repository(found.repo)).default_branch;
+    // A run dispatched on the default branch is a verdict the agent asked for: it
+    // is reported on any conclusion, never re-run, and still counts once the
+    // branch has moved on. Only dispatched runs ask GitHub for the default branch;
+    // while GitHub doesn't say, such a run waits for the next scan, never re-run.
+    let dispatchedOnDefault = false;
+    if (run.event === "workflow_dispatch" && run.head_branch) {
+      const branch = await defaultBranch(found.repo);
+      if (branch === undefined) return;
+      dispatchedOnDefault = run.head_branch === branch;
+    }
     if (!dispatchedOnDefault && UNINFORMATIVE.has(run.conclusion)) return; // cancelled by a newer push, skipped, waiting on approval
     const finishedAt = ts(run.updated_at);
     // Give the agent's own monitor, or the agent, the stall window to notice.

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Watchdog: default-branch dispatches always report their verdict.** A `workflow_dispatch` run on the repository's default branch, read from GitHub, is never automatically re-run or silenced after the branch moves on. Every conclusion, including `cancelled`, wakes the waiting agent through the usual CI-run check. Push, pull-request and other-branch dispatch runs keep their existing rules.
+- **Watchdog: default-branch dispatches always report their verdict.** A `workflow_dispatch` run on the repository's default branch, read from GitHub, is never automatically re-run or silenced after the branch moves on. Every conclusion, including `cancelled`, wakes the waiting agent through the usual CI-run check. Push, pull-request and other-branch dispatch runs keep their existing rules. The default branch is read once an hour per repository; while GitHub won't say, such a run waits for the next scan (never re-run meanwhile) and the log says why once.
 
 ## 1.8.1
 

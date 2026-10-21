@@ -80,7 +80,7 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
     }
     if (res.status === 403 || res.status === 404) {
       const need = method === "GET" ? "read" : "read and write";
-      const scope = /\/actions\//.test(path) ? "Actions" : "Pull requests";
+      const scope = /\/actions\//.test(path) ? "Actions" : /^\/repos\/[^/]+\/[^/]+$/.test(path) ? "Metadata" : "Pull requests";
       return new GitHubError(
         `${method} ${path} → ${res.status}: ${detail}. ${source} needs "${scope}: ${need}" on this repository.`,
         meta,
