@@ -93,7 +93,10 @@
 //    agent hasn't run on the issue since, the watchdog comments with the result,
 //    which wakes it. With WATCHDOG_CI_RERUN_JOBS set, a run whose failed jobs all
 //    match that pattern (known flaky jobs) is re-run first, up to
-//    WATCHDOG_CI_RERUN_MAX times, while it is still the PR's head.
+//    WATCHDOG_CI_RERUN_MAX times, while it is still the PR's head. Runs dispatched
+//    with workflow_dispatch on the repository's default branch (read from GitHub)
+//    are never re-run or silenced when the branch moves; every conclusion,
+//    including cancelled, is reported.
 //
 // 12. Answers that reach nobody (board-held.mjs). An agent asked you with a card
 //    and you answered it while the issue waited on your review, so Paperclip
@@ -1255,7 +1258,12 @@ export function createWatchdog(ctx, state, deps = {}) {
     const { run } = found;
     const key = record.ciRun(issue, run);
     if ((records.get(key)?.count ?? 0) > 0 || dryRunSeen.has(key)) return; // reported (a paused task leaves a count of 0)
-    if (UNINFORMATIVE.has(run.conclusion)) return; // cancelled by a newer push, skipped, waiting on approval
+    // A dispatch is a requested verdict, even after another merge. If repository
+    // metadata cannot be read, let the check retry later without re-running it.
+    const dispatchedOnDefault =
+      run.event === "workflow_dispatch" && Boolean(run.head_branch) &&
+      run.head_branch === (await github.repository(found.repo)).default_branch;
+    if (!dispatchedOnDefault && UNINFORMATIVE.has(run.conclusion)) return; // cancelled by a newer push, skipped, waiting on approval
     const finishedAt = ts(run.updated_at);
     // Give the agent's own monitor, or the agent, the stall window to notice.
     if (!finishedAt || now() - finishedAt < stallMs) return;
@@ -1270,9 +1278,9 @@ export function createWatchdog(ctx, state, deps = {}) {
     if (!full || full.assigneeAgentId !== assignee) return;
     if (monitorPending(full.executionState?.monitor, now())) return;
     if (await hasPendingWake(full, runs, agents)) return;
-    if (await rerunFlaky(found, issue)) return;
+    if (!dispatchedOnDefault && (await rerunFlaky(found, issue))) return;
     // Pushed since: that push's own run is what counts now.
-    if ((await headMoved(found.repo, run)) === true) return;
+    if (!dispatchedOnDefault && (await headMoved(found.repo, run)) === true) return;
     const reruns = records.get(record.ciRerun(found.repo, run))?.count ?? 0;
     const posted = await nudge(full, key, agent, ciMessage({ run, jobs: found.jobs, reruns }), {
       reason: "CI run finished",

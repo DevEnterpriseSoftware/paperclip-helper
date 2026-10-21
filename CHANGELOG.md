@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Watchdog: default-branch dispatches always report their verdict.** A `workflow_dispatch` run on the repository's default branch, read from GitHub, is never automatically re-run or silenced after the branch moves on. Every conclusion, including `cancelled`, wakes the waiting agent through the usual CI-run check. Push, pull-request and other-branch dispatch runs keep their existing rules.
+
 ## 1.8.1
 
 - **`pch worktrees`: squash-merged branches are closed.** A squash merge puts new commits on the base branch, so every squash-merged worktree showed "commits not on origin/master" and was left for you: on a real instance, 20 of 23. With `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE` set, the command now asks GitHub for the branch's PR; a merged PR with at least as many commits as the worktree is ahead holds them all, and the worktree is closed ("PR #41 merged"). A worktree with more commits than its PR is still left for you, with both counts.

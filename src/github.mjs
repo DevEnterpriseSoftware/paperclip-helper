@@ -150,6 +150,7 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
       return Array.isArray(data?.jobs) ? data.jobs : [];
     },
     rerunFailedJobs: (repo, id) => request("POST", `/repos/${repo}/actions/runs/${id}/rerun-failed-jobs`, {}),
+    repository: (repo) => request("GET", `/repos/${repo}`),
     // A branch's head commit (commit.sha), to tell whether a run is still its branch's latest.
     branch: (repo, name) => request("GET", `/repos/${repo}/branches/${encodeURIComponent(name)}`),
   };

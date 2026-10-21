@@ -188,6 +188,70 @@ test("without a GitHub token the check is off; a run outside GITHUB_REPOS is nev
   assert.ok(!env.gh.requests.some((r) => r.path.includes("elsewhere")));
 });
 
+test("a dispatched run on the default branch is reported, never re-run", async (t) => {
+  const env = await watchdogEnv(t, { WATCHDOG_CI_RERUN_JOBS: "windows|^ci-gate$" });
+  const { issue, run } = waitingOnCi(env, { conclusion: "failure" });
+  env.gh.repos["org/app"] = { default_branch: "trunk" };
+  Object.assign(run, { event: "workflow_dispatch", head_branch: "trunk", pull_requests: [] });
+  env.gh.branches["org/app"] = { trunk: { commit: { sha: run.head_sha } } };
+
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 1);
+  assert.match(helperComments(env.db, issue)[0].body, /\*\*failure\*\*/);
+  assert.equal(env.gh.reruns.length, 0);
+  assert.equal(env.watchdog.stats.ciReports, 1);
+  env.later(10);
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 1, "once per attempt");
+});
+
+test("a dispatched run on the default branch is reported after the branch moved on", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue, run } = waitingOnCi(env);
+  env.gh.repos["org/app"] = { default_branch: "release/default" };
+  Object.assign(run, { event: "workflow_dispatch", head_branch: "release/default", pull_requests: [] });
+  env.gh.branches["org/app"] = { "release/default": { commit: { sha: "newer000" } } };
+
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 1);
+  assert.match(helperComments(env.db, issue)[0].body, /\*\*success\*\*/);
+  assert.equal(env.gh.reruns.length, 0);
+});
+
+test("a cancelled dispatched run on the default branch is reported", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue, run } = waitingOnCi(env, { conclusion: "cancelled" });
+  env.gh.repos["org/app"] = { default_branch: "main" };
+  Object.assign(run, { event: "workflow_dispatch", head_branch: "main", pull_requests: [] });
+
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 1);
+  assert.match(helperComments(env.db, issue)[0].body, /\*\*cancelled\*\*/);
+  assert.equal(env.gh.reruns.length, 0);
+});
+
+test("runs not dispatched on the default branch keep the head-moved, re-run and cancelled rules", async (t) => {
+  for (const [event, branch] of [["push", "main"], ["pull_request", "change"], ["workflow_dispatch", "master"]]) {
+    await t.test(`${event} on ${branch}`, async (t) => {
+      for (const scenario of ["moved", "flaky", "cancelled"]) {
+        await t.test(scenario, async (t) => {
+          const env = await watchdogEnv(t, { WATCHDOG_CI_RERUN_JOBS: "windows|^ci-gate$" });
+          const { issue, run } = waitingOnCi(env, { conclusion: scenario === "cancelled" ? "cancelled" : "failure" });
+          env.gh.repos["org/app"] = { default_branch: "main" };
+          Object.assign(run, { event, head_branch: branch, pull_requests: event === "pull_request" ? [{ number: 188 }] : [] });
+          const sha = scenario === "moved" ? "newer000" : run.head_sha;
+          env.gh.branches["org/app"] = { [branch]: { commit: { sha } } };
+          env.gh.pulls["org/app"] = [{ number: 188, state: "open", head: { sha }, base: { ref: "main" } }];
+
+          await env.watchdog.tick();
+          assert.equal(helperComments(env.db, issue).length, 0);
+          assert.equal(env.gh.reruns.length, scenario === "flaky" ? 1 : 0);
+        });
+      }
+    });
+  }
+});
+
 test("known flaky jobs are re-run first, then the passing attempt is reported", async (t) => {
   const env = await watchdogEnv(t, { WATCHDOG_CI_RERUN_JOBS: "\\(windows\\)|^ci-gate$" });
   const { issue, run } = waitingOnCi(env, { conclusion: "failure" });
