@@ -560,11 +560,19 @@ export async function worktrees(ctx, flags = []) {
   };
   const toClose = [];
   let reviewCount = 0;
+  const hasGitHub = Boolean(ctx.config.githubToken || ctx.config.githubTokenFile);
+  const github = hasGitHub ? createGitHub({ config: ctx.config, log: ctx.log }) : null;
 
   for (const companyId of me.companyIds ?? []) {
     const company = await api.request("GET", `/api/companies/${companyId}`).catch(() => ({}));
     const name = company.issuePrefix ?? company.name ?? companyId;
-    const { counts, results } = await survey(api, companyId, { now, minDays, flags: opts });
+    const { counts, results, failedBefore, githubErrors } = await survey(api, companyId, {
+      now,
+      minDays,
+      flags: opts,
+      github,
+      repos: ctx.config.repos ?? [],
+    });
     if (!counts.workspaces) {
       out(`${name}: no open workspaces.`);
       continue;
@@ -572,7 +580,7 @@ export async function worktrees(ctx, flags = []) {
     const close = results.filter((r) => r.action === "close");
     const review = results.filter((r) => r.action === "review");
     const skip = results.filter((r) => r.action === "skip");
-    out(`${name}: ${plural(counts.workspaces, "open workspace")}, ${results.length} of them for issues finished ${minDays ? `${minDays}+ days ago` : "at any time"}`);
+    out(`${name}: ${plural(counts.workspaces, "open workspace")}, ${results.length} of them worktrees of issues finished ${minDays ? `${minDays}+ days ago` : "at any time"}`);
     if (close.length) {
       out(`  Paperclip can close ${close.length} and remove their worktrees:`);
       for (const r of close) out(row(r, r.reasons.length ? `(${r.reasons.join(", ")})` : ""));
@@ -585,12 +593,26 @@ export async function worktrees(ctx, flags = []) {
       out(`  Paperclip won't close ${skip.length}:`);
       for (const r of skip) out(row(r, r.reasons[0]));
     }
+    if (failedBefore.length) {
+      out(`  ${failedBefore.length} were closed before, but their clean-up failed. Paperclip treats them as closed and won't retry;`);
+      out("  if a folder below still exists, remove it with `git worktree remove --force <folder>` from the project's checkout:");
+      for (const f of failedBefore) {
+        const who = f.issue ? label(f.issue).padEnd(10) : "?".padEnd(10);
+        out(`    ${who} ${f.ws.cwd ?? f.ws.providerRef ?? f.ws.branchName ?? f.ws.id}`);
+        if (f.ws.cleanupReason) out(`               ${excerpt(f.ws.cleanupReason, 160)}`);
+      }
+    }
     const notLooked = [
       counts.open && `${counts.open} of open issues`,
       counts.recent && `${counts.recent} of issues finished in the last ${minDays === 1 ? "day" : `${minDays} days`}`,
+      counts.shared && `${counts.shared} sessions on the project's shared checkout (nothing to free)`,
       counts.noIssue && `${counts.noIssue} with no source issue`,
     ].filter(Boolean);
     if (notLooked.length) out(`  Left alone: ${notLooked.join(", ")}.`);
+    if (!hasGitHub && review.some((r) => r.reasons.some((x) => / not on /.test(x)))) {
+      out("  Without GITHUB_TOKEN or GITHUB_TOKEN_FILE, a squash-merged branch looks unmerged: set one to have merged PRs checked.");
+    }
+    for (const e of githubErrors) out(`  GitHub: ${e}`);
     toClose.push(...close);
     reviewCount += review.length;
   }
@@ -605,7 +627,9 @@ export async function worktrees(ctx, flags = []) {
     out(`--apply closes these ${plural(toClose.length, "workspace")}, as their Close button does: Paperclip stops their runtime services,`);
     out("removes the git worktrees (untracked build output with them) and deletes the branches it created once they're merged.");
     out("Issues and their history stay. Reopening an issue later gives it a new workspace.");
-    if (reviewCount && !opts.includeUntracked) out("--include-untracked also closes those with only untracked files; --include-unmerged those with commits not on the base branch.");
+    if (reviewCount && !(opts.includeUntracked && opts.includeUnmerged)) {
+      out("--include-untracked also closes those with untracked files; --include-unmerged those with commits that aren't merged. Modified files are never closed.");
+    }
     out(`  pch worktrees --apply${flags.filter((f) => f !== "--apply").map((f) => ` ${f}`).join("")}`);
     return;
   }
@@ -616,7 +640,9 @@ export async function worktrees(ctx, flags = []) {
   for (const r of toClose) {
     try {
       const result = await closeWorkspace(api, r.ws);
-      if (result.ok) {
+      if (result.alreadyClosed) {
+        out(`${label(r.issue)}: already closed (${result.status})${result.cleanupReason ? `: ${excerpt(result.cleanupReason, 160)}` : ""}`);
+      } else if (result.ok) {
         closed += 1;
         out(`${label(r.issue)}: closed${result.cleanupReason ? ` (${excerpt(result.cleanupReason, 160)})` : ""}`);
       } else {

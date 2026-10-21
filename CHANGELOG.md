@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.8.1
+
+- **`pch worktrees`: squash-merged branches are closed.** A squash merge puts new commits on the base branch, so every squash-merged worktree showed "commits not on origin/master" and was left for you: on a real instance, 20 of 23. With `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE` set, the command now asks GitHub for the branch's PR; a merged PR with at least as many commits as the worktree is ahead holds them all, and the worktree is closed ("PR #41 merged"). A worktree with more commits than its PR is still left for you, with both counts.
+- **`pch worktrees`: a workspace whose clean-up failed is listed, not closed.** Paperclip counts `cleanup_failed` as closed and answers 404 to closing it again, so `--apply` reported "not closed … 404" for them. They're now listed apart, with their folder and why the clean-up failed, so you can remove a folder that's still there.
+- **`pch worktrees`: sessions on the project's shared checkout are counted, not listed.** Closing one frees nothing; they filled the list one line per session.
+- **`pch worktrees --apply`** says "already closed" for a workspace Paperclip's reaper closed between the preview and the close.
+
 ## 1.8.0
 
 - **`pch worktrees [--apply]`: finished issues' worktrees still on disk.** Paperclip removes a workspace's git worktree when the workspace is closed, but its reaper only closes one once it can prove the branch was delivered, the worktree is clean (untracked build output counts) and the issue has been finished for 7 days. Squash merges and PRs Paperclip can't read keep a worktree for good, so they piled up: hundreds of worktrees, tens of GB. The command lists the open workspaces of issues finished at least a day ago (`--min-days=N`), with what Paperclip's own close check says about each, and `--apply` closes the ones that are safe, as their Close button does: Paperclip removes the worktree and records it. Workspaces with modified files are always left for you; with untracked files or commits not on the base branch unless you pass `--include-untracked` or `--include-unmerged`. A workspace whose clean-up failed before is retried, and a failed clean-up's output is printed. [docs/commands.md](docs/commands.md#worktrees-finished-issues-worktrees-still-on-disk)

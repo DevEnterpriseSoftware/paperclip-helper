@@ -357,7 +357,12 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     if ((m = p.match(/^\/api\/execution-workspaces\/([^/]+)$/)) && req.method === "PATCH") {
       const ws = db.executionWorkspaces.find((w) => w.id === m[1]);
       if (!ws) return send(404, { error: "Execution workspace not found" });
-      if (body.status === "archived" && ws.status !== "archived") {
+      // Like Paperclip's archive (archiveWorkspaceUnderLifecycleLock): a closed one,
+      // archived or cleanup_failed, can't be closed again and answers 404.
+      if (body.status === "archived" && ["archived", "cleanup_failed"].includes(ws.status)) {
+        return send(404, { error: "Execution workspace not found" });
+      }
+      if (body.status === "archived") {
         const open = db.issues.filter((i) => i.executionWorkspaceId === ws.id && !["done", "cancelled"].includes(i.status));
         if (open.length) return send(409, { error: "This workspace is still linked to an open issue." });
         db.workspaceCloses.push(ws.id);

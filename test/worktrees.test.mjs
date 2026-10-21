@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { captureOutput, setup } from "./helpers.mjs";
+import { pull, startFakeGitHub } from "./fake-github.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import * as cmd from "../src/commands.mjs";
-import { finishedAt, verdict } from "../src/worktrees.mjs";
+import { closeWorkspace, finishedAt, repoFromUrl, verdict } from "../src/worktrees.mjs";
 
 const daysAgo = (n) => new Date(Date.now() - n * 24 * 60 * 60_000).toISOString();
 
@@ -36,9 +37,12 @@ function seed(db) {
     unmerged: add(db, "ACM-5", { ws: { readiness: { git: { aheadCount: 2, isMergedIntoBase: false } } } }),
     open: add(db, "ACM-6", { issue: { status: "in_progress", completedAt: null } }),
     recent: add(db, "ACM-7", { issue: { completedAt: new Date(Date.now() - 2 * 60 * 60_000).toISOString() } }),
-    failedBefore: add(db, "ACM-8", { ws: { status: "cleanup_failed", closedAt: daysAgo(2) } }),
+    failedBefore: add(db, "ACM-8", {
+      ws: { status: "cleanup_failed", closedAt: daysAgo(2), cwd: "/p/.paperclip/worktrees/ACM-8-branch", cleanupReason: "Skipped deleting branch" },
+    }),
     archived: add(db, "ACM-9", { ws: { status: "archived", closedAt: daysAgo(5) } }),
     held: add(db, "ACM-10", { issue: { executionRunId: uuid() } }),
+    shared: add(db, "ACM-11", { ws: { mode: "shared_workspace" } }),
   };
 }
 
@@ -80,15 +84,17 @@ test("worktrees previews: what Paperclip can close, what would lose work, what i
     seed(h.db);
     const lines = await captureOutput(() => cmd.worktrees(h.ctx, []));
     const text = lines.join("\n");
-    assert.match(text, /ACM: 9 open workspaces, 7 of them for issues finished 1\+ days ago/);
-    assert.match(text, /Paperclip can close 3 and remove their worktrees:/);
-    for (const id of ["ACM-1", "ACM-2", "ACM-8"]) assert.match(text, new RegExp(`\\n    ${id} `));
+    assert.match(text, /ACM: 10 open workspaces, 6 of them worktrees of issues finished 1\+ days ago/);
+    assert.match(text, /Paperclip can close 2 and remove their worktrees:/);
+    for (const id of ["ACM-1", "ACM-2"]) assert.match(text, new RegExp(`\\n    ${id} `));
+    assert.match(text, /1 were closed before, but their clean-up failed[^]*\n    ACM-8 +\/p\/\.paperclip\/worktrees\/ACM-8-branch\n +Skipped deleting branch/);
     assert.match(text, /3 may hold work that isn't on GitHub/);
     assert.match(text, /ACM-3 .*4 untracked files/);
     assert.match(text, /ACM-4 .*2 modified tracked files/);
     assert.match(text, /ACM-5 .*2 commits not on master/);
     assert.match(text, /Paperclip won't close 1:\n    ACM-10 .*a run still holds the issue/);
-    assert.match(text, /Left alone: 1 of open issues, 1 of issues finished in the last day\./);
+    assert.match(text, /Left alone: 1 of open issues, 1 of issues finished in the last day, 1 sessions on the project's shared checkout \(nothing to free\)\./);
+    assert.match(text, /Without GITHUB_TOKEN or GITHUB_TOKEN_FILE, a squash-merged branch looks unmerged/);
     assert.match(text, /pch worktrees --apply/);
     assert.doesNotMatch(text, /ACM-9/, "an archived workspace isn't listed");
     assert.deepEqual(h.db.workspaceCloses, []);
@@ -105,13 +111,13 @@ test("worktrees --apply closes the clean ones and shows why a clean-up failed", 
     const lines = await captureOutput(() => cmd.worktrees(h.ctx, ["--apply"]));
     process.exitCode = 0;
     const text = lines.join("\n");
-    assert.deepEqual(new Set(h.db.workspaceCloses), new Set([s.clean.ws.id, s.cancelled.ws.id, s.failedBefore.ws.id]));
+    assert.deepEqual(new Set(h.db.workspaceCloses), new Set([s.clean.ws.id, s.cancelled.ws.id]));
     assert.equal(s.clean.ws.status, "archived");
-    assert.equal(s.failedBefore.ws.status, "archived", "a failed clean-up is retried");
+    assert.equal(s.failedBefore.ws.status, "cleanup_failed", "Paperclip can't close a closed workspace again");
     assert.match(text, /ACM-1: closed/);
     assert.match(text, /ACM-2: cleanup_failed: .*contains modified or untracked files/);
     assert.match(text, /\| worktree_cleanup failed \(exit 128\)/);
-    assert.match(text, /Closed 2 workspaces\. 1 didn't close cleanly/);
+    assert.match(text, /Closed 1 workspace\. 1 didn't close cleanly/);
     // The ones that would lose work, and open issues', are untouched.
     for (const k of ["untracked", "dirty", "unmerged", "open", "recent", "held"]) assert.notEqual(s[k].ws.status, "archived", k);
   } finally {
@@ -124,8 +130,8 @@ test("worktrees --include-untracked --include-unmerged --min-days=0 widen what i
   try {
     const s = seed(h.db);
     await captureOutput(() => cmd.worktrees(h.ctx, ["--apply", "--include-untracked", "--include-unmerged", "--min-days=0"]));
-    for (const k of ["clean", "cancelled", "untracked", "unmerged", "recent", "failedBefore"]) assert.equal(s[k].ws.status, "archived", k);
-    for (const k of ["dirty", "open", "held"]) assert.notEqual(s[k].ws.status, "archived", k);
+    for (const k of ["clean", "cancelled", "untracked", "unmerged", "recent"]) assert.equal(s[k].ws.status, "archived", k);
+    for (const k of ["dirty", "open", "held", "failedBefore", "shared"]) assert.notEqual(s[k].ws.status, "archived", k);
   } finally {
     await h.close();
   }
@@ -145,4 +151,74 @@ test("worktrees leaves a workspace another open issue still uses, and rejects un
   } finally {
     await h.close();
   }
+});
+
+test("repoFromUrl reads owner/repo from https and ssh remotes", () => {
+  assert.equal(repoFromUrl("https://github.com/Org/App.git"), "org/app");
+  assert.equal(repoFromUrl("git@github.com:org/app.git"), "org/app");
+  assert.equal(repoFromUrl("https://github.com/org/app/"), "org/app");
+  assert.equal(repoFromUrl("/home/me/app"), null);
+  assert.equal(repoFromUrl(null), null);
+});
+
+test("verdict: commits off the base branch but in a merged PR are delivered (squash merge); more than the PR had are not", () => {
+  const r = { blockingReasons: [], git: { aheadCount: 3, isMergedIntoBase: false, baseRef: "origin/master" } };
+  assert.deepEqual(verdict(r, {}, { number: 41, commits: 3 }), { action: "close", reasons: ["PR #41 merged"] });
+  assert.deepEqual(verdict(r, {}, { number: 41, commits: 2 }), {
+    action: "review",
+    reasons: ["3 commits not on origin/master (PR #41 was merged with 2 commits)"],
+  });
+  assert.equal(verdict(r, {}, null).action, "review");
+});
+
+test("worktrees asks GitHub about unmerged branches: a merged PR closes, an unmerged or bigger one is left", async () => {
+  const gh = await startFakeGitHub();
+  const h = await setup({ env: { GITHUB_TOKEN: gh.token, GITHUB_API: gh.url, GITHUB_REPOS: "org/app" } });
+  try {
+    const ahead = (n) => ({ readiness: { git: { aheadCount: n, isMergedIntoBase: false } } });
+    const squashed = add(h.db, "ACM-21", { ws: ahead(2) });
+    const extra = add(h.db, "ACM-22", { ws: { ...ahead(5), repoUrl: "https://github.com/org/app.git" } });
+    const noPr = add(h.db, "ACM-23", { ws: ahead(1) });
+    const openPr = add(h.db, "ACM-24", { ws: ahead(1) });
+    gh.pulls["org/app"] = [
+      pull(7, { state: "closed", merged_at: daysAgo(4), commits: 2, head: { ref: "ACM-21-branch", sha: "a" } }),
+      pull(8, { state: "closed", merged_at: daysAgo(4), commits: 3, head: { ref: "ACM-22-branch", sha: "b" } }),
+      pull(9, { state: "open", commits: 1, head: { ref: "ACM-24-branch", sha: "c" } }),
+      // Closed without merging: not delivered.
+      pull(10, { state: "closed", merged_at: null, commits: 1, head: { ref: "ACM-23-branch", sha: "d" } }),
+    ];
+    const lines = await captureOutput(() => cmd.worktrees(h.ctx, ["--apply"]));
+    process.exitCode = 0;
+    const text = lines.join("\n");
+    assert.match(text, /ACM-21 .*\(PR #7 merged\)/);
+    assert.match(text, /ACM-22 .*5 commits not on master \(PR #8 was merged with 3 commits\)/);
+    assert.match(text, /ACM-23 .*1 commit not on master  ACM-23/);
+    assert.equal(squashed.ws.status, "archived");
+    for (const x of [extra, noPr, openPr]) assert.notEqual(x.ws.status, "archived", x.issue.identifier);
+    assert.doesNotMatch(text, /Without GITHUB_TOKEN/);
+    assert.ok(gh.requests.some((r) => r.path.startsWith("/repos/org/app/pulls?state=closed&head=org%3AACM-21-branch")));
+  } finally {
+    await h.close();
+    await gh.close();
+  }
+});
+
+test("closeWorkspace: a workspace closed meanwhile is reported as already closed; any other 404 is an error", async () => {
+  const notFound = Object.assign(new Error("PATCH … → 404: Execution workspace not found"), { status: 404 });
+  const api = (current) => ({
+    request: async (method) => {
+      if (method === "PATCH") throw notFound;
+      if (current === null) throw notFound;
+      return current;
+    },
+  });
+  assert.deepEqual(await closeWorkspace(api({ status: "archived", cleanupReason: null }), { id: "w" }), {
+    ok: true,
+    alreadyClosed: true,
+    status: "archived",
+    cleanupReason: null,
+  });
+  assert.equal((await closeWorkspace(api({ status: "cleanup_failed", cleanupReason: "x" }), { id: "w" })).alreadyClosed, true);
+  await assert.rejects(closeWorkspace(api({ status: "idle" }), { id: "w" }), /404/);
+  await assert.rejects(closeWorkspace(api(null), { id: "w" }), /404/);
 });

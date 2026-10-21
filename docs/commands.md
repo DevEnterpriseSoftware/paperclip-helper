@@ -155,7 +155,7 @@ Miss any one and the worktree stays. On a busy instance they pile up into hundre
 
 ```text
 $ pch worktrees
-ACM: 231 open workspaces, 198 of them for issues finished 1+ days ago
+ACM: 231 open workspaces, 162 of them worktrees of issues finished 1+ days ago
   Paperclip can close 171 and remove their worktrees:
     ACM-296    done       14d  ACM-296-fody-weavers-compile-assets-only
     ACM-326    cancelled  13d  ACM-326-regenerate-wirecontract
@@ -172,14 +172,15 @@ ACM: 231 open workspaces, 198 of them for issues finished 1+ days ago
   pch worktrees --apply
 ```
 
-`--apply` closes the first group one at a time, as the workspace's **Close** button does (`PATCH /api/execution-workspaces/:id` with `status: "archived"`). Paperclip stops the workspace's runtime services, runs the project's clean-up and teardown commands, removes the worktree (`git worktree remove --force`, so untracked build output goes with it) and deletes the branch it created if that branch is merged. The issue, its history and the branch on GitHub stay. A workspace whose clean-up failed earlier (`cleanup_failed`) is closed again, which retries the clean-up. When a clean-up fails, the command prints the end of its output.
+`--apply` closes the first group one at a time, as the workspace's **Close** button does (`PATCH /api/execution-workspaces/:id` with `status: "archived"`). Paperclip stops the workspace's runtime services, runs the project's clean-up and teardown commands, removes the worktree (`git worktree remove --force`, so untracked build output goes with it) and deletes the branch it created if that branch is merged. The issue, its history and the branch on GitHub stay. When a clean-up fails, the command prints the end of its output. A workspace whose clean-up failed earlier (`cleanup_failed`) counts as closed in Paperclip and can't be closed again, so the command only lists it with its folder: if the folder is still there, remove it with `git worktree remove --force <folder>` from the project's checkout.
 
 What it leaves alone:
 
 - **Workspaces of open issues**, and of issues finished less than `--min-days` ago (default 1), in case one is reopened.
 - **Modified tracked files.** Always: commit or discard them yourself.
 - **Untracked files** (anything git doesn't ignore: scratch clones, new files nobody committed) unless you pass `--include-untracked`. Ignored build output (`bin/`, `obj/`, `node_modules/`) doesn't count.
-- **Commits not on the base branch** unless you pass `--include-unmerged`. A squash-merged branch looks like this; if its PR is merged, its commits are on GitHub and closing loses nothing.
+- **Commits not on the base branch** unless you pass `--include-unmerged`. A squash-merged branch always looks like this, because the merge puts new commits on the base branch. With `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE` set ("Pull requests: Read"), the command asks GitHub for the branch's PR: a merged PR with at least as many commits as the worktree is ahead holds all of them, so that worktree is closed ("PR #41 merged"). More commits than the PR had means some were made after it, and the worktree is left for you. The repository is the workspace's `repoUrl`, or each of `GITHUB_REPOS`.
+- **Sessions on the project's shared checkout** (`shared_workspace`). They're only counted: closing one removes a record and frees nothing.
 - **What Paperclip refuses**: a workspace another open issue is still linked to, or one whose git state it can't read (its folder may already be gone).
 - **An issue a run still holds.**
 

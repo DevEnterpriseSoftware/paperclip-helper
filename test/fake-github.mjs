@@ -43,7 +43,15 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
       let m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls$/);
       if (m && req.method === "GET") {
         const base = url.searchParams.get("base");
-        const rows = (pulls[m[1]] ?? []).filter((p) => p.state === "open" && (!base || p.base.ref === base));
+        // state defaults to open, like GitHub; head is "owner:branch".
+        const state = url.searchParams.get("state") ?? "open";
+        const head = url.searchParams.get("head");
+        const rows = (pulls[m[1]] ?? []).filter(
+          (p) =>
+            (state === "all" || p.state === state) &&
+            (!base || p.base.ref === base) &&
+            (!head || `${m[1].split("/")[0]}:${p.head.ref}` === head),
+        );
         // The list never says whether a PR merges.
         return send(res, 200, rows.map(({ mergeable, ...rest }) => rest));
       }
