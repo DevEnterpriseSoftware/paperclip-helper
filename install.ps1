@@ -494,7 +494,7 @@ $network
         if (-not $s.GITHUB_TOKEN) {
           Note 'Create a fine-grained token at https://github.com/settings/personal-access-tokens/new'
           Note "  Repository access: Only select repositories -> $($s.GITHUB_REPOS)"
-          Note '  Repository permissions: Pull requests -> Read and write'
+          Note '  Repository permissions: Pull requests -> Read and write; Actions -> Read (for the watchdog''s CI-run check)'
           Note "  (A classic token with the `"repo`" scope works too. Steps: $RepoUrl/blob/main/docs/relay.md#the-github-token)"
         }
         $s.GITHUB_TOKEN = Ask-Secret 'GitHub token' $s.GITHUB_TOKEN
@@ -552,7 +552,7 @@ $network
     Say 'assignee: the card waits for good. `pch blocked` lists them either way.'
     $s.WATCHDOG_ROUTE_QUESTIONS = if (Confirm 'Give the teammate an issue that asks it to answer the card (closed once it''s answered)?' (Truthy $s.WATCHDOG_ROUTE_QUESTIONS)) { 'true' } else { 'false' }
     Say 'An agent that waits on a CI run often stops, or its monitor gives up, before the run finishes.'
-    Say 'This uses the GitHub token (it needs "Actions: Read"); without a token it stays off.'
+    Say 'This uses the GitHub token from the merge-conflict question above (it needs "Actions: Read"); without a token it stays off.'
     if (Confirm 'Tell the agent once the CI run it named has finished?' (Truthy $s.WATCHDOG_CI_RUNS)) {
       $s.WATCHDOG_CI_RUNS = 'true'
       Say 'Jobs you know to be flaky can be re-run before the agent is told (needs "Actions: Read and write").'

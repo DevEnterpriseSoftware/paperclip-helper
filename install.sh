@@ -515,7 +515,7 @@ main() {
         if [ -z "$GITHUB_TOKEN" ]; then
           note "Create a fine-grained token at https://github.com/settings/personal-access-tokens/new"
           note "  Repository access: Only select repositories → $GITHUB_REPOS"
-          note "  Repository permissions: Pull requests → Read and write"
+          note "  Repository permissions: Pull requests → Read and write; Actions → Read (for the watchdog's CI-run check)"
           note "  (A classic token with the \"repo\" scope works too. Steps: $REPO_URL/blob/main/docs/relay.md#the-github-token)"
         fi
         ask_secret GITHUB_TOKEN "GitHub token" "$GITHUB_TOKEN"
@@ -582,7 +582,7 @@ main() {
     if confirm "Give the teammate an issue that asks it to answer the card (closed once it's answered)?" "$questions"; then WATCHDOG_ROUTE_QUESTIONS=true; else WATCHDOG_ROUTE_QUESTIONS=false; fi
     local ci=y; truthy "$WATCHDOG_CI_RUNS" || ci=n
     say "An agent that waits on a CI run often stops, or its monitor gives up, before the run finishes."
-    say "This uses the GitHub token (it needs \"Actions: Read\"); without a token it stays off."
+    say "This uses the GitHub token from the merge-conflict question above (it needs \"Actions: Read\"); without a token it stays off."
     if confirm "Tell the agent once the CI run it named has finished?" "$ci"; then
       WATCHDOG_CI_RUNS=true
       say "Jobs you know to be flaky can be re-run before the agent is told (needs \"Actions: Read and write\")."
