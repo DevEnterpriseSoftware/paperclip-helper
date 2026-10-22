@@ -52,9 +52,16 @@ export function waitingText(comments, agentId, monitor) {
 
 // The same, with when the agent said it: a comment written after the run finished
 // means the agent saw the result (it watched the run within its own run).
+//
+// An agent often names the run once and follows up without repeating it
+// ("blocked on run X", then "cleared a dependency; still waiting on CI"). When
+// its latest comment names no run, its most recent one that does counts. When it
+// spoke is still its latest comment, so a run that finished before the agent last
+// spoke is never reported: it may have seen the result.
 export function waitingOn(comments, agentId, monitor) {
-  const mine = (Array.isArray(comments) ? comments : []).find((c) => c?.authorAgentId === agentId);
-  return { text: [mine?.body ?? "", monitor?.notes ?? ""].join("\n"), saidAt: mine?.createdAt ?? null };
+  const mine = (Array.isArray(comments) ? comments : []).filter((c) => c?.authorAgentId === agentId);
+  const named = mine.find((c) => runRefs(c.body).length > 0) ?? mine[0];
+  return { text: [named?.body ?? "", monitor?.notes ?? ""].join("\n"), saidAt: mine[0]?.createdAt ?? null };
 }
 
 // Conclusions that say nothing about the change: a run cancelled (often by a newer
@@ -62,8 +69,23 @@ export function waitingOn(comments, agentId, monitor) {
 export const UNINFORMATIVE = new Set(["cancelled", "skipped", "neutral", "action_required", "stale"]);
 
 // A Paperclip monitor that will still wake the agent by itself: leave it to that.
+// Only a scheduled monitor fires. A triggered one has fired and waits for the
+// agent to schedule it again, and a cleared one is done, so neither wakes anyone
+// by itself. A scheduled one acts when its next check comes (or only just came:
+// Paperclip's scheduler looks every 30 seconds by default). Past its timeout or
+// out of attempts, it is cleared then instead of fired, and wakes the agent only
+// under the default recovery policy, wake_owner (issue_monitor_recovery); the
+// others tell the board instead. (dispatchClaimedIssueMonitor and
+// issueMonitorLimitClearReason, server/src/services/heartbeat/scheduling.ts)
+const MONITOR_GRACE_MS = 2 * 60_000;
 export function monitorPending(monitor, now) {
-  return monitor?.status === "scheduled" && ts(monitor.nextCheckAt) > now && !(ts(monitor.timeoutAt) && ts(monitor.timeoutAt) <= now);
+  if (monitor?.status !== "scheduled") return false;
+  const next = ts(monitor.nextCheckAt);
+  if (!next || next + MONITOR_GRACE_MS <= now) return false;
+  const timeout = ts(monitor.timeoutAt);
+  const max = Number(monitor.maxAttempts);
+  const spent = Boolean(timeout && timeout <= next) || (max > 0 && Number(monitor.attemptCount ?? 0) + 1 > max);
+  return !spent || (monitor.recoveryPolicy ?? "wake_owner") === "wake_owner";
 }
 
 const FAILED = new Set(["failure", "timed_out", "startup_failure"]);
@@ -86,6 +108,7 @@ export function ciMessage({ run, jobs, reruns = 0 }) {
     .filter(Boolean)
     .join(" at ");
   const conclusion = run.conclusion ?? "finished";
+  const noVerdict = UNINFORMATIVE.has(conclusion);
   const lines = [
     `the CI run you were waiting on has finished, and you haven't run on this issue since: ${label}${where ? ` on ${where}` : ""} ` +
       `finished ${new Date(ts(run.updated_at)).toISOString().replace(/\.\d+Z$/, "Z")} with **${conclusion}**. ${run.html_url ?? ""}`.trim(),
@@ -100,7 +123,9 @@ export function ciMessage({ run, jobs, reruns = 0 }) {
     "",
     conclusion === "success"
       ? "Please continue from where you were waiting on it (resubmit, or carry on with the next step)."
-      : "Please look at the failed jobs and continue: fix what your change broke, or say why it isn't yours.",
+      : noVerdict
+        ? "It gave no verdict on the change. If you still need one, start it again (or a new run), and say which run you wait on; otherwise continue."
+        : "Please look at the failed jobs and continue: fix what your change broke, or say why it isn't yours.",
   );
   return lines.join("\n");
 }

@@ -19,6 +19,8 @@ export const pull = (number, extra = {}) => ({
 });
 
 export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" } = {}) {
+  const repos = {}; // "org/app" → repository metadata, including default_branch
+  const branches = {}; // "org/app" → { [name]: branch }
   const pulls = {}; // "org/app" → [pull]
   const runs = {}; // "org/app" → { [runId]: workflow run, with `jobs` (served on the jobs route) and `onRerun(run)` }
   const reruns = []; // { repo, id }
@@ -40,7 +42,17 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
       const url = new URL(req.url, "http://github");
       requests.push({ method: req.method, path: url.pathname + url.search });
       if (req.headers.authorization !== `Bearer ${current.token}`) return send(res, 401, { message: "Bad credentials" });
-      let m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls$/);
+      let m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)$/);
+      if (m && req.method === "GET") {
+        if (fail["GET repo"]) return send(res, fail["GET repo"], { message: "Server Error" });
+        return repos[m[1]] ? send(res, 200, repos[m[1]]) : send(res, 404, { message: "Not Found" });
+      }
+      m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/branches\/(.+)$/);
+      if (m && req.method === "GET") {
+        const branch = branches[m[1]]?.[decodeURIComponent(m[2])];
+        return branch ? send(res, 200, branch) : send(res, 404, { message: "Not Found" });
+      }
+      m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/pulls$/);
       if (m && req.method === "GET") {
         const base = url.searchParams.get("base");
         // state defaults to open, like GitHub; head is "owner:branch".
@@ -69,6 +81,7 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
       }
       m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)(\/jobs|\/rerun-failed-jobs)?$/);
       if (m) {
+        if (!m[3] && req.method === "GET" && fail["GET run"]) return send(res, fail["GET run"], { message: "Resource not accessible by integration" });
         const run = runs[m[1]]?.[m[2]];
         if (!run) return send(res, 404, { message: "Not Found" });
         if (m[3] === "/jobs" && req.method === "GET") return send(res, 200, { total_count: (run.jobs ?? []).length, jobs: run.jobs ?? [] });
@@ -98,6 +111,8 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
     url: `http://127.0.0.1:${server.address().port}`,
     token,
     current,
+    repos,
+    branches,
     pulls,
     runs,
     reruns,
