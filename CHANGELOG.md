@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.9.0
 
 - **Watchdog: default-branch dispatches always report their verdict.** A `workflow_dispatch` run on the repository's default branch, read from GitHub, is never automatically re-run or silenced after the branch moves on. Every conclusion, including `cancelled`, wakes the waiting agent through the usual CI-run check. Push, pull-request and other-branch dispatch runs keep their existing rules. The default branch is read once an hour per repository; while GitHub won't say, such a run waits for the next scan (never re-run meanwhile) and the log says why once.
 - **Watchdog: a CI run named before the agent's latest comment is reported.** An agent often names the run once and follows up without repeating it ("blocked on run …", then "cleared a dependency; still waiting on CI"). Only the latest comment was read, so the run was never found and the agent was never told. When the latest comment names no run, the agent's latest comment that does now counts. A run that finished before the agent last commented still isn't reported.
