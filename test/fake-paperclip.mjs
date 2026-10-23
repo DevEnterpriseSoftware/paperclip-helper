@@ -322,6 +322,11 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           const next = issue.nextStages.shift();
           issue.executionState = { status: "pending", currentStageType: next.type, currentParticipant: next.participant };
           issue.status = "in_review";
+        } else if (body.status === "in_progress" && body.comment && issue.executionState?.status === "pending" && issue.executionState.returnAssignee?.agentId) {
+          // Like Paperclip's changes requested by the stage's participant: back to the
+          // implementer who submitted the work (returnAssignee), which wakes it.
+          issue.executionState = { ...issue.executionState, status: "changes_requested" };
+          Object.assign(issue, { status: "in_progress", assigneeAgentId: issue.executionState.returnAssignee.agentId, assigneeUserId: null });
         } else if (body.status) {
           // Like Paperclip's policy transition: leaving done or cancelled clears the execution state.
           if (["done", "cancelled"].includes(issue.status) && !["done", "cancelled"].includes(body.status)) issue.executionState = null;

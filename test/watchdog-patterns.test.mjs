@@ -696,8 +696,9 @@ test("with it on, the review goes back to the implementer with the reviewer's re
   assert.match(body.comment, /> Revision 5 still lacks the four proofs\./);
 
   // Escalated again, with a new decision: the budget (WATCHDOG_MAX_NUDGES = 1) is used up.
-  Object.assign(issue, { status: "in_review", updatedAt: minutesAgo(30) });
-  issue.executionState.lastDecisionId = "d-6";
+  // (Escalating re-pends the stage with you as participant, as Paperclip does.)
+  Object.assign(issue, { status: "in_review", assigneeUserId: ids.user, assigneeAgentId: null, updatedAt: minutesAgo(30) });
+  Object.assign(issue.executionState, { status: "pending", lastDecisionId: "d-6" });
   env.db.comments.push({ issueId: issue.id, body: "Still missing proof 4.", authorAgentId: env.db.agents[1].id, createdAt: new Date(env.clock.now + 1000).toISOString() });
   env.later(10);
   await env.watchdog.tick();

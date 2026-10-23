@@ -19,6 +19,11 @@
 //   * PR merged by you, its issue's      → the issue is closed as done with the
 //     review stages wiped                  merge comment, as the approval would
 //                                          have (RELAY_DONE_WITHOUT_STAGES)
+//   * PR merged by you, when the merge   → changes requested instead of approve:
+//     doesn't finish the issue (its        the issue goes back to its implementer
+//     hand-off or description says so,     for the rest of the work
+//     or it has open child issues)         (RELAY_MERGE_KEEP_OPEN_MARKER,
+//                                          RELAY_MERGE_KEEP_OPEN_CHILDREN)
 //   * PR closed unmerged, or merged by   → a note on the issue
 //     someone else
 //   * Any PR merged                      → other open PRs that now conflict are
@@ -41,7 +46,7 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
-import { approvalWaitingOn, DECISION_STATUS, every, RELAYED_SIGNATURE, signed } from "./util.mjs";
+import { approvalWaitingOn, DECISION_STATUS, every, RELAYED_SIGNATURE, signed, ts } from "./util.mjs";
 import { createGitHub } from "./github.mjs";
 import { createConflictSweep, HELPER_MARK } from "./conflicts.mjs";
 import { createMergeQueueHandler, QUEUE_BOT } from "./merge-queue.mjs";
@@ -141,6 +146,9 @@ export function decisionNote({ kind, asked, result, identifiers, prefixLabel = "
 // "Changes requested on PR #8", "Approved on PR #8", or "<plain> on PR #8".
 const heading = (kind, plain, pr) =>
   `${kind === "changes" ? "Changes requested" : kind === "approve" ? "Approved" : plain} on ${prLabel(pr)}`;
+
+// The slack between a move to review and the hand-off comment sent with it.
+const HAND_OFF_SLACK_MS = 2 * 60_000;
 
 export function createRelay(ctx, state, { github, sleep } = {}) {
   const { config, api, log } = ctx;
@@ -256,6 +264,78 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
     return Boolean(stagesWipe(await issueActivity(api, issue.id)));
   }
 
+  // Does your merge finish the issue? null when it does; otherwise why not:
+  // { marker: true } when the issue's description, its review request, or the
+  // hand-off that sent it to review says so (RELAY_MERGE_KEEP_OPEN_MARKER), or
+  // { children: [identifiers] } when it has open child issues
+  // (RELAY_MERGE_KEEP_OPEN_CHILDREN). A PR that is only one step of a longer issue
+  // would otherwise close it, release its dependants and wake nobody.
+  async function mergeKeepsOpen(issue) {
+    const marker = config.relayMergeKeepOpenMarker.toLowerCase();
+    if (marker) {
+      const full = (await api.request("GET", `/api/issues/${issue.id}`).catch(() => null)) ?? issue;
+      const texts = [full.description, full.executionState?.reviewRequest?.instructions, ...(await handOffTexts(full))];
+      if (texts.some((t) => String(t ?? "").toLowerCase().includes(marker))) return { marker: true };
+    }
+    if (config.relayMergeKeepOpenChildren) {
+      const rows = await api.request("GET", `/api/companies/${issue.companyId}/issues?parentId=${issue.id}&limit=100`).catch(() => null);
+      if (!Array.isArray(rows)) log.warn("relay: couldn't list the issue's child issues; deciding the merge without them", { identifier: issue.identifier ?? issue.id });
+      const open = (Array.isArray(rows) ? rows : []).filter((c) => c.parentId === issue.id && !["done", "cancelled"].includes(c.status));
+      if (open.length) return { children: open.map((c) => c.identifier ?? c.id) };
+    }
+    return null;
+  }
+
+  // The hand-off that sent the issue to review: its implementer's comments since
+  // the implementer last moved the issue to in_review (Paperclip's activity log), the
+  // hand-off comment itself included. A board move back to review (the resume
+  // sweep's restore, a drag in the UI) isn't a hand-off. Without the log, the
+  // implementer's latest comment.
+  async function handOffTexts(issue) {
+    const [comments, activity] = await Promise.all([
+      api.request("GET", `/api/issues/${issue.id}/comments?order=desc&limit=50`).catch(() => null),
+      issueActivity(api, issue.id),
+    ]);
+    const implementer = issue.executionState?.returnAssignee?.agentId ?? issue.assigneeAgentId ?? null;
+    if (!Array.isArray(comments)) log.warn("relay: couldn't read the issue's comments; looking for the keep-open marker without its hand-off", { identifier: issue.identifier ?? issue.id });
+    const own = (Array.isArray(comments) ? comments : []).filter((c) => c.authorAgentId && (!implementer || c.authorAgentId === implementer));
+    const moves = (Array.isArray(activity) ? activity : []).filter((e) => e?.action === "issue.updated" && e.details?.changes?.status?.to === "in_review");
+    const byAgent = (e) => (implementer ? (e.agentId ?? e.actorId) === implementer : e.actorType === "agent");
+    const entered = moves.find(byAgent) ?? moves[0];
+    if (!entered) return own.slice(0, 1).map((c) => c.body);
+    // The hand-off comment is written in the same request as the move: a little slack.
+    const since = ts(entered.createdAt) - HAND_OFF_SLACK_MS;
+    return own.filter((c) => ts(c.createdAt) >= since).map((c) => c.body);
+  }
+
+  // Your merge of a PR that doesn't finish its issue: changes requested for you, so
+  // Paperclip returns the issue to its implementer and wakes them.
+  async function returnAfterMerge(pr, identifier, keep, { wiped = false } = {}) {
+    const why = keep.marker
+      ? "This issue says the merge doesn't complete it"
+      : `This issue still has open child issues (${keep.children.join(", ")})`;
+    const comment =
+      `${prLabel(pr)} merged (\`${pr.merge_commit_sha?.slice(0, 12) ?? "no sha"}\`). ${why}, so it's back with you for the rest of the work.` +
+      `${wiped ? " Its review stages had been wiped: ask the board to restore them before you hand it back." : ""}\n\n${pr.html_url ?? ""}`;
+    const reason = keep.marker ? "the issue says the merge doesn't complete it" : `open child issues: ${keep.children.join(", ")}`;
+    if (config.dryRun) return { identifier, action: "changes (dry run)", status: DECISION_STATUS.changes, reason };
+    try {
+      await api.request("PATCH", `/api/issues/${encodeURIComponent(identifier)}`, {
+        status: DECISION_STATUS.changes,
+        comment: signed(comment, RELAYED_SIGNATURE),
+      });
+    } catch (err) {
+      // Paperclip refused the hand-back (a stage with no implementer to return to, say).
+      // Closing the issue would drop the rest of its work: say so, and leave it to you.
+      if (!(err?.status >= 400 && err.status < 500)) throw err;
+      log.warn("relay: Paperclip refused to return the issue to its implementer after a merge that doesn't finish it; commented instead", { identifier, error: err.message });
+      const result = await addComment(identifier, `${comment}\n\n_Paperclip refused to return the issue (${err.message}): it is left as it was for you to decide._`);
+      return { ...result, reason: `${reason}; Paperclip refused the hand-back` };
+    }
+    log("relay: a merge that doesn't finish its issue; returned to its implementer", { identifier, pr: pr.number, reason });
+    return { identifier, action: "changes", status: DECISION_STATUS.changes, reason };
+  }
+
   // A note that needs nothing from the issue's agent: a line in the issue's
   // pull-requests document (wakes nobody), or a comment with RELAY_QUIET_NOTES off
   // or when Paperclip won't take the document.
@@ -291,7 +371,9 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
     }
     if (!waiting && merged && (await stagesWereWiped(issue, identifiers))) {
       // Your merge of its own PR, and no stage left to record it: close it as the approval
-      // would have, so its dependants can start.
+      // would have, so its dependants can start, unless the merge doesn't finish it.
+      const keep = await mergeKeepsOpen(issue);
+      if (keep) return returnAfterMerge(pr, identifier, keep, { wiped: true });
       if (config.dryRun) return { identifier, action: "done (dry run)", reason: "its review stages were wiped" };
       await api.request("PATCH", `/api/issues/${encodeURIComponent(identifier)}`, {
         status: "done",
@@ -310,6 +392,12 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       const note = `_Not recorded as a decision: ${list} all wait on you, and none lists this PR. Decide on the right one in Paperclip, or with \`pch approve\` or \`pch changes\`._`;
       const result = await addComment(identifier, `${comment}\n\n${note}`);
       return { ...result, reason: `several issues wait on you (${list}) and none lists this PR`, status: issue.status, stageType };
+    }
+
+    if (kind === "approve" && merged) {
+      // The merge was one step of the issue, not all of it: back to its implementer.
+      const keep = await mergeKeepsOpen(issue);
+      if (keep) return { ...(await returnAfterMerge(pr, identifier, keep)), ...(via ? { via } : {}) };
     }
 
     const status = DECISION_STATUS[kind];

@@ -211,6 +211,15 @@ test("your merge of an issue's own PR closes it as done when its stages were wip
   env.db.issues.push(waiting);
   assert.equal((await env.relay.handle("pull_request", mergedEvent(31, "ACM-31"))).action, "approve");
 
+  // The issue says the merge doesn't finish it: back to its agent, not closed.
+  const step = { id: uuid(), identifier: "ACM-33", companyId: ids.company, status: "in_progress", assigneeAgentId: env.codex.id, executionPolicy: null,
+    description: "Five proofs. Merge does not complete this issue." };
+  env.db.issues.push(step);
+  wipe(env.db, step, env.codex);
+  assert.equal((await env.relay.handle("pull_request", mergedEvent(33, "ACM-33: fix"))).action, "changes");
+  assert.equal(step.status, "in_progress");
+  assert.match(env.db.patches.at(-1).body.comment, /back with you for the rest of the work\. Its review stages had been wiped/);
+
   // Blocked waits on something the merge doesn't settle: the merge is only a comment.
   const blocked = { id: uuid(), identifier: "ACM-32", companyId: ids.company, status: "blocked", assigneeAgentId: env.codex.id, executionPolicy: null };
   env.db.issues.push(blocked);

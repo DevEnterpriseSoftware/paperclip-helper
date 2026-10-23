@@ -85,6 +85,7 @@ These are open bugs in [Paperclip's issue tracker](https://github.com/paperclipa
 | **A cancelled blocker never releases its dependants.** | [#9811](https://github.com/paperclipai/paperclip/issues/9811) | [#11837](https://github.com/paperclipai/paperclip/pull/11837) | [watchdog 14](docs/watchdog.md#14-issues-blocked-by-a-cancelled-issue) |
 | **Claude usage-limit failures are retried as transient**, or the reset time doesn't hold runs back: hundreds of failed runs before the limit resets. | [#15797](https://github.com/paperclipai/paperclip/issues/15797), [#11597](https://github.com/paperclipai/paperclip/issues/11597) | [#17013](https://github.com/paperclipai/paperclip/pull/17013) | [watchdog 16](docs/watchdog.md#16-claude-usage-limits) |
 | **An agent's update wipes an issue's review stages** (`executionPolicy: { stages: [] }`), so it closes unreviewed with its PR still open. | [#17301](https://github.com/paperclipai/paperclip/issues/17301) | related: [#16431](https://github.com/paperclipai/paperclip/pull/16431), [#11145](https://github.com/paperclipai/paperclip/issues/11145) | [watchdog 17](docs/watchdog.md#17-issues-whose-review-stages-were-wiped), [relay](docs/relay.md#merging-an-issue-whose-review-stages-were-wiped) |
+| **Approving the last stage always closes the issue**, even when the merged PR was only one step of its work: Paperclip has no way to approve a stage and hand the work back to its implementer. | [#10360](https://github.com/paperclipai/paperclip/issues/10360) | [#10365](https://github.com/paperclipai/paperclip/pull/10365); related: [#11145](https://github.com/paperclipai/paperclip/issues/11145) | [relay](#keeping-an-issue-open-after-a-merge) |
 | **No way to approve a review stage that waits on you**: the Approve and Request changes decisions are advertised but not shown, and the decision endpoint refuses them. | [#15496](https://github.com/paperclipai/paperclip/issues/15496) | [#10277](https://github.com/paperclipai/paperclip/pull/10277), [#5487](https://github.com/paperclipai/paperclip/pull/5487) | [relay](docs/relay.md) |
 
 ## How it works
@@ -138,7 +139,7 @@ What it does step by step, unattended and manual installs, networking and the Gi
 
 | On GitHub | In Paperclip |
 |---|---|
-| **You merge** the PR | The issue is **approved**, including each consecutive stage that is waiting on you. |
+| **You merge** the PR | The issue is **approved**, including each consecutive stage that is waiting on you, unless the merge doesn't finish it ([below](#keeping-an-issue-open-after-a-merge)). |
 | **You "Request changes"**, or comment `/changes …` | **Changes requested**: back to the engineer, with your text as the brief. |
 | **You comment `/approve …`** | Approved without merging. |
 | **You comment** anything else | Copied to the issue, which wakes the assignee. |
@@ -147,6 +148,16 @@ What it does step by step, unattended and manual installs, networking and the Gi
 | **A PR opens, closes or is merged by someone else** | A note in the issue's **Pull requests** document, which wakes nobody. |
 
 It acts only on events signed with your webhook secret, from your repositories, by your GitHub login, and only when Paperclip says the decision is waiting on *you*. Otherwise it comments. Details and settings: **[docs/relay.md](docs/relay.md)**.
+
+#### Keeping an issue open after a merge
+
+Approving the last stage closes the issue as `done`, and Paperclip then releases its dependants. That's right when the PR **is** the issue's work, and wrong when it's one step of it: a fix found halfway through, or one slice of several. So approve-on-merge closes the issue **unless** the hand-off comment that sent it to review, or the issue's description, contains the marker (`RELAY_MERGE_KEEP_OPEN_MARKER`, default `Merge does not complete this issue`, any case). With the marker, the relay records **changes requested** instead: the issue goes back to its implementer, who is woken with a comment that the PR merged and the rest of the work is theirs. With `RELAY_MERGE_KEEP_OPEN_CHILDREN=true`, open child issues keep it open the same way. Put the marker in the hand-off rather than the description: a description marker hands back every merge, the last one too, so you'd finish the issue with `/approve` ([details](docs/relay.md#keeping-an-issue-open-after-a-merge)).
+
+This only works if your agents know to write the marker. Add a line like this to your team's agent template or agent instructions:
+
+> When your pull request merges, the Paperclip Helper records the board's approval and Paperclip closes the issue. If the pull request is only one step of the issue's work (a fix along the way, one slice of several), write `Merge does not complete this issue` in the hand-off comment that sends the issue to review. The Helper then reports the merge and hands the issue back to you.
+
+The line must quote the same phrase as `RELAY_MERGE_KEEP_OPEN_MARKER`. If you change the setting, change the line to match.
 
 ### Watchdog: wake stalled work
 

@@ -9,6 +9,8 @@ import path from "node:path";
 const TRUE = /^(1|true|yes|on)$/i;
 const FALSE = /^(0|false|no|off)$/i;
 
+export const DEFAULT_KEEP_OPEN_MARKER = "Merge does not complete this issue";
+
 export function loadConfig(env = process.env) {
   const problems = [];
   const get = (name, fallback = "") => {
@@ -157,6 +159,12 @@ export function loadConfig(env = process.env) {
     // When you merge an issue's own PR and the issue has no review or approval stage
     // left to record it, close the issue as done, as the approval would have.
     relayDoneWithoutStages: bool("RELAY_DONE_WITHOUT_STAGES", true),
+    // Your merge doesn't finish an issue whose hand-off or description says so with
+    // this phrase (any case): the issue goes back to its implementer instead of being
+    // approved. Set but empty: the check is off.
+    relayMergeKeepOpenMarker: env.RELAY_MERGE_KEEP_OPEN_MARKER === undefined ? DEFAULT_KEEP_OPEN_MARKER : env.RELAY_MERGE_KEEP_OPEN_MARKER.trim(),
+    // Nor does it finish an issue with open child issues (off by default).
+    relayMergeKeepOpenChildren: bool("RELAY_MERGE_KEEP_OPEN_CHILDREN", false),
     // Notes that need nothing from the agent (PR opened, closed, merged by someone
     // else) go in the issue's "pull-requests" document, which wakes nobody, not in a
     // comment, which wakes the assignee.

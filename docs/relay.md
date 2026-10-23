@@ -5,6 +5,7 @@ In Paperclip, the current participant of a review or approval stage records a de
 | On GitHub | In Paperclip |
 |---|---|
 | **You merge** the PR | The issue is **approved**: `done`, with a comment naming the PR and merge commit. |
+| **You merge** a PR that is only one step of its issue (its hand-off or description carries the marker, or, optionally, it has open child issues) | **Changes requested** instead: back to its implementer for the rest of the work, with a comment that the PR merged ([below](#keeping-an-issue-open-after-a-merge)). |
 | **You merge** the PR of an issue whose review stages an agent's update wiped | Closed as `done` with the merge comment, as the approval would have (`RELAY_DONE_WITHOUT_STAGES`, [below](#merging-an-issue-whose-review-stages-were-wiped)). |
 | **You "Request changes"** in a review | **Changes requested**: `in_progress` and back to the engineer, with your review text as the brief. |
 | **You comment `/changes …`** on the PR, or start a review with it | Same as Request changes. |
@@ -52,6 +53,25 @@ A decision that is recorded gets no reply. For comments, GitHub doesn't send the
 ## Merging an issue whose review stages were wiped
 
 When an agent's update wipes an issue's review stages (a Paperclip bug: [watchdog 17](watchdog.md#17-issues-whose-review-stages-were-wiped)), your merge has no approval stage to record, so the issue stayed open and its dependants couldn't start. With `RELAY_DONE_WITHOUT_STAGES` on (the default), when you merge a PR and its own issue (the first one it names) is in todo, in progress or in review, has no stage pending, and Paperclip's activity log shows an agent's update removed its stages, the relay closes it as done with the merge comment, as the approval would have. An issue that never had stages, a blocked issue (it waits on a blocker or a recovery decision the merge doesn't settle), a PR that only mentions the issue, a merge by someone else and a `/approve` on a PR not yet merged are handled as before.
+
+## Keeping an issue open after a merge
+
+Approving an issue's last stage closes it as `done`, and Paperclip starts its dependants. Paperclip has no way to approve a stage and hand the work back to its implementer ([paperclipai/paperclip#10360](https://github.com/paperclipai/paperclip/issues/10360)), so a PR that is only one step of an issue (a fix found halfway through a verification, one slice of several) would close the issue with the rest of its work never done, and wake nobody.
+
+So before approve-on-merge, the relay asks whether the merge finishes the issue:
+
+- **The marker.** The issue's description, its review request, or the hand-off that sent it to review contains `RELAY_MERGE_KEEP_OPEN_MARKER` (default `Merge does not complete this issue`, matched in any case). The hand-off is the implementer's comments since the implementer last moved the issue to `in_review`, as Paperclip's activity log shows it (a board move back to review isn't a hand-off; without the log, the implementer's latest comment). A marker in an earlier round's hand-off doesn't count.
+- **Open child issues,** with `RELAY_MERGE_KEEP_OPEN_CHILDREN=true` (off by default): any child issue that isn't `done` or `cancelled`.
+
+Either way, the merge is still relayed, but as your **changes requested** (`in_progress` with a comment, in one request): Paperclip returns the issue to its implementer and wakes them. The comment: *"PR #12 merged (`abcdef123456`). This issue says the merge doesn't complete it, so it's back with you for the rest of the work."* (or names the open child issues). When they hand it back, it comes to the same stage. Without the marker or open children, nothing changes: approved and closed. An issue already `done` or `cancelled`, and a merge by someone else, are handled as before. The same check applies when the relay would close an issue whose stages were wiped ([above](#merging-an-issue-whose-review-stages-were-wiped)). If Paperclip refuses to hand the issue back (its stage has no implementer recorded, say), the relay comments instead and leaves the issue as it was: it never closes it.
+
+**Hand-off or description.** The hand-off is the place for the marker: it is read afresh each round, so the final PR's hand-off, without it, closes the issue as usual. A marker in the **description** stays there, so every merge hands the issue back, the last one too. To finish such an issue, approve it yourself: comment `/approve` on the final PR before you merge it (the merge then finds the issue done), or approve it in Paperclip, or run `pch approve ISSUE`.
+
+**Tell your agents.** It only works if the agents write the marker. Add a line like this to your team's agent template or agent instructions:
+
+> When your pull request merges, the Paperclip Helper records the board's approval and Paperclip closes the issue. If the pull request is only one step of the issue's work (a fix along the way, one slice of several), write `Merge does not complete this issue` in the hand-off comment that sends the issue to review. The Helper then reports the merge and hands the issue back to you.
+
+The line must quote the same phrase as `RELAY_MERGE_KEEP_OPEN_MARKER`: if you change the setting, change the line to match. Setting it to an empty value (`RELAY_MERGE_KEEP_OPEN_MARKER=`) turns the check off.
 
 ## PRs with merge conflicts
 
@@ -178,6 +198,8 @@ Paperclip builds an issue's "GitHub Pull Request" rows from full `github.com/<ow
 | `RELAY_CONFLICT_MAX_ATTEMPTS` | `2` | Send-backs per PR while it keeps conflicting, one per push, before it is left to you. |
 | `RELAY_CONFLICT_PR_COMMENT` | `true` | Say on the PR that it was sent back. |
 | `RELAY_DONE_WITHOUT_STAGES` | `true` | When you merge an issue's own PR and its review stages were wiped, close it as done. |
+| `RELAY_MERGE_KEEP_OPEN_MARKER` | `Merge does not complete this issue` | A merge doesn't finish an issue whose hand-off or description contains this phrase (any case): [changes requested](#keeping-an-issue-open-after-a-merge) instead of approve. Empty: the check is off. Your agents' instructions must quote the same phrase. |
+| `RELAY_MERGE_KEEP_OPEN_CHILDREN` | `false` | Nor does it finish an issue with open child issues. |
 | `RELAY_MERGE_QUEUE` | `true` | When the merge queue drops a PR without a conflict: send it back if a check failed, or tell the board if a run was cancelled or the queue timed out. Needs a GitHub token with **Actions: Read** (and **Checks: Read** for the failure annotation); without one it is off, and the log says so once. |
 | `RELAY_REQUEUE_ON_INFRA_DROP` | `false` | Also queue such a PR again (not after a failed check), once per head commit, if a person queued it. Needs a token allowed to merge. |
 | `RELAY_CONFLICT_SWEEP_SEC` | `900` | Also look at every open PR this often. `0`: only after a merge. Otherwise at least 60. |
