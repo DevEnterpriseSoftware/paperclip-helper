@@ -71,6 +71,72 @@ test("a usage limit pauses the account's idle agents, waits for busy ones, and t
   assert.equal(other.status, "idle");
 });
 
+test("agents with their own config directory but the same token secret share one account: one failure pauses them all", async (t) => {
+  const env = await limitEnv(t);
+  const dir = { CLAUDE_CONFIG_DIR: { type: "plain", value: "***REDACTED***" } };
+  const [a, b, c] = ["Engineer", "Reviewer", "Architect"].map((name) => claude(env.db, name, { ...dir, ...secret("sub-1") }));
+  failedRun(env.db, a, { at: T0 - MIN });
+  await env.watchdog.tick();
+  assert.deepEqual([a, b, c].map((x) => x.status), ["paused", "paused", "paused"]);
+});
+
+test("an agent whose run starts just before its pause is left running, and paused once that run ends", async (t) => {
+  const env = await limitEnv(t);
+  const engineer = claude(env.db, "Engineer");
+  const reviewer = claude(env.db, "Reviewer");
+  failedRun(env.db, engineer, { at: T0 - MIN });
+  // A retry starts for the reviewer after the tick read the company's runs.
+  let started = null;
+  env.db.onRequest = (method, path) => {
+    if (started || method !== "GET" || !path.includes(`heartbeat-runs?agentId=${reviewer.id}`)) return;
+    started = { id: uuid(), companyId: ids.company, agentId: reviewer.id, status: "running", createdAt: iso(T0) };
+    env.db.heartbeatRuns.push(started);
+  };
+  await env.watchdog.tick();
+  assert.equal(engineer.status, "paused");
+  assert.equal(reviewer.status, "idle");
+  assert.equal(started.status, "running", "the run that started wasn't cancelled");
+  assert.match(env.db.comments.find((c) => c.identifier === "ACM-1").body, /and 1 more once its current run ends \(Reviewer\)/);
+
+  started.status = "succeeded";
+  env.clock.at += MIN;
+  await env.watchdog.tick();
+  assert.equal(reviewer.status, "paused");
+});
+
+test("an agent kept busy by its own failing retries is logged once, not paused", async (t) => {
+  const env = await limitEnv(t);
+  const engineer = claude(env.db, "Engineer");
+  const busy = claude(env.db, "Architect");
+  failedRun(env.db, engineer, { at: T0 - MIN });
+  for (let i = 0; i < 40; i++) {
+    // The busy agent's run fails on the limit every five ticks, and a retry is queued at once.
+    if (i % 5 === 0) {
+      for (const r of env.db.heartbeatRuns) if (r.agentId === busy.id && r.status === "queued") r.status = "failed";
+      failedRun(env.db, busy, { at: env.clock.at });
+      env.db.heartbeatRuns.push({ id: uuid(), companyId: ids.company, agentId: busy.id, status: "queued", createdAt: iso(env.clock.at + 1) });
+    }
+    await env.watchdog.tick();
+    env.clock.at += MIN;
+  }
+  assert.equal(busy.status, "idle");
+  assert.equal(env.logs.filter((l) => /has had a run queued or going for a long time/.test(l.msg)).length, 1);
+});
+
+test("an agent kept busy by its runs for a long time is logged once, not paused", async (t) => {
+  const env = await limitEnv(t);
+  const engineer = claude(env.db, "Engineer");
+  const busy = claude(env.db, "Architect");
+  failedRun(env.db, engineer, { at: T0 - MIN });
+  env.db.heartbeatRuns.push({ id: uuid(), companyId: ids.company, agentId: busy.id, status: "queued", createdAt: iso(T0 - MIN) });
+  for (let i = 0; i < 32; i++) {
+    await env.watchdog.tick();
+    env.clock.at += MIN;
+  }
+  assert.equal(busy.status, "idle");
+  assert.equal(env.logs.filter((l) => /has had a run queued or going for a long time/.test(l.msg)).length, 1);
+});
+
 test("the agents are resumed at the reset plus the grace, not before, and the old failures don't pause them again", async (t) => {
   const env = await limitEnv(t);
   const engineer = claude(env.db, "Engineer");
@@ -201,6 +267,9 @@ test("an issue Paperclip blocked during the limit's pause is restored after the 
   env.clock.at = Date.parse("2026-10-12T15:06:00Z");
   await env.watchdog.tick();
   assert.equal(engineer.status, "idle");
+  assert.equal(issue.status, "blocked", "not before the resume has settled");
+  env.clock.at += 10 * MIN;
+  await env.watchdog.tick();
   assert.equal(issue.status, "todo");
 });
 
@@ -304,9 +373,16 @@ test("isClaudeLimitFailure and subscriptionOf", () => {
   assert.equal(subscriptionOf({ id: "e", adapterType: "codex_local" }), null);
   // Paperclip's order: the API key wins over the OAuth token.
   assert.equal(subscriptionOf({ id: "f", adapterType: "claude_local", adapterConfig: { env: { ...secret("s1"), ANTHROPIC_API_KEY: { type: "secret_ref", secretId: "k" } } } }), "ANTHROPIC_API_KEY:secret:k");
-  // Bedrock, its own config directory, a proxy, a managed connection: not the shared login.
-  for (const env of [{ CLAUDE_CODE_USE_BEDROCK: "1" }, { CLAUDE_CONFIG_DIR: { type: "plain", value: "***REDACTED***" } }, { ANTHROPIC_BASE_URL: "https://proxy" }]) {
+  // Bedrock, a proxy, a managed connection: not the shared login.
+  for (const env of [{ CLAUDE_CODE_USE_BEDROCK: "1" }, { ANTHROPIC_BASE_URL: "https://proxy" }, { ...secret("s1"), ANTHROPIC_AUTH_TOKEN: { type: "plain", value: "***REDACTED***" } }]) {
     assert.equal(subscriptionOf({ id: "g", adapterType: "claude_local", adapterConfig: { env } }), "agent:g", JSON.stringify(env));
   }
+  // Its own config directory: with a token secret bound, the token decides the account.
+  const ownDir = { CLAUDE_CONFIG_DIR: { type: "plain", value: "***REDACTED***" } };
+  assert.equal(subscriptionOf({ id: "g", adapterType: "claude_local", adapterConfig: { env: { ...ownDir, ...secret("s1") } } }), "CLAUDE_CODE_OAUTH_TOKEN:secret:s1");
+  // Without a token, the directory holds the login: the same directory is the same login,
+  // and a redacted one can't be compared.
+  assert.equal(subscriptionOf({ id: "g", adapterType: "claude_local", adapterConfig: { env: ownDir } }), "agent:g");
+  assert.equal(subscriptionOf({ id: "g", adapterType: "claude_local", adapterConfig: { env: { CLAUDE_CONFIG_DIR: "/home/pc/.claude-a" } } }), "host-login:/home/pc/.claude-a");
   assert.equal(subscriptionOf({ id: "h", adapterType: "claude_local", adapterConfig: {}, runtimeConfig: { aiConnection: { mode: "grant" } } }), "agent:h");
 });

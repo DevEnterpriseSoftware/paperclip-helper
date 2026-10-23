@@ -210,6 +210,13 @@ test("your merge of an issue's own PR closes it as done when its stages were wip
   const waiting = { id: uuid(), identifier: "ACM-31", companyId: ids.company, status: "in_review", executionState: waitingOnMe };
   env.db.issues.push(waiting);
   assert.equal((await env.relay.handle("pull_request", mergedEvent(31, "ACM-31"))).action, "approve");
+
+  // Blocked waits on something the merge doesn't settle: the merge is only a comment.
+  const blocked = { id: uuid(), identifier: "ACM-32", companyId: ids.company, status: "blocked", assigneeAgentId: env.codex.id, executionPolicy: null };
+  env.db.issues.push(blocked);
+  wipe(env.db, blocked, env.codex);
+  assert.equal((await env.relay.handle("pull_request", mergedEvent(32, "ACM-32: change"))).action, "comment");
+  assert.equal(blocked.status, "blocked");
 });
 
 test("a merge with no wipe on record, a merge by someone else, or another issue's PR, closes nothing", async (t) => {

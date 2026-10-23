@@ -38,7 +38,8 @@ export function answerFor(card, text) {
   // A label first: an option's id can read like another option's label.
   const picked = options.find((o) => same(o.label)) ?? options.find((o) => same(o.id));
   if (picked) return { body: { answers: [{ questionId: q.id, optionIds: [picked.id] }] }, prompt, answer: picked.label ?? picked.id };
-  const typed = q.allowOther || (q.options ?? []).some((o) => o.freeText);
+  // A text question takes a typed answer even if Paperclip didn't store its free-text option.
+  const typed = q.answerMode === "text" || q.allowOther || (q.options ?? []).some((o) => o.freeText);
   if (!typed) {
     throw new Error(options.length ? `"${prompt}" takes one of: ${options.map((o) => o.label ?? o.id).join(", ")}.` : `"${prompt}" takes no typed answer and has no options: answer it in Paperclip.`);
   }

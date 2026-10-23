@@ -114,18 +114,22 @@ export function parseReset(text, now) {
   return null;
 }
 
-// Settings that send an agent's runs somewhere other than a shared Claude login:
-// Bedrock, its own Claude config directory, a proxy or another token type.
-const OWN_ROUTE = ["CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BEDROCK_BASE_URL", "CLAUDE_CONFIG_DIR", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
+// Settings that send an agent's runs somewhere other than a Claude account's
+// token or login: Bedrock, a proxy, or another token type.
+const OWN_ROUTE = ["CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
 const isSet = (value) => value != null && value !== "" && value !== "0" && value !== "false";
+const REDACTED = /^\*+REDACTED\*+$/;
 
 // Which Claude account an agent's runs are billed to, as far as Paperclip shows,
 // in the order Paperclip's claude-local adapter picks credentials: the secret
-// behind ANTHROPIC_API_KEY, else behind CLAUDE_CODE_OAUTH_TOKEN, else the
-// machine's own Claude login. An agent whose account can't be compared (a token
-// typed in as plain text, which Paperclip redacts; Bedrock, its own config
-// directory or a proxy; a managed AI connection) is its own group: it is paused
-// when it fails itself. null for an agent that isn't a Claude agent.
+// behind ANTHROPIC_API_KEY, else behind CLAUDE_CODE_OAUTH_TOKEN, else the Claude
+// login stored in its config directory (CLAUDE_CONFIG_DIR, or the machine's
+// default). A token in the environment wins over the stored login, so a
+// per-agent CLAUDE_CONFIG_DIR (its own sessions and settings) doesn't change the
+// account when a token secret is bound. An agent whose account can't be compared
+// (a token typed in as plain text, or a config directory, which Paperclip
+// redacts; Bedrock or a proxy; a managed AI connection) is its own group: it is
+// paused when it fails itself. null for an agent that isn't a Claude agent.
 export function subscriptionOf(agent) {
   if (agent?.adapterType !== "claude_local") return null;
   const own = `agent:${agent.id}`;
@@ -138,7 +142,12 @@ export function subscriptionOf(agent) {
     if (binding?.type === "secret_ref" && binding.secretId) return `${name}:secret:${binding.secretId}`;
     return own;
   }
-  return "host-login";
+  // No token: the login stored in the config directory. The same directory is the same login.
+  const dir = env.CLAUDE_CONFIG_DIR;
+  if (dir == null || dir === "") return "host-login";
+  if (dir?.type === "secret_ref" && dir.secretId) return `host-login:secret:${dir.secretId}`;
+  const path = typeof dir === "string" ? dir : dir?.value;
+  return path && !REDACTED.test(path) ? `host-login:${path}` : own;
 }
 
 // A short, readable reset time for the board: in the zone Claude named.
@@ -179,6 +188,8 @@ const SAME_EVENT_MS = 6 * 60 * 60_000;
 const PAUSE_MATCH_MS = 60_000;
 // Resume attempts per agent before it's left to you.
 const MAX_RESUME_TRIES = 5;
+// Ticks an agent may stay busy (its runs keep it from being paused) before the log says so.
+const LONG_WAIT_TICKS = 30;
 
 const names = (list) => list.join(", ");
 
@@ -186,7 +197,8 @@ const names = (list) => list.join(", ");
 // has no live run; tell the board once; resume exactly those agents at the reset.
 // One record per company and account in the watchdog's records,
 // `limit:<companyId>:<account>`: { resetAt, timeZone, unknownReset, waitMs, paused:
-// { agentId: { name, pausedAt, tries } }, notified, runId, resumedAt }.
+// { agentId: { name, pausedAt, tries } }, waitTicks: { agentId: ticks busy }, notified,
+// runId, resumedAt }.
 export function createLimitCheck({ api, config, log, records, state, now, stats, dryRunSeen }) {
   const graceMs = config.watchdogLimitResumeGraceMin * 60_000;
   const keyOf = (companyId, account) => `limit:${companyId}:${account}`;
@@ -255,8 +267,33 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
       unknownReset: active ? prior.unknownReset && !reset : !reset,
       waitMs,
       paused: active ? prior.paused : {},
+      // Kept while the event lasts: a busy agent's retries failing on the limit again extend it.
+      waitTicks: active ? prior.waitTicks ?? {} : {},
       notified: active ? prior.notified : Boolean(repeat && prior.notified),
     };
+  }
+
+  // Whether the agent is busy right now: a fresh read just before pausing it, since
+  // a retry or a new wake can start a run after the tick's list was read. null when
+  // Paperclip doesn't answer, or the agent was paused or stopped meanwhile (looked at
+  // again next tick).
+  async function busyNow(companyId, agent) {
+    const [fresh, runs] = await Promise.all([
+      api.request("GET", `/api/agents/${agent.id}`).catch(() => null),
+      api.request("GET", `/api/companies/${companyId}/heartbeat-runs?agentId=${agent.id}&limit=5`).catch(() => null),
+    ]);
+    if (!fresh || !Array.isArray(runs) || asleep(fresh)) return null;
+    return fresh.status === "running" || runs.some((r) => r.agentId === agent.id && LIVE.has(r.status));
+  }
+
+  // Waiting for a busy agent's runs to end is right (pausing would cancel them), but
+  // a run that keeps being retried can hold it off until the reset: say so, once.
+  function stillWaiting(event, agent) {
+    const ticks = (event.waitTicks ??= {});
+    ticks[agent.id] = (ticks[agent.id] ?? 0) + 1;
+    if (ticks[agent.id] === LONG_WAIT_TICKS) {
+      log.warn("watchdog: an agent at its Claude usage limit has had a run queued or going for a long time, so it hasn't been paused; pausing it yourself cancels that run", { agent: agent.name, ticks: LONG_WAIT_TICKS });
+    }
   }
 
   // Pauses the account's agents that have no live run; returns those still busy.
@@ -268,10 +305,17 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
       const live = agent.status === "running" || runs.some((r) => r.agentId === agent.id && LIVE.has(r.status));
       if (live) {
         waiting.push(agent);
+        stillWaiting(event, agent);
         continue;
       }
       if (config.dryRun) {
         once(`limit-pause:${event.runId}:${agent.id}`, () => log("watchdog: would pause an agent until its Claude usage limit resets (dry run)", { agent: agent.name }));
+        continue;
+      }
+      // Busy, or Paperclip didn't say: not paused this tick, and counted as waiting.
+      if ((await busyNow(event.companyId, agent)) !== false) {
+        waiting.push(agent);
+        stillWaiting(event, agent);
         continue;
       }
       let paused;

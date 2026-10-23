@@ -83,15 +83,18 @@ async function resumeEnv(t, extra = {}) {
   // The test clock runs a little behind the fake's own: Paperclip-side timestamps the
   // fake writes (updatedAt) are then never older than the watchdog thinks.
   const clock = { at: Date.now() - 60 * MIN };
-  const env = await setup({ env: { WATCHDOG_STALL_SEC: "180", ...extra }, now: () => clock.at });
+  const env = await setup({ env: { WATCHDOG_STALL_SEC: "180", WATCHDOG_RESUME_SETTLE_MIN: "0", ...extra }, now: () => clock.at });
   t.after(env.close);
   env.db.simulateWakes = true;
   return { ...env, clock, watchdog: createWatchdog(env.ctx, env.state) };
 }
 
+// Like Paperclip's pause: it also cancels the agent's queued and running runs.
 const pause = (env, a) => {
   a.status = "paused";
   a.pausedAt = iso(env.clock.at);
+  const runs = [...env.db.heartbeatRuns, ...Object.values(env.db.issueRuns).flat()];
+  for (const r of runs) if (r.agentId === a.id && ["queued", "running"].includes(r.status)) Object.assign(r, { status: "cancelled", errorCode: "agent_paused" });
 };
 const resume = (a) => {
   a.status = "idle";
@@ -494,6 +497,114 @@ test("one postponed issue doesn't keep check 6 off the agent's other blocked iss
   assert.equal(held.status, "blocked");
   assert.equal(env.db.comments.filter((c) => c.via === "comment" && c.issueId === parked.id).length, 1);
   assert.equal(env.db.comments.filter((c) => c.issueId === held.id && c.via).length, 0);
+});
+
+test("a resume is acted on once it has settled; a pause within the window restores and nudges nothing", async (t) => {
+  const env = await resumeEnv(t, { WATCHDOG_RESUME_SETTLE_MIN: "10" });
+  const engineer = agent(env.db, { runtimeConfig: { heartbeat: { maxConcurrentRuns: 5 } } });
+  await env.watchdog.tick();
+  pause(env, engineer);
+  await env.watchdog.tick();
+  env.clock.at += MIN;
+  const held = recoveryBlock(env.db, engineer, { at: env.clock.at });
+  // Parked before the pause: check 6's, which waits for the window too.
+  const parked = recoveryBlock(env.db, engineer, { at: env.clock.at - 30 * MIN });
+  env.clock.at += MIN;
+  const touched = () => env.db.patches.length + env.db.comments.filter((c) => c.via === "comment").length;
+
+  // A brief resume: the board checks one thing and pauses again.
+  resume(engineer);
+  await env.watchdog.tick();
+  env.clock.at += 5 * MIN;
+  await env.watchdog.tick();
+  assert.equal(touched(), 0, "nothing in the settle window");
+  pause(env, engineer);
+  env.clock.at += MIN;
+  await env.watchdog.tick();
+  assert.equal(touched(), 0);
+  assert.equal(env.state.nudges.has(`agent-paused:${engineer.id}`), true, "the sweep was called off, the first pause kept");
+
+  // Resumed for good: acted on once the window has passed.
+  env.clock.at += 30 * MIN;
+  resume(engineer);
+  await env.watchdog.tick();
+  env.clock.at += 9 * MIN;
+  await env.watchdog.tick();
+  assert.equal(touched(), 0);
+  env.clock.at += 2 * MIN;
+  await env.watchdog.tick();
+  assert.equal(held.status, "in_progress");
+  assert.equal(env.db.comments.filter((c) => c.via === "comment" && c.issueId === parked.id).length, 1);
+});
+
+test("with the sweep off, check 6 still waits for the resume to settle", async (t) => {
+  const env = await resumeEnv(t, { WATCHDOG_RESUME_SWEEP: "false", WATCHDOG_RESUME_SETTLE_MIN: "10" });
+  const engineer = agent(env.db, { runtimeConfig: { heartbeat: { maxConcurrentRuns: 5 } } });
+  await env.watchdog.tick();
+  pause(env, engineer);
+  await env.watchdog.tick();
+  const parked = recoveryBlock(env.db, engineer, { at: env.clock.at - 30 * MIN });
+  env.clock.at += MIN;
+  resume(engineer);
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.filter((c) => c.via === "comment" && c.issueId === parked.id).length, 0);
+  env.clock.at += 11 * MIN;
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.filter((c) => c.via === "comment" && c.issueId === parked.id).length, 1);
+  assert.equal(env.db.patches.length, 0, "the sweep itself stays off");
+});
+
+test("check 6 is paced like the sweep: no more nudges than the agent has free runs", async (t) => {
+  const env = await resumeEnv(t);
+  const engineer = agent(env.db, { runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } } });
+  const parked = [];
+  for (let i = 0; i < 4; i++) parked.push(recoveryBlock(env.db, engineer, { at: env.clock.at - 30 * MIN }));
+  const nudged = () => env.db.comments.filter((c) => c.via === "comment").length;
+  await env.watchdog.tick();
+  assert.equal(nudged(), 2);
+  await env.watchdog.tick(); // their runs are still queued
+  assert.equal(nudged(), 2);
+  finishRuns(env);
+  await env.watchdog.tick();
+  assert.equal(nudged(), 4);
+});
+
+test("the agent's other queued runs count: a resume that releases deferred wakes restores nothing until they finish", async (t) => {
+  const env = await resumeEnv(t);
+  const engineer = agent(env.db, { runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } } });
+  await env.watchdog.tick();
+  pause(env, engineer);
+  await env.watchdog.tick();
+  env.clock.at += MIN;
+  const issue = recoveryBlock(env.db, engineer, { at: env.clock.at });
+  env.clock.at += MIN;
+  resume(engineer);
+  // Paperclip releases two wakes it deferred during the pause, on other issues.
+  for (let i = 0; i < 2; i++) env.db.heartbeatRuns.push({ id: uuid(), companyId: ids.company, agentId: engineer.id, status: "queued", createdAt: iso(env.clock.at) });
+  await env.watchdog.tick();
+  assert.equal(issue.status, "blocked");
+  for (const r of env.db.heartbeatRuns) if (r.status === "queued") r.status = "succeeded";
+  await env.watchdog.tick();
+  assert.equal(issue.status, "in_progress");
+});
+
+test("an agent paused again during the tick isn't given its issues back", async (t) => {
+  const env = await resumeEnv(t);
+  const engineer = agent(env.db, { runtimeConfig: { heartbeat: { maxConcurrentRuns: 5 } } });
+  await env.watchdog.tick();
+  pause(env, engineer);
+  await env.watchdog.tick();
+  env.clock.at += MIN;
+  const issue = recoveryBlock(env.db, engineer, { at: env.clock.at });
+  env.clock.at += MIN;
+  resume(engineer);
+  // Paused again after the tick listed the agents, just before the restore.
+  env.db.onRequest = (method, path) => {
+    if (method === "GET" && path.startsWith(`/api/issues/${issue.id}/runs`)) pause(env, engineer);
+  };
+  await env.watchdog.tick();
+  assert.equal(issue.status, "blocked");
+  assert.equal(env.db.patches.length, 0);
 });
 
 test("a dry run leaves the sweep for the real run", async (t) => {

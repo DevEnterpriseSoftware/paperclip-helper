@@ -126,3 +126,11 @@ test("a complete .env loads without problems, trimming URLs and upper-casing pre
   assert.deepEqual(config.prefixes, ["ABC", "DEF"]);
   assert.deepEqual(serviceProblems(config), []);
 });
+
+test("merge-queue handling is on by default, independent of RELAY_FIX_CONFLICTS; RELAY_MERGE_QUEUE=false turns it off", () => {
+  const relay = { GITHUB_WEBHOOK_SECRET: "s", GITHUB_OWNER_LOGIN: "Octo", GITHUB_REPOS: "org/app", GITHUB_TOKEN: "t" };
+  assert.equal(loadConfig(relay).config.relayMergeQueue, true);
+  assert.equal(loadConfig({ ...relay, RELAY_FIX_CONFLICTS: "false" }).config.relayMergeQueue, true);
+  assert.equal(loadConfig({ ...relay, RELAY_MERGE_QUEUE: "false" }).config.relayMergeQueue, false);
+  assert.equal(loadConfig(relay).config.relayRequeueOnInfraDrop, false);
+});

@@ -149,7 +149,8 @@ export function loadConfig(env = process.env) {
     conflictSweepSec: num("RELAY_CONFLICT_SWEEP_SEC", 900),
     // A PR the merge queue drops without a conflict: a failed check sends it back to its
     // agent, a cancelled run or the queue's timeout is noted for the board (needs a token).
-    relayMergeQueue: null, // set below: defaults to RELAY_FIX_CONFLICTS
+    // On by default; it needs a GitHub token, and without one the relay says once that it is off.
+    relayMergeQueue: bool("RELAY_MERGE_QUEUE", true),
     // Queue such a PR again yourself (once per head commit, only one a person queued).
     // Needs a token allowed to merge (GraphQL enqueuePullRequest). Off by default.
     relayRequeueOnInfraDrop: bool("RELAY_REQUEUE_ON_INFRA_DROP", false),
@@ -190,10 +191,14 @@ export function loadConfig(env = process.env) {
     // counts as resolved.
     watchdogCancelledBlockers: bool("WATCHDOG_CANCELLED_BLOCKERS", true),
     // When a paused agent is resumed, restore its issues Paperclip's recovery blocked
-    // during the pause ("the original assignee is not invokable"), at most
-    // WATCHDOG_RESUME_SWEEP_LIMIT per agent per tick (0: the agent's maxConcurrentRuns).
+    // during the pause ("the original assignee is not invokable"). WATCHDOG_RESUME_SWEEP_LIMIT:
+    // the runs the watchdog may give an agent at once, counting those it has queued or
+    // going, for these restores and for 6's nudges (0: the agent's maxConcurrentRuns).
     watchdogResumeSweep: bool("WATCHDOG_RESUME_SWEEP", true),
     watchdogResumeSweepLimit: Math.floor(num("WATCHDOG_RESUME_SWEEP_LIMIT", 0)),
+    // Minutes a resume must hold before the agent's blocked issues are touched: a
+    // resume to check one thing, then a pause again, restores and wakes nothing.
+    watchdogResumeSettleMin: Math.max(0, num("WATCHDOG_RESUME_SETTLE_MIN", 10)),
     // When a Claude account hits its usage limit, pause its agents (each once idle) and
     // resume them this many minutes after the reset. A comment goes on
     // WATCHDOG_NOTIFY_ISSUE (an issue identifier) when it happens, if set.
@@ -215,8 +220,6 @@ export function loadConfig(env = process.env) {
     costSyncSettleSec: num("COST_SYNC_SETTLE_SEC", 300),
   };
   if (!config.costSyncAdapters.length) config.costSyncAdapters = ["claude_local", "codex_local"];
-  // Merge-queue drops send PRs back like conflicts do, so they follow that choice unless set.
-  config.relayMergeQueue = bool("RELAY_MERGE_QUEUE", config.relayFixConflicts);
 
   const relayProblems = [];
   if (!config.secret) relayProblems.push("GITHUB_WEBHOOK_SECRET is not set");

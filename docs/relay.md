@@ -51,7 +51,7 @@ A decision that is recorded gets no reply. For comments, GitHub doesn't send the
 
 ## Merging an issue whose review stages were wiped
 
-When an agent's update wipes an issue's review stages (a Paperclip bug: [watchdog 17](watchdog.md#17-issues-whose-review-stages-were-wiped)), your merge has no approval stage to record, so the issue stayed open and its dependants couldn't start. With `RELAY_DONE_WITHOUT_STAGES` on (the default), when you merge a PR and its own issue (the first one it names) isn't done or cancelled, has no stage pending, and Paperclip's activity log shows an agent's update removed its stages, the relay closes it as done with the merge comment, as the approval would have. An issue that never had stages, a PR that only mentions the issue, a merge by someone else and a `/approve` on a PR not yet merged are handled as before.
+When an agent's update wipes an issue's review stages (a Paperclip bug: [watchdog 17](watchdog.md#17-issues-whose-review-stages-were-wiped)), your merge has no approval stage to record, so the issue stayed open and its dependants couldn't start. With `RELAY_DONE_WITHOUT_STAGES` on (the default), when you merge a PR and its own issue (the first one it names) is in todo, in progress or in review, has no stage pending, and Paperclip's activity log shows an agent's update removed its stages, the relay closes it as done with the merge comment, as the approval would have. An issue that never had stages, a blocked issue (it waits on a blocker or a recovery decision the merge doesn't settle), a PR that only mentions the issue, a merge by someone else and a `/approve` on a PR not yet merged are handled as before.
 
 ## PRs with merge conflicts
 
@@ -87,17 +87,19 @@ Every look is one log line, `relay: conflict sweep`, listing each PR it acted on
 
 GitHub's merge queue tests each queued PR combined with the base branch and the PRs ahead of it, on a temporary branch (`gh-readonly-queue/<base>/pr-<n>-…`, workflow runs with event `merge_group`), and removes it when that goes wrong (`pull_request.dequeued`, from `github-merge-queue[bot]`, with a `reason`). A drop for a conflict was always sent back; anything else left the PR sitting unmerged until someone noticed.
 
-With `RELAY_MERGE_QUEUE` on (it follows `RELAY_FIX_CONFLICTS` unless you set it) and a GitHub token with **Actions: Read**, the relay goes by GitHub's reason and the runs of the PR's latest merge group:
+With `RELAY_MERGE_QUEUE` on (the default) and a GitHub token with **Actions: Read** (without a token it stays off, and the log says so once at start), the relay goes by GitHub's reason and the runs of the PR's latest merge group:
 
 | Reason | What it finds | What it does |
 |---|---|---|
-| `CI_FAILURE` | A job failed (a test, a check that only fails on the combined change). | Sends the PR back [like a conflict](#prs-with-merge-conflicts), with the run, the failed jobs and the first failure annotation (that needs **Checks: Read**; without it the brief has none), and a note on the PR (`RELAY_CONFLICT_PR_COMMENT`). |
+| `CI_FAILURE` | A job failed (a test, a check that only fails on the combined change), or timed out. | Sends the PR back [like a conflict](#prs-with-merge-conflicts), with the run, the failed jobs and the first failure annotation (that needs **Checks: Read**; without it the brief has none), and a note on the PR (`RELAY_CONFLICT_PR_COMMENT`). |
 | `CI_FAILURE` | Only a cancelled job (a runner restarted mid-run). | Tells the board the PR isn't at fault: queue it again. |
 | `CI_FAILURE` | No failed or cancelled job to show. | Tells the board it couldn't tell why, rather than guess. |
 | `CI_TIMEOUT` | (not looked at) | The queue's status-check timeout ran out while the checks waited for a runner. Tells the board to queue it again; never sent back. |
-| `MERGE_CONFLICT` | The PR conflicts with its base. | The [conflict sweep](#prs-with-merge-conflicts) sends it back, as before. |
+| `MERGE_CONFLICT` | The PR conflicts with its base. | The [conflict sweep](#prs-with-merge-conflicts) sends it back, as before (with `RELAY_FIX_CONFLICTS`). |
 | `MERGE_CONFLICT` | It conflicts only with a PR ahead of it. | Tells the board to queue it again once that PR has merged. |
 | anything else | | Nothing: removed by hand, branch protections, the queue cleared. |
+
+A job that **timed out** counts as the PR's: it ran past its own `timeout-minutes`, which is usually the change (a slow or hanging test). On a single self-hosted runner a timeout can also be the runner; the agent's brief names the job, so it can say so. A job **cancelled** by a runner restart isn't the PR's.
 
 Without a reason (an older GitHub Enterprise Server), the runs decide the same way; with no merge-group run found, nothing is done.
 
@@ -176,7 +178,7 @@ Paperclip builds an issue's "GitHub Pull Request" rows from full `github.com/<ow
 | `RELAY_CONFLICT_MAX_ATTEMPTS` | `2` | Send-backs per PR while it keeps conflicting, one per push, before it is left to you. |
 | `RELAY_CONFLICT_PR_COMMENT` | `true` | Say on the PR that it was sent back. |
 | `RELAY_DONE_WITHOUT_STAGES` | `true` | When you merge an issue's own PR and its review stages were wiped, close it as done. |
-| `RELAY_MERGE_QUEUE` | as `RELAY_FIX_CONFLICTS` | When the merge queue drops a PR without a conflict: send it back if a check failed, or tell the board if a run was cancelled or the queue timed out. Needs a GitHub token with **Actions: Read** (and **Checks: Read** for the failure annotation). |
+| `RELAY_MERGE_QUEUE` | `true` | When the merge queue drops a PR without a conflict: send it back if a check failed, or tell the board if a run was cancelled or the queue timed out. Needs a GitHub token with **Actions: Read** (and **Checks: Read** for the failure annotation); without one it is off, and the log says so once. |
 | `RELAY_REQUEUE_ON_INFRA_DROP` | `false` | Also queue such a PR again (not after a failed check), once per head commit, if a person queued it. Needs a token allowed to merge. |
 | `RELAY_CONFLICT_SWEEP_SEC` | `900` | Also look at every open PR this often. `0`: only after a merge. Otherwise at least 60. |
 | `GITHUB_API` | `https://api.github.com` | For GitHub Enterprise Server: `https://<host>/api/v3`. |

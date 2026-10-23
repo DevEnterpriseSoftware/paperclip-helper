@@ -113,6 +113,9 @@ test("pch answer refuses what it can't answer, and lists the pending cards", asy
   assert.equal(findCard([textCard, choiceCard], "c0ffee00-0000-4000-8000-000000000002").id, choiceCard.id);
   assert.throws(() => answerFor(choiceCard, "QA"), /"Which environment\?" takes one of: Staging, Production\./);
   assert.throws(() => answerFor({ ...textCard, kind: "request_confirmation" }, "yes"), /request_confirmation, not questions/);
+  // A text question takes a typed answer even without a stored free-text option.
+  const bare = { kind: "ask_user_questions", payload: { questions: [{ id: "q1", prompt: "Paste the report", answerMode: "text", options: [] }] } };
+  assert.deepEqual(answerFor(bare, "All green").body, { answers: [{ questionId: "q1", optionIds: [], otherText: "All green" }] });
   const two = { ...textCard, payload: { questions: [...textCard.payload.questions, choiceCard.payload.questions[0]] } };
   assert.throws(() => answerFor(two, "x"), /asks 2 questions/);
   assert.throws(() => answerFor(textCard, "  "), /usage: pch answer/);

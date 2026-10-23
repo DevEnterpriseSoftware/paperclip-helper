@@ -211,7 +211,7 @@ test("RELAY_REQUEUE_ON_INFRA_DROP queues it again, once per commit, only when a 
   assert.equal(refused.logs.filter((l) => /couldn't queue the PR again/.test(l.msg)).length, 1);
 });
 
-test("dry run changes nothing on any path; RELAY_MERGE_QUEUE follows RELAY_FIX_CONFLICTS unless set", async (t) => {
+test("dry run changes nothing on any path; RELAY_MERGE_QUEUE is on by default, and off when set false or without a token", async (t) => {
   for (const [conclusion, jobs] of [["failure", [["test", "failure"]]], ["cancelled", [["test", "cancelled"]]]]) {
     const env = await queueEnv(t, { DRY_RUN: "true", RELAY_REQUEUE_ON_INFRA_DROP: "true" });
     await env.relay.handle("pull_request", { ...dequeued(), action: "enqueued", sender: { login: "Owner" } });
@@ -219,9 +219,19 @@ test("dry run changes nothing on any path; RELAY_MERGE_QUEUE follows RELAY_FIX_C
     await drop(env);
     assert.equal(env.db.patches.length + env.db.comments.length + env.gh.comments.length + env.gh.graphql.length, 0, conclusion);
   }
-  const off = await queueEnv(t, { RELAY_MERGE_QUEUE: "" });
+  // Unset, with RELAY_FIX_CONFLICTS off: on.
+  const byDefault = await queueEnv(t, { RELAY_MERGE_QUEUE: "", RELAY_FIX_CONFLICTS: "false" });
+  groupRun(byDefault.gh, { conclusion: "failure", jobs: [["test", "failure"]] });
+  assert.equal((await drop(byDefault)).queued, "merge-queue drop");
+
+  const off = await queueEnv(t, { RELAY_MERGE_QUEUE: "false" });
   groupRun(off.gh, { conclusion: "failure", jobs: [["test", "failure"]] });
   assert.match((await drop(off)).ignored, /RELAY_MERGE_QUEUE is off/);
+
+  // No token: off, and the log says so once, when the relay starts.
+  const noToken = await queueEnv(t, { RELAY_MERGE_QUEUE: "", GITHUB_TOKEN: "" });
+  assert.match((await drop(noToken)).ignored, /no GitHub token/);
+  assert.equal(noToken.logs.filter((l) => /merge-queue drops aren't handled: no GitHub token/.test(l.msg)).length, 1);
 });
 
 test("a failure in the background is logged with the PR, and the delivery can be redelivered", async (t) => {

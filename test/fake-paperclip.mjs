@@ -77,7 +77,11 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     const runs = (db.issueRuns[issue.id] ??= []);
     // One wake per issue and agent at a time: a later one coalesces into the queued run.
     if (runs.some((r) => r.agentId === agent.id && r.status === "queued")) return;
-    runs.unshift({ runId: uuid(), agentId: agent.id, status: "queued", reason, createdAt: new Date().toISOString() });
+    // The same run in the company's run list, as Paperclip lists it (heartbeat-runs).
+    const runId = uuid();
+    const run = { id: runId, runId, companyId: issue.companyId, agentId: agent.id, status: "queued", reason, createdAt: new Date().toISOString() };
+    runs.unshift(run);
+    db.heartbeatRuns.push(run);
   };
   const issueByRef = (ref) => db.issues.find((i) => i.id === ref || i.identifier?.toUpperCase() === String(ref).toUpperCase());
   const actor = (req) => {
@@ -95,6 +99,8 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     const p = url.pathname;
     const q = url.searchParams;
     requests.push({ method: req.method, path: p + url.search, body, host: req.headers.host });
+    // A test's hook: change the world between two of the helper's requests.
+    db.onRequest?.(req.method, p + url.search);
     const send = (status, data) => {
       res.writeHead(status, { "content-type": "application/json" });
       res.end(data === undefined ? "" : JSON.stringify(data));

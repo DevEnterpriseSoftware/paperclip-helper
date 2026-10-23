@@ -546,7 +546,8 @@ test("a blocked issue with no linked blocker and no recovery hold is left alone"
 test("no repair and no hold release while the assignee is paused", async (t) => {
   // DIR-109: the repair moved the issue to todo while its assignee was paused, and
   // Paperclip's recovery blocked it again for a board decision.
-  const env = await watchdogEnv(t);
+  // (No settle window after the resume here: watchdog-resume.test.mjs covers it.)
+  const env = await watchdogEnv(t, { WATCHDOG_RESUME_SETTLE_MIN: "0" });
   const { engineer } = agents(env.db);
   engineer.status = "paused";
   const workspaceId = uuid();
@@ -593,7 +594,7 @@ function parkedIssue(env, action = {}) {
 }
 
 test("an issue Paperclip's recovery parked is nudged once its assignee is available, capped", async (t) => {
-  const env = await watchdogEnv(t);
+  const env = await watchdogEnv(t, { WATCHDOG_RESUME_SETTLE_MIN: "0" });
   const { issue, engineer } = parkedIssue(env);
 
   engineer.status = "paused";
@@ -654,6 +655,25 @@ test("a parked issue whose provider failure is old (the limit has reset) is nudg
     createdAt: minutesAgo(25 * 60), finishedAt: minutesAgo(25 * 60 - 1) });
   await env.watchdog.tick();
   assert.equal(env.db.comments.length, 1);
+});
+
+test("a parked issue whose deferred retry is spent doesn't take the agent's only run from another parked issue", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue: spent, engineer } = parkedIssue(env); // no maxConcurrentRuns shown: one run at a time
+  env.db.queuedComments[spent.id] = {
+    issueId: spent.id, queueId: uuid(), state: "deferred", targetRunId: null, revision: "rev-1", protocol: "legacy",
+    entries: [{ comment: { id: uuid(), body: "please continue" }, position: 0 }],
+  };
+  env.state.nudges.set(`hold:${spent.id}:${env.db.recoveryActions[spent.id].id}`, { count: 99, at: 0 });
+  const other = { ...spent, id: uuid(), identifier: "ACM-110" };
+  env.db.issues.push(other);
+  env.db.issueRuns[other.id] = [...env.db.issueRuns[spent.id]];
+  env.db.blockerDiagnostics[other.id] = env.db.blockerDiagnostics[spent.id];
+  env.db.recoveryActions[other.id] = { ...env.db.recoveryActions[spent.id], id: uuid() };
+  await env.watchdog.tick();
+  assert.equal(env.db.interrupts.length, 0);
+  assert.equal(env.db.comments.filter((c) => c.issueId === other.id).length, 1);
+  assert.equal(engineer.status, "idle");
 });
 
 test("a parked issue with saved messages gets them delivered instead of a comment", async (t) => {

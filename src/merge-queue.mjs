@@ -229,7 +229,7 @@ export function createMergeQueueHandler({ ctx, state, github, identifiersOf, res
     const again = infra && config.relayRequeueOnInfraDrop && !config.dryRun ? await requeue(repo, pr) : null;
     const note =
       drop.kind === "queue-conflict"
-        ? `${prLabel(pr)} was dropped from the merge queue for a conflict with a PR ahead of it, not with \`${pr.base?.ref}\`. Queue it again once that PR has merged; if it then conflicts, it is sent back to its agent.\n\n${pr.html_url}`
+        ? `${prLabel(pr)} was dropped from the merge queue for a conflict with a PR ahead of it, not with \`${pr.base?.ref}\`. Queue it again once that PR has merged${sweepConflicts ? "; if it then conflicts, it is sent back to its agent" : ""}.\n\n${pr.html_url}`
         : drop.kind === "unexplained"
           ? `${prLabel(pr)} was dropped from the merge queue for a failed check (${payload.reason}), but no failed or cancelled merge-group job was found for it. Look at the PR's checks, then queue it again or send it back.\n\n${pr.html_url}`
           : infraNote(pr, drop, again?.requeued);

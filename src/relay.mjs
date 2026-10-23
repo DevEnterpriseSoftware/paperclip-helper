@@ -244,11 +244,14 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
     return { issue: waiting[0], waiting: true, ambiguous: waiting.map((i) => i.identifier ?? i.id) };
   }
 
-  // The PR's own issue (the first it names), open, with no stage pending, whose
-  // stages Paperclip's activity log shows an agent removed (stages.mjs).
+  // The PR's own issue (the first it names), being worked on or in review, with no
+  // stage pending, whose stages Paperclip's activity log shows an agent removed
+  // (stages.mjs). A blocked issue waits on something the merge doesn't settle (a
+  // blocker, a recovery decision), and a backlog one wasn't started: both are yours.
+  const CLOSABLE = new Set(["todo", "in_progress", "in_review"]);
   async function stagesWereWiped(issue, identifiers) {
     if (!config.relayDoneWithoutStages || (issue.identifier ?? issue.id) !== identifiers[0]) return false;
-    if (issue.status === "done" || issue.status === "cancelled" || issue.executionState?.status === "pending") return false;
+    if (!CLOSABLE.has(issue.status) || issue.executionState?.status === "pending") return false;
     if (issue.executionPolicy?.stages?.length) return false;
     return Boolean(stagesWipe(await issueActivity(api, issue.id)));
   }
@@ -381,6 +384,9 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
   }
   async function sweepAll() {
     for (const repo of config.repos) await conflicts.sweep(repo);
+  }
+  if (config.relayMergeQueue && !gh) {
+    log("relay: merge-queue drops aren't handled: no GitHub token (set GITHUB_TOKEN or GITHUB_TOKEN_FILE, with Actions: Read)");
   }
   const mergeQueue = config.relayMergeQueue && gh
     ? createMergeQueueHandler({

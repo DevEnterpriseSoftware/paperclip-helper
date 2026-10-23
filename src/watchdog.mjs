@@ -248,8 +248,6 @@ const ANSWER_WAIT_MS = 30 * 60_000;
 const RESUME_SWEEP_MS = 24 * 60 * 60_000;
 // Clock slack between the helper and Paperclip when comparing a comment's time with a pause.
 const CLOCK_SLACK_MS = 5_000;
-// Restored issues a resume sweep remembers, to count their runs still in flight (more than any limit).
-const MAX_REMEMBERED_RESTORES = 50;
 
 export function createWatchdog(ctx, state, deps = {}) {
   const { config, api, log } = ctx;
@@ -275,6 +273,7 @@ export function createWatchdog(ctx, state, deps = {}) {
   const seenStatus = new Map(); // agentId → its status at this process's previous tick
   let previousTickAt = null; // when this process's previous tick started
   const sweepHeld = new Map(); // agentId → ids of its issues a resume sweep will restore on a later tick
+  let slots = new Map(); // agentId → Promise<{ left }>: runs it may still be given this tick (startSlots)
   const hasGitHubToken = Boolean(config.githubToken || config.githubTokenFile);
   const github = deps.github ?? (hasGitHubToken ? createGitHub({ config, log }) : null);
   const stagesCheck = createStagesCheck({ ctx, records, state, stats, dryRunSeen, github, identifiersOf: (pr) => findIdentifiers(pr, ctx.prefixes()) });
@@ -348,7 +347,8 @@ export function createWatchdog(ctx, state, deps = {}) {
   }
 
   // Paperclip's "send queued messages now" for a deferred queue of saved comments.
-  async function retryDeferred(issue, key = record.retry(issue)) {
+  // `before`, as for nudge, is asked last, just before the retry: false holds it back.
+  async function retryDeferred(issue, key = record.retry(issue), { before = null } = {}) {
     const prior = records.get(key);
     const count = prior?.count ?? 0;
     if (count >= config.watchdogMaxNudges || (prior && now() - prior.at < stallMs)) return;
@@ -371,6 +371,7 @@ export function createWatchdog(ctx, state, deps = {}) {
       }
       return;
     }
+    if (!config.dryRun && before && !(await before())) return; // not this tick
     records.set(key, { count: count + 1, at: now() });
     state.touch();
     if (config.dryRun) {
@@ -516,7 +517,7 @@ export function createWatchdog(ctx, state, deps = {}) {
   }
 
   // An issue blocked by an active recovery action that waits on the board.
-  async function releaseParkedIssue(issue, action, agents) {
+  async function releaseParkedIssue(issue, action, agents, companyId) {
     const who = issue.identifier ?? issue.id;
     const agent = await agentFor(issue.assigneeAgentId, agents).catch(() => null);
     // Waking an agent Paperclip can't invoke is what parked the issue in the first place.
@@ -564,7 +565,7 @@ export function createWatchdog(ctx, state, deps = {}) {
       ? await api.request("GET", `/api/issues/${issue.id}/queued-comments`).catch(() => null)
       : null;
     if (queue?.queueId && queue.state === "deferred" && queue.protocol === "legacy" && queue.entries?.length && !queue.targetRunId) {
-      await retryDeferred(issue, record.hold(issue, action.id));
+      await retryDeferred(issue, record.hold(issue, action.id), { before: () => takeSlot(agent, companyId) });
       return;
     }
     // One nudge budget per issue and assignee, not per recovery action: each failed retry chain
@@ -580,6 +581,8 @@ export function createWatchdog(ctx, state, deps = {}) {
         `(you were paused, or the issue had just changed hands). You are available again and nothing else ` +
         `blocks the issue. Please continue it.`,
       { reason: "parked by recovery", kind: action.kind },
+      // Paced like the resume sweep: a resume never starts more runs than the agent can take.
+      { before: () => takeSlot(agent, companyId) },
     );
   }
 
@@ -750,7 +753,8 @@ export function createWatchdog(ctx, state, deps = {}) {
   // within the stall window. With `patch`, the comment travels in a PATCH of the
   // issue with those fields, so both happen in one step, and `patchNote` is added
   // to it; if Paperclip refuses the fields, the comment goes alone, without the note.
-  async function nudge(issue, key, agent, message, logExtra, { patch = null, patchNote = "" } = {}) {
+  // `before`, when given, is asked last, just before sending: false holds the nudge back.
+  async function nudge(issue, key, agent, message, logExtra, { patch = null, patchNote = "", before = null } = {}) {
     const prior = records.get(key);
     const count = prior?.count ?? 0;
     if (count >= config.watchdogMaxNudges || (prior && now() - prior.at < stallMs)) return false;
@@ -762,6 +766,7 @@ export function createWatchdog(ctx, state, deps = {}) {
       log("watchdog: would nudge (dry run)", { issue: who, agent: agent.name, ...logExtra });
       return false;
     }
+    if (before && !(await before())) return false; // not this tick
     records.set(key, { count: count + 1, at: now() });
     state.touch();
     const bodyOf = (text) => `${agentMention(agent)} ${text}\n\n_Paperclip Helper watchdog, nudge ${count + 1}/${config.watchdogMaxNudges}._`;
@@ -815,8 +820,9 @@ export function createWatchdog(ctx, state, deps = {}) {
 
   async function checkBlocked(companyId, agents) {
     const issues = (await listIssues(api, companyId, "blocked")).filter(
-      // An agent just resumed: its issues blocked during the pause are 15's to restore.
-      (issue) => issue.assigneeAgentId && !issue.executionRunId && !issue.checkoutRunId && !resumeSweepHolds(issue),
+      // An agent just resumed: nothing is touched until the resume has settled, and
+      // then its issues blocked during the pause are 15's to restore.
+      (issue) => issue.assigneeAgentId && !issue.executionRunId && !issue.checkoutRunId && !settling(issue.assigneeAgentId) && !resumeSweepHolds(issue),
     );
     await mapLimit(issues, CONCURRENCY, async (issue) => {
       try {
@@ -831,7 +837,7 @@ export function createWatchdog(ctx, state, deps = {}) {
           if (await releaseUnprovableHold(issue, agents)) return;
           const parked = await api.request("GET", `/api/issues/${issue.id}/recovery-actions`).catch(() => null);
           if (parked?.active) {
-            await releaseParkedIssue(issue, parked.active, agents);
+            await releaseParkedIssue(issue, parked.active, agents, companyId);
             return;
           }
           const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
@@ -1685,12 +1691,13 @@ export function createWatchdog(ctx, state, deps = {}) {
       if (paused) {
         if (asleep(agent)) continue; // awaiting approval: not invokable yet
         records.delete(key);
-        const entry = { count: 0, at: now(), since: r.since, resumedAt: tickAt, companyId, restored: [] };
+        const entry = { count: 0, at: now(), since: r.since, resumedAt: tickAt, companyId };
         records.set(record.agentResumed(agentId), entry);
         state.touch();
-        log("watchdog: an agent was resumed; looking for its issues Paperclip's recovery blocked during the pause", {
+        log("watchdog: an agent was resumed; its issues Paperclip's recovery blocked during the pause are looked at once the resume has settled", {
           agent: agent.name,
           pausedSince: new Date(r.since).toISOString(),
+          settleMin: config.watchdogResumeSettleMin,
         });
         resumed.push({ agent, entry });
         continue;
@@ -1723,35 +1730,63 @@ export function createWatchdog(ctx, state, deps = {}) {
   // postponed)? Then 6 leaves it to the sweep. Issues the sweep turned down aren't held.
   const resumeSweepHolds = (issue) => config.watchdogResumeSweep && Boolean(sweepHeld.get(issue.assigneeAgentId)?.has(issue.id));
 
+  // Resumed less than WATCHDOG_RESUME_SETTLE_MIN ago: neither the sweep nor 6 touches
+  // the agent's blocked issues yet. A pause within the window ends the sweep before
+  // anything was restored (trackPauses), and the next resume covers both pauses.
+  const settleMs = config.watchdogResumeSettleMin * 60_000;
+  function settling(agentId) {
+    if (!settleMs) return false;
+    const r = records.get(record.agentResumed(agentId));
+    return Boolean(r && now() - (r.resumedAt ?? 0) < settleMs);
+  }
+
+  // Runs an agent may still be given this tick, shared by the resume sweep and 6: its
+  // limit (WATCHDOG_RESUME_SWEEP_LIMIT, or its maxConcurrentRuns) less the runs it
+  // has queued or going on any issue: those of issues restored earlier, and the wakes
+  // Paperclip released on the resume. Unknown counts as full: better a tick later
+  // than too many runs at once.
+  function startSlots() {
+    slots = new Map();
+  }
+  async function freeSlots(agent, companyId) {
+    const limit = config.watchdogResumeSweepLimit || concurrencyOf(agent);
+    const runs = await api.request("GET", `/api/companies/${companyId}/heartbeat-runs?agentId=${agent.id}&limit=100`).catch(() => null);
+    if (!Array.isArray(runs)) return { left: 0 };
+    const live = runs.filter((r) => r.agentId === agent.id && ACTIVE_RUN.has(r.status)).length;
+    return { left: Math.max(0, limit - live) };
+  }
+  async function takeSlot(agent, companyId) {
+    if (!slots.has(agent.id)) slots.set(agent.id, freeSlots(agent, companyId));
+    const s = await slots.get(agent.id);
+    if (s.left <= 0) return false;
+    s.left -= 1;
+    return true;
+  }
+
+  // Tracks pauses and resumes (for the settle window, even with the sweep off), then sweeps.
   async function checkResumes(companyId, agents, tickAt) {
-    const resumed = await trackPauses(companyId, agents, tickAt);
+    const tracked = await trackPauses(companyId, agents, tickAt);
+    if (!config.watchdogResumeSweep) return;
+    const resumed = tracked.filter(({ agent }) => !settling(agent.id));
     if (!resumed.length) return;
     const blocked = (await listIssues(api, companyId, "blocked")).sort(sweepOrder);
     for (const { agent, entry } of resumed) {
       try {
-        await sweepAgent(agent, entry, blocked.filter((i) => i.assigneeAgentId === agent.id));
+        await sweepAgent(agent, entry, blocked.filter((i) => i.assigneeAgentId === agent.id), companyId);
       } catch (err) {
         log.warn("watchdog: resume sweep failed", { agent: agent.name, error: err.message });
       }
     }
   }
 
-  // Each tick: every one of the agent's blocked issues is looked at, and up to the
-  // limit restored, less those this sweep restored earlier that still have a run
-  // queued or going, so a resume never puts more than the limit of runs in flight.
-  // The sweep ends at the first tick with nothing left to restore and nothing postponed.
-  async function sweepAgent(agent, entry, issues) {
-    const limit = config.watchdogResumeSweepLimit || concurrencyOf(agent);
-    const earlier = Array.isArray(entry.restored) ? entry.restored : [];
-    let inFlight = 0;
-    for (const id of earlier) {
-      const runs = await api.request("GET", `/api/issues/${id}/runs`).catch(() => null);
-      // Unknown counts as in flight: prefer waiting a tick to queueing too many.
-      if (!Array.isArray(runs) || runs.some((r) => r.agentId === agent.id && ACTIVE_RUN.has(r.status))) inFlight += 1;
-    }
-    let budget = Math.max(0, limit - inFlight);
+  // Each tick: every one of the agent's blocked issues is looked at, and as many
+  // restored as the agent has free slots (takeSlot), so a resume never puts more than
+  // its limit of runs in flight. The sweep ends at the first tick with nothing left to
+  // restore and nothing postponed.
+  async function sweepAgent(agent, entry, issues, companyId) {
     const held = new Set();
     const restoredNow = [];
+    let full = false;
     for (const issue of issues) {
       const verdict = await pauseBlocked(issue, agent, entry);
       if (verdict === "postponed") {
@@ -1759,15 +1794,19 @@ export function createWatchdog(ctx, state, deps = {}) {
         continue;
       }
       if (!verdict) continue;
-      if (budget <= 0) {
+      // Paused again since the tick began: the next resume restores it.
+      if (full || !(await stillResumed(agent))) {
+        held.add(issue.id);
+        continue;
+      }
+      if (!config.dryRun && !(await takeSlot(agent, companyId))) {
+        full = true;
         held.add(issue.id); // a later tick
         continue;
       }
       const result = await restoreIssue(issue, agent, verdict);
-      if (result === "restored") {
-        budget -= 1;
-        restoredNow.push(issue.id);
-      } else if (result === "postponed") held.add(issue.id);
+      if (result === "restored") restoredNow.push(issue.id);
+      else if (result === "postponed") held.add(issue.id);
     }
     const key = record.agentResumed(agent.id);
     if (held.size) sweepHeld.set(agent.id, held);
@@ -1777,11 +1816,16 @@ export function createWatchdog(ctx, state, deps = {}) {
       records.delete(key);
       log.debug("watchdog: resume sweep finished", { agent: agent.name, restored: (entry.count ?? 0) + restoredNow.length });
     } else {
-      // Only the restored issues whose runs may still be going are worth keeping.
-      const restored = [...earlier, ...restoredNow].slice(-MAX_REMEMBERED_RESTORES);
-      records.set(key, { ...entry, count: (entry.count ?? 0) + restoredNow.length, restored, at: now() });
+      records.set(key, { ...entry, count: (entry.count ?? 0) + restoredNow.length, at: now() });
     }
     state.touch();
+  }
+
+  // The agent as Paperclip has it now, just before a restore: paused or not runnable
+  // again since the tick's list, nothing is restored (it would only be blocked again).
+  async function stillResumed(agent) {
+    const fresh = await api.request("GET", `/api/agents/${agent.id}`).catch(() => null);
+    return Boolean(fresh) && !asleep(fresh);
   }
 
   // Is this an issue Paperclip's recovery blocked because the agent was paused, and
@@ -1866,6 +1910,7 @@ export function createWatchdog(ctx, state, deps = {}) {
     const started = now();
     const { companyIds = [] } = await ctx.identity();
     try {
+      startSlots();
       for (const companyId of companyIds) {
         let listed = true;
         const list = await companyAgents(api, companyId).catch(() => {
@@ -1876,7 +1921,7 @@ export function createWatchdog(ctx, state, deps = {}) {
         // Without the agents' statuses a pause or resume can't be told: wait for the next tick.
         // Pauses for a usage limit first, then resumes, which the resume sweep then sees.
         if (config.watchdogLimitPause && listed) await limits.check(companyId, agents);
-        if (config.watchdogResumeSweep && listed) await checkResumes(companyId, agents, started);
+        if ((config.watchdogResumeSweep || config.watchdogResumeSettleMin) && listed) await checkResumes(companyId, agents, started);
         if (config.watchdogClearDeadLinks) {
           await checkDeadLinks(companyId, agents);
           await checkScheduledWorkspaces(companyId, agents);
@@ -1922,7 +1967,10 @@ export function createWatchdog(ctx, state, deps = {}) {
         cancelledBlockers: config.watchdogCancelledBlockers,
         limitPause: config.watchdogLimitPause ? { graceMin: config.watchdogLimitResumeGraceMin, notifyIssue: config.watchdogNotifyIssue || null } : false,
         stagesWipe: config.watchdogStagesWipe ? (github ? true : "on, without the open-PR part: no GitHub token") : false,
-        resumeSweep: config.watchdogResumeSweep ? config.watchdogResumeSweepLimit || "the agent's maxConcurrentRuns" : false,
+        resumeSweep: config.watchdogResumeSweep,
+        // Runs at once per agent, for the sweep's restores and 6's nudges.
+        runsPerAgent: config.watchdogResumeSweepLimit || "the agent's maxConcurrentRuns",
+        resumeSettleMin: config.watchdogResumeSettleMin,
       });
       loop = every("watchdog", config.watchdogIntervalSec, 5_000, tick, log);
     },
