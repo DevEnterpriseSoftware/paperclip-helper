@@ -6,7 +6,7 @@ import path from "node:path";
 import { readJson } from "./store.mjs";
 import { createGitHub, tokenSource } from "./github.mjs";
 import { companyAgents, companyPrefixes } from "./paperclip.mjs";
-import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, signed } from "./util.mjs";
+import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, plural, signed } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
 import { advise, excerpt, llmPrompt } from "./advice.mjs";
 import { blocked as blockedReport } from "./blocked.mjs";
@@ -22,7 +22,9 @@ import {
   issuesLinkedTo,
   linkFacts,
 } from "./workspace.mjs";
-import { closeWorkspace, lastFailedOperation, plural, survey } from "./worktrees.mjs";
+import { closeWorkspace, lastFailedOperation, survey } from "./worktrees.mjs";
+import { readUsage, render, summarize, usageOptions } from "./usage.mjs";
+import { answerFor, findCard } from "./answer.mjs";
 
 export const USAGE = `Paperclip Helper
 
@@ -34,6 +36,7 @@ export const USAGE = `Paperclip Helper
   pch approve ISSUE [comment]  approve an issue whose approval is waiting on you
   pch changes ISSUE comment    request changes (the comment becomes the brief)
   pch comment ISSUE text       comment as you (wakes the assignee)
+  pch answer ISSUE CARD text   answer a question card (CARD: its id, or the start of it)
   pch release ISSUE [--apply] [--outcome=mixed|completed|not_performed]
                                release an execution hold whose run can't prove it stopped (preview without --apply)
   pch workspace ISSUE [--apply]  give an issue linked to a closed (or another issue's) workspace its own new one
@@ -41,6 +44,8 @@ export const USAGE = `Paperclip Helper
   pch worktrees [--apply] [--min-days=N] [--include-untracked] [--include-unmerged]
                                close the workspaces of finished issues so Paperclip removes their worktrees
                                (preview without --apply; issues finished at least N days ago, default 1)
+  pch usage [--days N] [--agent NAME]
+                               where the tokens go: per agent runs, tokens, cost, what woke it, and what to look at
   pch costs                    preview what cost sync would post (changes nothing)
   pch costs --sessions         check whether resumed sessions report cumulative costs
   pch models                   every agent's adapter, model and effort
@@ -684,6 +689,15 @@ export async function decide(ctx, kind, identifier, text) {
   out(`${identifier}: ${kind === "approve" ? "approved (done)" : "changes requested (back to the engineer)"}.`);
 }
 
+export async function answer(ctx, identifier, cardRef, text) {
+  if (!identifier || !cardRef) throw new Error('usage: pch answer ISSUE CARD "answer" (CARD: its id, or the start of it)');
+  const cards = await ctx.api.request("GET", `/api/issues/${encodeURIComponent(identifier)}/interactions`);
+  const card = findCard(cards, cardRef);
+  const { body, prompt, answer: given } = answerFor(card, text);
+  await ctx.api.request("POST", `/api/issues/${encodeURIComponent(identifier)}/interactions/${card.id}/respond`, body);
+  out(`Answered card ${card.id} on ${identifier}: "${prompt}" → ${given}`);
+}
+
 export async function comment(ctx, identifier, text) {
   if (!identifier || !text) throw new Error("usage: comment <ISSUE-ID> <text>");
   await ctx.api.request("POST", `/api/issues/${encodeURIComponent(identifier)}/comments`, { body: signed(text, COMMAND_SIGNATURE) });
@@ -699,9 +713,6 @@ async function listAgents(ctx) {
   return agents;
 }
 
-export function effortOf(cfg) {
-  return cfg?.effort ?? cfg?.modelReasoningEffort ?? cfg?.reasoningEffort ?? "";
-}
 
 export async function models(ctx) {
   const agents = await listAgents(ctx);
@@ -743,6 +754,28 @@ export async function setModel(ctx, from, to, flags = []) {
   }
   if (!apply) out(`\n${targets.length} agent(s). Run again with --apply to change them.`);
   if (problems) throw new Error(`${problems} agent(s) need checking: see the lines marked CHECK.`);
+}
+
+// ---------------------------------------------------------------- usage
+
+export async function usage(ctx, args = []) {
+  const opts = usageOptions(args);
+  const until = ctx.now();
+  const since = until - opts.days * 24 * 60 * 60_000;
+  const { companyIds = [] } = await ctx.identity();
+  let found = false;
+  for (const companyId of companyIds) {
+    const data = await readUsage(ctx.api, companyId, { since, until, agentName: opts.agent });
+    if (opts.agent && !data.agents.length) continue; // the agent is in another company
+    found = true;
+    if (companyIds.length > 1) {
+      const company = await ctx.api.request("GET", `/api/companies/${companyId}`).catch(() => null);
+      out(`== ${company?.name ?? companyId}`);
+    }
+    for (const line of render(summarize({ ...data, since }), { days: opts.days, truncated: data.truncated, costError: data.costError })) out(line);
+    if (companyIds.length > 1) out("");
+  }
+  if (opts.agent && !found) out(`No agent called ${opts.agent}.`);
 }
 
 // ---------------------------------------------------------------- costs
@@ -791,6 +824,8 @@ export async function status(ctx) {
     out(r?.on ? `Relay: on, ${r.handled} deliveries handled, ${r.failed} failed, last ${ago(r.lastEventAt)}${r.lastError ? `; last error: ${r.lastError}` : ""}` : "Relay: off");
     const k = r?.on ? r.conflicts : null;
     if (k) out(`  Merge conflicts: ${k.sentBack} PRs sent back since start, last look ${ago(k.lastSweepAt)}${k.lastError ? `; last error: ${k.lastError}` : ""}`);
+    const q = r?.on ? r.mergeQueue : null;
+    if (q) out(`  Merge queue: ${q.dropped} drops handled since start, ${q.sentBack} sent back, ${q.noted} told to the board${q.requeued ? `, ${q.requeued} queued again` : ""}${q.lastError ? `; last error: ${q.lastError}` : ""}`);
     const w = s.watchdog;
     out(
       w?.on
@@ -802,7 +837,10 @@ export async function status(ctx) {
             `${w.ciReports ? `; ${w.ciReports} finished CI runs reported` : ""}` +
             `${w.ciReruns ? `; ${w.ciReruns} flaky CI runs re-run` : ""}` +
             `${w.returned ? `; ${w.returned} issues returned to their agent` : ""}` +
-            `${w.resumed ? `; ${w.resumed} issues restored after their agent was resumed` : ""}${w.lastError ? `; last error: ${w.lastError}` : ""}`
+            `${w.resumed ? `; ${w.resumed} issues restored after their agent was resumed` : ""}` +
+            `${w.limitPauses ? `; ${w.limitPauses} agents paused at a usage limit, ${w.limitResumes} resumed` : ""}` +
+            `${w.reopened ? `; ${w.reopened} done issues with an open PR reopened` : ""}` +
+            `${w.wipes ? `; ${w.wipes} wiped review stages reported` : ""}${w.lastError ? `; last error: ${w.lastError}` : ""}`
         : "Watchdog: off",
     );
     const c = s.costSync;

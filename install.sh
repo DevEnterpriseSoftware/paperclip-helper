@@ -236,7 +236,7 @@ EOF
   } >"$1"
 }
 
-MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS GITHUB_TOKEN GITHUB_TOKEN_FILE GITHUB_TOKEN_HOST_FILE RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS WATCHDOG_CLEAR_DEAD_LINKS WATCHDOG_ROUTE_QUESTIONS WATCHDOG_CI_RUNS WATCHDOG_CI_RERUN_JOBS WATCHDOG_CI_RERUN_MAX WATCHDOG_DELIVER_ANSWERS WATCHDOG_RETURN_ESCALATED_REVIEWS WATCHDOG_CANCELLED_BLOCKERS WATCHDOG_RESUME_SWEEP WATCHDOG_RESUME_SWEEP_LIMIT COST_SYNC COST_SYNC_SINCE"
+MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS RELAY_MERGE_QUEUE RELAY_REQUEUE_ON_INFRA_DROP RELAY_DONE_WITHOUT_STAGES RELAY_QUIET_NOTES GITHUB_TOKEN GITHUB_TOKEN_FILE GITHUB_TOKEN_HOST_FILE RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS WATCHDOG_CLEAR_DEAD_LINKS WATCHDOG_ROUTE_QUESTIONS WATCHDOG_CI_RUNS WATCHDOG_CI_RERUN_JOBS WATCHDOG_CI_RERUN_MAX WATCHDOG_DELIVER_ANSWERS WATCHDOG_RETURN_ESCALATED_REVIEWS WATCHDOG_CANCELLED_BLOCKERS WATCHDOG_RESUME_SWEEP WATCHDOG_RESUME_SWEEP_LIMIT WATCHDOG_LIMIT_PAUSE WATCHDOG_LIMIT_RESUME_GRACE_MIN WATCHDOG_NOTIFY_ISSUE WATCHDOG_STAGES_WIPE COST_SYNC COST_SYNC_SINCE"
 
 write_env() {
   local key
@@ -446,6 +446,14 @@ main() {
   ISSUE_PREFIXES="$(pick ISSUE_PREFIXES)"
   RELAY_LINK_PRS="$(pick RELAY_LINK_PRS)"
   RELAY_FIX_CONFLICTS="$(pick RELAY_FIX_CONFLICTS)"
+  # shellcheck disable=SC2034  # written to .env by write_env
+  RELAY_MERGE_QUEUE="$(pick RELAY_MERGE_QUEUE)"
+  # shellcheck disable=SC2034  # written to .env by write_env
+  RELAY_REQUEUE_ON_INFRA_DROP="$(pick RELAY_REQUEUE_ON_INFRA_DROP false)"
+  # shellcheck disable=SC2034  # written to .env by write_env
+  RELAY_DONE_WITHOUT_STAGES="$(pick RELAY_DONE_WITHOUT_STAGES true)"
+  # shellcheck disable=SC2034  # written to .env by write_env
+  RELAY_QUIET_NOTES="$(pick RELAY_QUIET_NOTES true)"
   GITHUB_TOKEN="$(pick GITHUB_TOKEN)"
   # shellcheck disable=SC2034  # written to .env by write_env
   GITHUB_TOKEN_FILE="$(pick GITHUB_TOKEN_FILE)"
@@ -558,6 +566,12 @@ main() {
   WATCHDOG_RESUME_SWEEP="$(pick WATCHDOG_RESUME_SWEEP true)"
   # shellcheck disable=SC2034  # written to .env by write_env
   WATCHDOG_RESUME_SWEEP_LIMIT="$(pick WATCHDOG_RESUME_SWEEP_LIMIT 0)"
+  WATCHDOG_LIMIT_PAUSE="$(pick WATCHDOG_LIMIT_PAUSE true)"
+  # shellcheck disable=SC2034  # written to .env by write_env
+  WATCHDOG_LIMIT_RESUME_GRACE_MIN="$(pick WATCHDOG_LIMIT_RESUME_GRACE_MIN 5)"
+  WATCHDOG_NOTIFY_ISSUE="$(pick WATCHDOG_NOTIFY_ISSUE)"
+  # shellcheck disable=SC2034  # written to .env by write_env
+  WATCHDOG_STAGES_WIPE="$(pick WATCHDOG_STAGES_WIPE true)"
   say "It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without"
   say "anything picking them up, and repairs blockers stuck on a failed workspace clean-up."
   local wd_default=y; truthy "$WATCHDOG" || wd_default=n
@@ -605,6 +619,12 @@ main() {
     local resume=y; truthy "$WATCHDOG_RESUME_SWEEP" || resume=n
     say "Pausing an agent with runs queued makes Paperclip block those issues, and resuming it restarts none of them."
     if confirm "Restore such issues when the agent is resumed (a few at a time; others are never touched)?" "$resume"; then WATCHDOG_RESUME_SWEEP=true; else WATCHDOG_RESUME_SWEEP=false; fi
+    local limit=y; truthy "$WATCHDOG_LIMIT_PAUSE" || limit=n
+    say "At a Claude usage limit every Claude agent's next run fails, and Paperclip keeps retrying them."
+    if confirm "Pause the Claude agents on that account (each once idle) and resume them when the limit resets?" "$limit"; then WATCHDOG_LIMIT_PAUSE=true; else WATCHDOG_LIMIT_PAUSE=false; fi
+    say "Some things only the board can settle: a usage-limit pause, wiped review stages, a merge-queue drop."
+    say "The helper always logs them; it can also comment on an issue you watch (in the same company)."
+    ask WATCHDOG_NOTIFY_ISSUE "Issue for the helper's notes to you, e.g. ACM-12 (empty: the log only)" "$WATCHDOG_NOTIFY_ISSUE"
   else
     WATCHDOG=false
   fi

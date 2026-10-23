@@ -1,12 +1,17 @@
-// GitHub REST API client, for the relay (its conflict sweep, and its notes on a
-// PR when a decision you asked for wasn't recorded) and the watchdog's CI-run check.
+// GitHub API client (REST, and GraphQL for re-queueing), for the relay (its conflict
+// sweep, merge-queue drops, and its notes on a PR when a decision you asked for
+// wasn't recorded) and the watchdog (CI runs, and the PRs of issues whose review
+// stages were wiped).
 //
 // It lists open pull requests, reads whether each can be merged, and leaves a
-// comment on the ones it sends back or explains. It needs a token with "Pull requests"
-// access on the repositories in GITHUB_REPOS: read to look, read and write to
-// comment. The watchdog reads workflow runs and their jobs ("Actions: Read") and,
-// only for jobs you named as flaky, re-runs failed jobs ("Actions: Read and write").
-// It never merges, pushes, closes or deletes anything.
+// comment on the ones it sends back or explains: "Pull requests" access on the
+// repositories in GITHUB_REPOS, read to look, read and write to comment. Merge-queue
+// drops and the CI check read workflow runs and their jobs ("Actions: Read"), and a
+// failed check's annotation ("Checks: Read", optional). Only for jobs you named as
+// flaky does the watchdog re-run failed jobs ("Actions: Read and write"), and only
+// with RELAY_REQUEUE_ON_INFRA_DROP (off by default) does the relay put a PR back in
+// the merge queue (a token allowed to merge). It never merges, pushes, closes or
+// deletes anything itself.
 //
 // The token is GITHUB_TOKEN as it is, or the contents of GITHUB_TOKEN_FILE, read
 // again for every request: a GitHub App installation token lasts an hour, and
@@ -61,6 +66,8 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
   const base = config.githubApi;
   const timeoutMs = config.timeoutSec * 1000;
   const source = tokenSource(config);
+  // github.com serves GraphQL at /graphql; GitHub Enterprise Server at /api/graphql, beside /api/v3.
+  const graphqlUrl = /\/api\/v3\/?$/.test(base) ? base.replace(/\/api\/v3\/?$/, "/api/graphql") : `${base}/graphql`;
 
   function explain(method, path, res, data, text) {
     const detail = data && typeof data === "object" && data.message ? String(data.message) : String(text ?? "").slice(0, 300);
@@ -100,7 +107,7 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
     let res;
     let text;
     try {
-      res = await fetchImpl(`${base}${path}`, {
+      res = await fetchImpl(/^https?:/.test(path) ? path : `${base}${path}`, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -153,5 +160,11 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
     repository: (repo) => request("GET", `/repos/${repo}`),
     // A branch's head commit (commit.sha), to tell whether a run is still its branch's latest.
     branch: (repo, name) => request("GET", `/repos/${repo}/branches/${encodeURIComponent(name)}`),
+    // GraphQL, for the merge queue (enqueuePullRequest). GitHub answers 200 with `errors` on failure.
+    async graphql(query, variables) {
+      const data = await request("POST", graphqlUrl, { query, variables });
+      if (data?.errors?.length) throw new GitHubError(`GraphQL: ${data.errors.map((e) => e.message).join("; ")}`, { status: 200, method: "POST", path: "/graphql" });
+      return data?.data;
+    },
   };
 }

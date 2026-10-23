@@ -12,13 +12,22 @@
 //   * Any other comment/review by you    → copied to the issue as a comment
 //                                          (not a plain GitHub approval, since
 //                                          merging is the approval, nor an empty review)
-//   * PR opened, reopened or ready       → its URL posted on the issue, so
-//                                          Paperclip links it (RELAY_LINK_PRS)
+//   * PR opened, reopened or ready       → its URL noted on the issue, so
+//                                          Paperclip links it (RELAY_LINK_PRS), in
+//                                          the issue's pull-requests document,
+//                                          which wakes nobody (RELAY_QUIET_NOTES)
+//   * PR merged by you, its issue's      → the issue is closed as done with the
+//     review stages wiped                  merge comment, as the approval would
+//                                          have (RELAY_DONE_WITHOUT_STAGES)
 //   * PR closed unmerged, or merged by   → a note on the issue
 //     someone else
 //   * Any PR merged                      → other open PRs that now conflict are
 //                                          sent back to their agents
 //                                          (RELAY_FIX_CONFLICTS, conflicts.mjs)
+//   * PR dropped by the merge queue      → a failed check sends it back; a
+//                                          cancelled run or the queue's timeout
+//                                          tells the board (RELAY_MERGE_QUEUE,
+//                                          merge-queue.mjs)
 //
 // When your /changes, /approve or "Request changes" is not recorded as a decision
 // (the issue isn't waiting on you, several are, it's already done, or the PR names
@@ -35,6 +44,11 @@ import crypto from "node:crypto";
 import { approvalWaitingOn, DECISION_STATUS, every, RELAYED_SIGNATURE, signed } from "./util.mjs";
 import { createGitHub } from "./github.mjs";
 import { createConflictSweep, HELPER_MARK } from "./conflicts.mjs";
+import { createMergeQueueHandler, QUEUE_BOT } from "./merge-queue.mjs";
+import { issueActivity, stagesWipe } from "./stages.mjs";
+import { appendNote } from "./quiet-notes.mjs";
+import { findIdentifiers } from "./identifiers.mjs";
+
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 const MAX_FORWARDED_CHARS = 20_000;
@@ -49,27 +63,6 @@ export function verifySignature(secret, rawBody, header) {
   const expected = Buffer.from("sha256=" + crypto.createHmac("sha256", secret).update(rawBody).digest("hex"));
   const given = Buffer.from(header);
   return given.length === expected.length && crypto.timingSafeEqual(given, expected);
-}
-
-function identifierRegex(prefixes) {
-  const alternatives = prefixes.map((p) => p.replace(/[^A-Z0-9]/gi, "")).filter(Boolean);
-  // With no known prefix, fall back to Paperclip's identifier shape.
-  const prefix = alternatives.length ? `(${alternatives.join("|")})` : "([A-Z][A-Z0-9]*)";
-  return new RegExp(`\\b${prefix}-(\\d+)\\b`, "gi");
-}
-
-// Every issue identifier the PR names, in order: title, branch, body.
-export function findIdentifiers(pr, prefixes) {
-  const found = [];
-  const pattern = identifierRegex(prefixes);
-  for (const text of [pr?.title, pr?.head?.ref, pr?.body]) {
-    if (typeof text !== "string") continue;
-    for (const match of text.matchAll(pattern)) {
-      const id = `${match[1].toUpperCase()}-${match[2]}`;
-      if (!found.includes(id)) found.push(id);
-    }
-  }
-  return found;
 }
 
 function clip(text) {
@@ -251,14 +244,39 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
     return { issue: waiting[0], waiting: true, ambiguous: waiting.map((i) => i.identifier ?? i.id) };
   }
 
+  // The PR's own issue (the first it names), open, with no stage pending, whose
+  // stages Paperclip's activity log shows an agent removed (stages.mjs).
+  async function stagesWereWiped(issue, identifiers) {
+    if (!config.relayDoneWithoutStages || (issue.identifier ?? issue.id) !== identifiers[0]) return false;
+    if (issue.status === "done" || issue.status === "cancelled" || issue.executionState?.status === "pending") return false;
+    if (issue.executionPolicy?.stages?.length) return false;
+    return Boolean(stagesWipe(await issueActivity(api, issue.id)));
+  }
+
+  // A note that needs nothing from the issue's agent: a line in the issue's
+  // pull-requests document (wakes nobody), or a comment with RELAY_QUIET_NOTES off
+  // or when Paperclip won't take the document.
+  async function addNote(identifier, text) {
+    if (!config.relayQuietNotes) return addComment(identifier, text);
+    if (config.dryRun) return { identifier, action: "note (dry run)" };
+    try {
+      await appendNote(api, identifier, text, { now: ctx.now() });
+      return { identifier, action: "note" };
+    } catch (err) {
+      log.warn("relay: couldn't write the issue's pull-requests document; commenting instead", { identifier, error: err.message });
+      return addComment(identifier, text);
+    }
+  }
+
   async function addComment(identifier, comment) {
     if (config.dryRun) return { identifier, action: "comment (dry run)" };
     await api.request("POST", `/api/issues/${encodeURIComponent(identifier)}/comments`, { body: signed(comment, RELAYED_SIGNATURE) });
     return { identifier, action: "comment" };
   }
 
-  // `resolved`: a target the caller already looked up for this PR.
-  async function decide(pr, identifiers, kind, comment, resolved) {
+  // `resolved`: a target the caller already looked up for this PR. `merged`: the
+  // decision is your merge of the PR (not a /approve on an open one).
+  async function decide(pr, identifiers, kind, comment, resolved, { merged = false } = {}) {
     const target = resolved ?? (await resolveTarget(pr, identifiers));
     if (!target) return { identifiers, action: "none", reason: "no Paperclip issue found for the identifiers" };
     const { issue, waiting, ambiguous, via } = target;
@@ -267,6 +285,16 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
 
     if (kind === "approve" && issue.status === "done") {
       return { identifier, action: "none", reason: "issue already done" };
+    }
+    if (!waiting && merged && (await stagesWereWiped(issue, identifiers))) {
+      // Your merge of its own PR, and no stage left to record it: close it as the approval
+      // would have, so its dependants can start.
+      if (config.dryRun) return { identifier, action: "done (dry run)", reason: "its review stages were wiped" };
+      await api.request("PATCH", `/api/issues/${encodeURIComponent(identifier)}`, {
+        status: "done",
+        comment: signed(`${comment}\n\nThis issue's review stages had been wiped, so there was no approval to record: closed as done on the merge.`, RELAYED_SIGNATURE),
+      });
+      return { identifier, action: "done", reason: "its review stages were wiped" };
     }
     if (!waiting) {
       // Not your turn: keep the information, change nothing.
@@ -354,6 +382,18 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
   async function sweepAll() {
     for (const repo of config.repos) await conflicts.sweep(repo);
   }
+  const mergeQueue = config.relayMergeQueue && gh
+    ? createMergeQueueHandler({
+        ctx,
+        state,
+        github: gh,
+        identifiersOf: (pr) => findIdentifiers(pr, ctx.prefixes()),
+        resolveTarget,
+        decide,
+        addComment,
+        sweepConflicts: conflicts ? (repo, base) => inBackground(conflicts.sweep(repo, { base })) : null,
+      })
+    : null;
   let timer = null;
 
   // ------------------------------------------------------------ notes on the PR
@@ -376,7 +416,8 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
 
   // ------------------------------------------------------------ GitHub events
 
-  async function handle(event, payload) {
+  // `meta.delivery`: the delivery id, for work that finishes after the webhook is answered.
+  async function handle(event, payload, meta = {}) {
     const repo = payload?.repository?.full_name?.toLowerCase();
     if (config.repos.length && !config.repos.includes(repo)) {
       return { ignored: `repository ${repo} is not in GITHUB_REPOS` };
@@ -397,7 +438,30 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
         if (!identifiers.length) return { ignored: `${prLabel(pr)} names no ${prefixLabel()} issue` };
         const verb = payload.action === "reopened" ? "reopened" : "opened";
         // On the PR's own issue (or its subtask), never on a blocker or another issue it mentions.
-        return commentOnTarget(pr, identifiers, `${prLabel(pr)} ${verb} by @${payload.sender?.login}: ${pr.html_url}`, { own: true });
+        const target = await resolveTarget(pr, identifiers, { own: true }).catch(() => null);
+        return addNote(target?.issue?.identifier ?? identifiers[0], `${prLabel(pr)} ${verb} by @${payload.sender?.login}: ${pr.html_url}`);
+      }
+      if (payload.action === "enqueued") {
+        mergeQueue?.enqueued(repo, payload);
+        return { ignored: "pull_request.enqueued (noted who queued it)" };
+      }
+      if (payload.action === "dequeued") {
+        if (!mergeQueue) return { ignored: "pull_request.dequeued (RELAY_MERGE_QUEUE is off, or no GitHub token)" };
+        // A person taking it out of the queue decided that themselves.
+        if (payload.sender?.login !== QUEUE_BOT) return { ignored: `removed from the merge queue by @${payload.sender?.login}` };
+        // GitHub reads take a few seconds; the webhook is answered at once. If the work
+        // fails, the delivery is forgotten so GitHub's "Redeliver" can try again.
+        const number = payload.pull_request?.number;
+        const work = mergeQueue
+          .handle(repo, payload)
+          .then((result) => log("relay: merge-queue drop", { repo, pr: number, reason: payload.reason ?? null, result }))
+          .catch((err) => {
+            mergeQueue.stats.lastError = err.message;
+            if (meta.delivery) deliveries.delete(meta.delivery);
+            throw new Error(`${repo}#${number}: ${err.message}`);
+          });
+        inBackground(work, "relay: merge-queue drop failed");
+        return { queued: "merge-queue drop" };
       }
       if (payload.action !== "closed") return { ignored: `pull_request.${payload.action}` };
       // Whoever merged it and whatever it names: the base branch moved.
@@ -406,16 +470,18 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       if (!identifiers.length) return { ignored: `${prLabel(pr)} names no ${prefixLabel()} issue` };
       const identifier = identifiers[0];
       if (!pr.merged) {
-        return addComment(identifier, `${prLabel(pr)} was closed without merging by @${payload.sender.login}: ${pr.html_url}`);
+        return addNote(identifier, `${prLabel(pr)} was closed without merging by @${payload.sender.login}: ${pr.html_url}`);
       }
       if (sender !== config.ownerLogin) {
-        return addComment(identifier, `${prLabel(pr)} was merged by @${payload.sender.login}, not by the approver: ${pr.html_url}`);
+        return addNote(identifier, `${prLabel(pr)} was merged by @${payload.sender.login}, not by the approver: ${pr.html_url}`);
       }
       return decide(
         pr,
         identifiers,
         "approve",
         `Approved: ${prLabel(pr)} merged into \`${pr.base?.ref}\` by @${payload.sender.login} (${pr.merge_commit_sha?.slice(0, 12) ?? "no sha"}).\n\n${pr.html_url}`,
+        undefined,
+        { merged: true },
       );
     }
 
@@ -479,6 +545,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
 
   const stats = { handled: 0, failed: 0, lastEventAt: null, lastError: null };
   if (conflicts) stats.conflicts = conflicts.stats;
+  if (mergeQueue) stats.mergeQueue = mergeQueue.stats;
 
   function send(res, status, body) {
     res.writeHead(status, { "content-type": "application/json" });
@@ -504,7 +571,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       state.touch();
     }
     try {
-      const result = await handle(event, payload);
+      const result = await handle(event, payload, { delivery });
       stats.handled += 1;
       stats.lastEventAt = new Date().toISOString();
       log("relay: handled", { event, action: payload?.action, delivery, result });
@@ -564,6 +631,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
             owner: config.ownerLogin,
             prefixes: ctx.prefixes().length ? ctx.prefixes() : "every company's own",
             fixConflicts: Boolean(conflicts),
+            mergeQueue: mergeQueue ? { requeue: config.relayRequeueOnInfraDrop } : config.relayMergeQueue ? "off: no GitHub token" : false,
           });
           if (conflicts && config.conflictSweepSec > 0) {
             timer = every("relay conflicts", config.conflictSweepSec, 30_000, sweepAll, log);

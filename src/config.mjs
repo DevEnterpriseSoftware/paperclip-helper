@@ -147,6 +147,19 @@ export function loadConfig(env = process.env) {
     conflictPrComment: bool("RELAY_CONFLICT_PR_COMMENT", true),
     // Besides after each merge, look at every open PR this often. 0 = only after merges.
     conflictSweepSec: num("RELAY_CONFLICT_SWEEP_SEC", 900),
+    // A PR the merge queue drops without a conflict: a failed check sends it back to its
+    // agent, a cancelled run or the queue's timeout is noted for the board (needs a token).
+    relayMergeQueue: null, // set below: defaults to RELAY_FIX_CONFLICTS
+    // Queue such a PR again yourself (once per head commit, only one a person queued).
+    // Needs a token allowed to merge (GraphQL enqueuePullRequest). Off by default.
+    relayRequeueOnInfraDrop: bool("RELAY_REQUEUE_ON_INFRA_DROP", false),
+    // When you merge an issue's own PR and the issue has no review or approval stage
+    // left to record it, close the issue as done, as the approval would have.
+    relayDoneWithoutStages: bool("RELAY_DONE_WITHOUT_STAGES", true),
+    // Notes that need nothing from the agent (PR opened, closed, merged by someone
+    // else) go in the issue's "pull-requests" document, which wakes nobody, not in a
+    // comment, which wakes the assignee.
+    relayQuietNotes: bool("RELAY_QUIET_NOTES", true),
 
     // watchdog.mjs: re-wake stalled work
     watchdog: bool("WATCHDOG", true),
@@ -181,6 +194,15 @@ export function loadConfig(env = process.env) {
     // WATCHDOG_RESUME_SWEEP_LIMIT per agent per tick (0: the agent's maxConcurrentRuns).
     watchdogResumeSweep: bool("WATCHDOG_RESUME_SWEEP", true),
     watchdogResumeSweepLimit: Math.floor(num("WATCHDOG_RESUME_SWEEP_LIMIT", 0)),
+    // When a Claude account hits its usage limit, pause its agents (each once idle) and
+    // resume them this many minutes after the reset. A comment goes on
+    // WATCHDOG_NOTIFY_ISSUE (an issue identifier) when it happens, if set.
+    watchdogLimitPause: bool("WATCHDOG_LIMIT_PAUSE", true),
+    watchdogLimitResumeGraceMin: num("WATCHDOG_LIMIT_RESUME_GRACE_MIN", 5),
+    watchdogNotifyIssue: get("WATCHDOG_NOTIFY_ISSUE"),
+    // Reopen a done issue whose own PR is still open, and report issues whose review
+    // stages an update removed (the open-PR part needs a GitHub token).
+    watchdogStagesWipe: bool("WATCHDOG_STAGES_WIPE", true),
 
     // cost-sync.mjs: API-equivalent cost of subscription runs
     costSync: bool("COST_SYNC", true),
@@ -193,6 +215,8 @@ export function loadConfig(env = process.env) {
     costSyncSettleSec: num("COST_SYNC_SETTLE_SEC", 300),
   };
   if (!config.costSyncAdapters.length) config.costSyncAdapters = ["claude_local", "codex_local"];
+  // Merge-queue drops send PRs back like conflicts do, so they follow that choice unless set.
+  config.relayMergeQueue = bool("RELAY_MERGE_QUEUE", config.relayFixConflicts);
 
   const relayProblems = [];
   if (!config.secret) relayProblems.push("GITHUB_WEBHOOK_SECRET is not set");

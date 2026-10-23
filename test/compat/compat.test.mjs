@@ -65,6 +65,12 @@ const HELPER_ENDPOINTS = [
   ["GET", "/api/issues/{id}/recovery-actions"],
   ["POST", "/api/issues/{id}/recovery-actions/resolve"],
   ["GET", "/api/issues/{id}/runs"],
+  ["GET", "/api/issues/{id}/activity"],
+  ["POST", "/api/agents/{id}/pause"],
+  ["POST", "/api/agents/{id}/resume"],
+  ["GET", "/api/issues/{id}/documents/{key}"],
+  ["PUT", "/api/issues/{id}/documents/{key}"],
+  ["POST", "/api/issues/{id}/interactions/{interactionId}/respond"],
   ["GET", "/api/issues/{id}/work-products"],
   ["GET", "/api/issues/{id}/diagnostics/wakes"],
   ["GET", "/api/issues/{id}/diagnostics/blockers"],
@@ -77,6 +83,11 @@ const HELPER_ENDPOINTS = [
   ["GET", "/api/execution-workspaces/{id}/close-readiness"],
   ["PATCH", "/api/execution-workspaces/{id}"],
   ["GET", "/api/instance/settings/experimental"],
+];
+// Endpoints the helper calls that Paperclip serves but its OpenAPI document doesn't
+// list (main at d69631b). Covered by the last test, not by the OpenAPI check.
+const UNDOCUMENTED_ENDPOINTS = [
+  ["GET", "/api/companies/{companyId}/costs/by-agent"], // pch usage
 ];
 const templateRegex = (template) => new RegExp(`^${template.replace(/\{[^}]+\}/g, "[^/]+")}$`);
 
@@ -734,7 +745,7 @@ if (!BASE) {
     // ------------------------------------------------------------ 8. the end
 
     test("every request the helper made is to a listed endpoint", () => {
-      const patterns = HELPER_ENDPOINTS.map(([method, template]) => ({ method, regex: templateRegex(template) }));
+      const patterns = [...HELPER_ENDPOINTS, ...UNDOCUMENTED_ENDPOINTS].map(([method, template]) => ({ method, regex: templateRegex(template) }));
       const unlisted = new Set();
       for (const call of s.calls) {
         if (!patterns.some((p) => p.method === call.method && p.regex.test(call.pathname))) unlisted.add(`${call.method} ${call.pathname}`);

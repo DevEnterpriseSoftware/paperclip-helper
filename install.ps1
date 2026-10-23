@@ -193,12 +193,13 @@ function Install-PaperclipHelper {
   # ---------------------------------------------------------------- files
 
   $Managed = @('PCH_UID', 'PCH_GID', 'PCH_IMAGE', 'PAPERCLIP_API', 'PAPERCLIP_PUBLIC_URL', 'RELAY', 'GITHUB_WEBHOOK_SECRET',
-    'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'GITHUB_TOKEN', 'GITHUB_TOKEN_FILE', 'GITHUB_TOKEN_HOST_FILE',
+    'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS', 'RELAY_MERGE_QUEUE', 'RELAY_REQUEUE_ON_INFRA_DROP', 'RELAY_DONE_WITHOUT_STAGES', 'RELAY_QUIET_NOTES', 'GITHUB_TOKEN', 'GITHUB_TOKEN_FILE', 'GITHUB_TOKEN_HOST_FILE',
     'RELAY_HOST', 'RELAY_PORT', 'RELAY_PATH',
     'WATCHDOG', 'WATCHDOG_INTERVAL_SEC', 'WATCHDOG_STALL_SEC', 'WATCHDOG_MAX_NUDGES', 'WATCHDOG_HEAL_FAILED_FINALIZE',
     'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'WATCHDOG_CLEAR_DEAD_LINKS', 'WATCHDOG_ROUTE_QUESTIONS',
     'WATCHDOG_CI_RUNS', 'WATCHDOG_CI_RERUN_JOBS', 'WATCHDOG_CI_RERUN_MAX', 'WATCHDOG_DELIVER_ANSWERS', 'WATCHDOG_RETURN_ESCALATED_REVIEWS',
-    'WATCHDOG_CANCELLED_BLOCKERS', 'WATCHDOG_RESUME_SWEEP', 'WATCHDOG_RESUME_SWEEP_LIMIT', 'COST_SYNC', 'COST_SYNC_SINCE')
+    'WATCHDOG_CANCELLED_BLOCKERS', 'WATCHDOG_RESUME_SWEEP', 'WATCHDOG_RESUME_SWEEP_LIMIT',
+    'WATCHDOG_LIMIT_PAUSE', 'WATCHDOG_LIMIT_RESUME_GRACE_MIN', 'WATCHDOG_NOTIFY_ISSUE', 'WATCHDOG_STAGES_WIPE', 'COST_SYNC', 'COST_SYNC_SINCE')
 
   function Get-EnvText {
     $lines = @(
@@ -442,6 +443,10 @@ $network
   Step 'Relay: merge a PR to approve its issue'
   foreach ($key in @('RELAY', 'GITHUB_OWNER_LOGIN', 'GITHUB_REPOS', 'GITHUB_WEBHOOK_SECRET', 'ISSUE_PREFIXES', 'RELAY_LINK_PRS', 'RELAY_FIX_CONFLICTS',
       'GITHUB_TOKEN', 'GITHUB_TOKEN_FILE', 'GITHUB_TOKEN_HOST_FILE')) { $s[$key] = Pick $key }
+  $s.RELAY_MERGE_QUEUE = Pick 'RELAY_MERGE_QUEUE' ''
+  $s.RELAY_REQUEUE_ON_INFRA_DROP = Pick 'RELAY_REQUEUE_ON_INFRA_DROP' 'false'
+  $s.RELAY_DONE_WITHOUT_STAGES = Pick 'RELAY_DONE_WITHOUT_STAGES' 'true'
+  $s.RELAY_QUIET_NOTES = Pick 'RELAY_QUIET_NOTES' 'true'
   $s.RELAY_PORT = Pick 'RELAY_PORT' '3110'
   $s.RELAY_PATH = Pick 'RELAY_PATH' '/hooks/github'
   $s.RELAY_HOST = if ($script:NetMode -eq 'host') { '127.0.0.1' } else { '0.0.0.0' }
@@ -533,6 +538,10 @@ $network
   $s.WATCHDOG_CANCELLED_BLOCKERS = Pick 'WATCHDOG_CANCELLED_BLOCKERS' 'true'
   $s.WATCHDOG_RESUME_SWEEP = Pick 'WATCHDOG_RESUME_SWEEP' 'true'
   $s.WATCHDOG_RESUME_SWEEP_LIMIT = Pick 'WATCHDOG_RESUME_SWEEP_LIMIT' '0'
+  $s.WATCHDOG_LIMIT_PAUSE = Pick 'WATCHDOG_LIMIT_PAUSE' 'true'
+  $s.WATCHDOG_LIMIT_RESUME_GRACE_MIN = Pick 'WATCHDOG_LIMIT_RESUME_GRACE_MIN' '5'
+  $s.WATCHDOG_NOTIFY_ISSUE = Pick 'WATCHDOG_NOTIFY_ISSUE' ''
+  $s.WATCHDOG_STAGES_WIPE = Pick 'WATCHDOG_STAGES_WIPE' 'true'
   Say 'It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without'
   Say 'anything picking them up, and repairs blockers stuck on a failed workspace clean-up.'
   if (Confirm 'Turn the watchdog on?' (Truthy $s.WATCHDOG)) {
@@ -569,6 +578,11 @@ $network
     $s.WATCHDOG_CANCELLED_BLOCKERS = if (Confirm 'Tell an agent when its issue is blocked by a cancelled issue (Paperclip never counts it resolved)?' (Truthy $s.WATCHDOG_CANCELLED_BLOCKERS)) { 'true' } else { 'false' }
     Say 'Pausing an agent with runs queued makes Paperclip block those issues, and resuming it restarts none of them.'
     $s.WATCHDOG_RESUME_SWEEP = if (Confirm 'Restore such issues when the agent is resumed (a few at a time; others are never touched)?' (Truthy $s.WATCHDOG_RESUME_SWEEP)) { 'true' } else { 'false' }
+    Say 'At a Claude usage limit every Claude agent''s next run fails, and Paperclip keeps retrying them.'
+    $s.WATCHDOG_LIMIT_PAUSE = if (Confirm 'Pause the Claude agents on that account (each once idle) and resume them when the limit resets?' (Truthy $s.WATCHDOG_LIMIT_PAUSE)) { 'true' } else { 'false' }
+    Say 'Some things only the board can settle: a usage-limit pause, wiped review stages, a merge-queue drop.'
+    Say 'The helper always logs them; it can also comment on an issue you watch (in the same company).'
+    $s.WATCHDOG_NOTIFY_ISSUE = Ask 'Issue for the helper''s notes to you, e.g. ACM-12 (empty: the log only)' $s.WATCHDOG_NOTIFY_ISSUE
   } else {
     $s.WATCHDOG = 'false'
   }

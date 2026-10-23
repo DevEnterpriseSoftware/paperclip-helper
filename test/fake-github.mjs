@@ -24,6 +24,8 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
   const pulls = {}; // "org/app" → [pull]
   const runs = {}; // "org/app" → { [runId]: workflow run, with `jobs` (served on the jobs route) and `onRerun(run)` }
   const reruns = []; // { repo, id }
+  const annotations = {}; // check run (job) id → [{ annotation_level, message }]
+  const graphql = []; // { query, variables }
   const comments = []; // { repo, number, body }
   const requests = [];
   const fail = {}; // "POST comments" or "GET pull 8" → status
@@ -79,6 +81,30 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
           : found.mergeable;
         return send(res, 200, { ...found, mergeable });
       }
+      m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/actions\/runs$/);
+      if (m && req.method === "GET") {
+        // Newest first, filtered by event and `created=>=<time>`, paged, like GitHub's list.
+        const event = url.searchParams.get("event");
+        const after = Date.parse(String(url.searchParams.get("created") ?? "").replace(/^>=/, "")) || 0;
+        const perPage = Number(url.searchParams.get("per_page") ?? 30);
+        const page = Number(url.searchParams.get("page") ?? 1);
+        const rows = Object.values(runs[m[1]] ?? {})
+          .filter((r) => (!event || r.event === event) && Date.parse(r.created_at) >= after)
+          .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+          .map(({ jobs, onRerun, ...rest }) => rest);
+        return send(res, 200, { total_count: rows.length, workflow_runs: rows.slice((page - 1) * perPage, page * perPage) });
+      }
+      m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/check-runs\/(\d+)\/annotations$/);
+      if (m && req.method === "GET") {
+        if (fail["GET annotations"]) return send(res, fail["GET annotations"], { message: "Resource not accessible by integration" });
+        return send(res, 200, annotations[m[2]] ?? []);
+      }
+      if (url.pathname === "/graphql" && req.method === "POST") {
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        graphql.push(body);
+        if (fail["POST graphql"]) return send(res, 200, { errors: [{ message: "Resource not accessible by integration" }] });
+        return send(res, 200, { data: { enqueuePullRequest: { mergeQueueEntry: { id: "MQE_1" } } } });
+      }
       m = url.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/actions\/runs\/(\d+)(\/jobs|\/rerun-failed-jobs)?$/);
       if (m) {
         if (!m[3] && req.method === "GET" && fail["GET run"]) return send(res, fail["GET run"], { message: "Resource not accessible by integration" });
@@ -116,6 +142,8 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
     pulls,
     runs,
     reruns,
+    annotations,
+    graphql,
     comments,
     requests,
     fail,

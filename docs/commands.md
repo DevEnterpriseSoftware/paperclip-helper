@@ -11,9 +11,11 @@
 | `pch approve ISSUE [comment]` | Approves an issue whose approval is waiting on you. It refuses otherwise. |
 | `pch changes ISSUE comment` | Requests changes. The comment is required and becomes the brief. |
 | `pch comment ISSUE text` | Comments as you, which wakes the assignee. |
+| `pch answer ISSUE CARD text` | Answers a question card as you, as the card's form would: `CARD` is its id or the start of it. A card with one question only: an option whose label (or id) is the text, else the text as a typed answer when the question takes one. Without a matching card it lists the pending ones. Quote the text to keep its spacing exactly. |
 | `pch release ISSUE [--apply] [--outcome=…]` | Releases an execution hold whose run can't prove it stopped, so messages and Interrupt stay saved behind it. It previews unless you pass `--apply`. See [`release`](#release-a-hold-messages-cant-clear). |
 | `pch workspace ISSUE [--apply]` | Gives an issue linked to a closed workspace, or to another issue's live one, a new isolated workspace. It previews unless you pass `--apply`. See [`workspace`](#workspace-an-issue-linked-to-the-wrong-workspace). |
 | `pch worktrees [--apply]` | Closes the execution workspaces of finished issues, so Paperclip removes their git worktrees from disk. It previews unless you pass `--apply`. See [`worktrees`](#worktrees-finished-issues-worktrees-still-on-disk). |
+| `pch usage [--days N] [--agent NAME]` | Where the tokens go: per agent, its runs, tokens, cost, model and effort, what woke it, and the agents worth a look (one that polls, one that keeps failing, one using most of its provider's tokens). Read-only. See [`usage`](#usage-where-the-tokens-go). |
 | `pch costs` | Previews what cost sync would post, and what it does to budgets. |
 | `pch costs --sessions` | Checks whether resumed sessions report cumulative costs (see [Compatibility](../README.md#compatibility)). |
 | `pch models` | Every agent's adapter, model, effort and status. |
@@ -52,6 +54,33 @@ ACM: 96 blocked issues
 - **Other question cards:** for you, a board user, a person, or anyone.
 
 It reads only, and looks at every open issue's cards, so on a large company it takes a few seconds.
+
+## `usage`: where the tokens go
+
+When a subscription runs out sooner than it should, the question is which agent spent it, and on what. `pch usage` reads each agent's runs over the last 7 days (`--days N`), or one agent's (`--agent NAME`), and changes nothing:
+
+```text
+Usage over the last 7 days
+
+Agent  Runs  Failed  Input  Cached  Output      Cost  Model              Effort
+Carla   100       0  10.0M  100.0M    500k  $1234.56  claude-opus-4-7    high
+Cody     10       6   406k    4.0M     20k         -  gpt-5.4            medium
+Rex      10       0   200k    2.0M     20k         -  claude-sonnet-4-6  -
+
+What woke them:
+  Carla: issue_commented 50 (50%), issue_monitor_due 40 (40%), issue_blockers_resolved 10 (10%)
+  Cody: issue_commented 6 (60%), issue_assigned 4 (40%)
+  Rex: execution_review_requested 10 (100%)
+
+Worth a look:
+  - Carla polls: 40% of its runs (40 of 100) were its own monitor's wakes. Tell it to name the run it waits on and end its run; the watchdog wakes it when the run finishes.
+  - Cody: 60% of its runs failed (6 of 10). Its runs' errors say why; `pch why` helps on one of its issues.
+```
+
+- **Runs and tokens** come from each agent's finished runs (`GET /api/companies/:id/heartbeat-runs?agentId=…`, its latest 1000; the report says when that cut the window short). Input is fresh input, cached input its own column, as Paperclip records them; for Codex, whose input included its cache hits on Paperclip releases before late October 2026, the cached part is taken out of the input.
+- **Cost** is what Paperclip records per agent for the period (`/costs/by-agent`): $0 for subscription runs unless [cost sync](cost-sync.md) posts their API-equivalent cost. If Paperclip won't give the costs, the report says so.
+- **What woke them** is each run's wake reason: `issue_monitor_due` (its own Paperclip monitor), `issue_commented`, `issue_blockers_resolved`, `interaction_pending`, an assignment, a timer, and so on.
+- **Worth a look:** more than 25% of an agent's runs are monitor wakes (it polls: rely on the [watchdog's CI report](watchdog.md#11-ci-runs-an-agent-waits-on) instead); more than 20% of its runs failed (at least 5); or it used far more than an even share of its provider's tokens (Anthropic for Claude agents, OpenAI for Codex): more than 30%, and more than twice an even share (so with two or three agents on a provider, one being busier isn't flagged).
 
 ## `set-model`: every model and effort level
 

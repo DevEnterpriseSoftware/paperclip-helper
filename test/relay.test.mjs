@@ -2,12 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setup, sign } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
-import { createRelay, findIdentifiers, isWorkProductOf, verifySignature } from "../src/relay.mjs";
+import { createRelay, isWorkProductOf, verifySignature } from "../src/relay.mjs";
+import { findIdentifiers } from "../src/identifiers.mjs";
 import { createStateStore } from "../src/store.mjs";
 import { signed, SIGNATURE } from "../src/util.mjs";
 
 const SECRET = "test-secret";
-const RELAY_ENV = { GITHUB_WEBHOOK_SECRET: SECRET, GITHUB_OWNER_LOGIN: "Owner", GITHUB_REPOS: "org/app", RELAY_PORT: "0" };
+// Most of these check the notes as comments (RELAY_QUIET_NOTES=false); quiet-notes.test.mjs checks the document.
+const RELAY_ENV = { GITHUB_WEBHOOK_SECRET: SECRET, GITHUB_OWNER_LOGIN: "Owner", GITHUB_REPOS: "org/app", RELAY_PORT: "0", RELAY_QUIET_NOTES: "false" };
 
 const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user } };
 

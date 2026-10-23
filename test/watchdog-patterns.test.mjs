@@ -198,6 +198,84 @@ test("a Paperclip monitor still due to fire is left to do its job", async (t) =>
   assert.equal(helperComments(env.db, issue).length, 0);
 });
 
+test("a monitor still due that names the finished run is cleared in the same step as the report", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue } = waitingOnCi(env);
+  const stages = [{ id: "s1", type: "review", participants: [{ type: "user", userId: ids.user }] }];
+  const monitor = { nextCheckAt: new Date(env.clock.now + 30 * 60_000).toISOString(), notes: "Re-check CI run 39498202022", externalRef: "[redacted]" };
+  issue.executionPolicy = { stages, monitor };
+  issue.executionState = { monitor: { status: "scheduled", nextCheckAt: monitor.nextCheckAt, notes: monitor.notes } };
+  await env.watchdog.tick();
+  assert.equal(env.db.patches.length, 1);
+  const { body } = env.db.patches[0];
+  assert.deepEqual(body.executionPolicy, { stages }, "the policy as it was, without the monitor");
+  assert.match(body.comment, /the CI run you were waiting on has finished/);
+  assert.match(body.comment, /Your Paperclip monitor for this run was cleared/);
+  assert.equal(issue.executionState.monitor.status, "cleared");
+  assert.equal(helperComments(env.db, issue).length, 1);
+});
+
+test("a monitor that also watches another run, or one without its policy, is left alone; a monitor-only policy clears to none", async (t) => {
+  const both = await watchdogEnv(t);
+  const { issue } = waitingOnCi(both);
+  const notes = "CI run 39498202022, then the deploy run 39498299999 in org/infra";
+  const due = new Date(both.clock.now + 30 * 60_000).toISOString();
+  issue.executionPolicy = { monitor: { nextCheckAt: due, notes } };
+  issue.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes } };
+  await both.watchdog.tick();
+  assert.equal(both.db.patches.length + helperComments(both.db, issue).length, 0);
+
+  const orphan = await watchdogEnv(t);
+  const lone = waitingOnCi(orphan).issue;
+  lone.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: "CI run 39498202022" } };
+  await orphan.watchdog.tick();
+  assert.equal(orphan.db.patches.length + helperComments(orphan.db, lone).length, 0);
+
+  const only = await watchdogEnv(t);
+  const solo = waitingOnCi(only).issue;
+  solo.executionPolicy = { monitor: { nextCheckAt: due, notes: "https://github.com/org/app/actions/runs/39498202022" } };
+  solo.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: solo.executionPolicy.monitor.notes } };
+  await only.watchdog.tick();
+  assert.equal(only.db.patches.length, 1);
+  assert.equal(solo.executionPolicy, null);
+});
+
+test("a paused task postpones the report and the clearing together; a dry run does neither", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue } = waitingOnCi(env);
+  const due = new Date(env.clock.now + 30 * 60_000).toISOString();
+  issue.executionPolicy = { monitor: { nextCheckAt: due, notes: "run 39498202022" } };
+  issue.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: "run 39498202022" } };
+  issue.paused = true;
+  await env.watchdog.tick();
+  assert.equal(issue.executionState.monitor.status, "scheduled");
+  assert.equal(helperComments(env.db, issue).length, 0);
+  issue.paused = false;
+  env.later(10);
+  await env.watchdog.tick();
+  assert.equal(issue.executionState.monitor.status, "cleared");
+
+  const dry = await watchdogEnv(t, { DRY_RUN: "true" });
+  const other = waitingOnCi(dry).issue;
+  other.executionPolicy = { monitor: { nextCheckAt: due, notes: "run 39498202022" } };
+  other.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: "run 39498202022" } };
+  await dry.watchdog.tick();
+  assert.equal(dry.db.patches.length, 0);
+  assert.equal(other.executionState.monitor.status, "scheduled");
+});
+
+test("a monitor still due that names another run is left alone, and nothing is said", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue } = waitingOnCi(env);
+  const monitor = { nextCheckAt: new Date(env.clock.now + 30 * 60_000).toISOString(), notes: "Watching the release run 39498209999" };
+  issue.executionPolicy = { monitor };
+  issue.executionState = { monitor: { status: "scheduled", nextCheckAt: monitor.nextCheckAt, notes: monitor.notes } };
+  await env.watchdog.tick();
+  assert.equal(env.db.patches.length, 0);
+  assert.equal(helperComments(env.db, issue).length, 0);
+  assert.equal(issue.executionState.monitor.status, "scheduled");
+});
+
 test("a run named only in a monitor's notes counts too", async (t) => {
   const env = await watchdogEnv(t);
   const { issue } = waitingOnCi(env, { comment: "Handing off to the monitor." });

@@ -77,6 +77,7 @@ export function createStateStore(file, { now = () => Date.now() } = {}) {
   const deliveries = new BoundedMap(Object.entries(raw.deliveries ?? {}), 1000);
   const nudges = new BoundedMap(Object.entries(raw.nudges ?? {}), 2000);
   const conflicts = new BoundedMap(Object.entries(raw.conflicts ?? {}), 500);
+  const queue = new BoundedMap(Object.entries(raw.queue ?? {}), 500); // merge-queue drops and who queued each PR
   let dirty = false;
   const WEEK = 7 * 86_400_000;
 
@@ -84,6 +85,7 @@ export function createStateStore(file, { now = () => Date.now() } = {}) {
     deliveries,
     nudges,
     conflicts,
+    queue,
     touch() {
       dirty = true;
     },
@@ -96,11 +98,13 @@ export function createStateStore(file, { now = () => Date.now() } = {}) {
         if (key.startsWith("question:") && value?.relayId && !value.settled) continue;
         if (now() - (value?.at ?? 0) > WEEK) nudges.delete(key);
       }
+      for (const [key, value] of queue.entries()) if (now() - (value?.at ?? 0) > WEEK) queue.delete(key);
       writeJson(file, {
         version: 1,
         deliveries: Object.fromEntries(deliveries.entries()),
         nudges: Object.fromEntries(nudges.entries()),
         conflicts: Object.fromEntries(conflicts.entries()),
+        queue: Object.fromEntries(queue.entries()),
       });
       dirty = false;
     },

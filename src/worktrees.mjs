@@ -22,7 +22,7 @@
 // Everything else is left for you unless you ask for it.
 
 import { listIssues } from "./paperclip.mjs";
-import { mapLimit } from "./util.mjs";
+import { mapLimit, plural } from "./util.mjs";
 
 const TERMINAL = new Set(["done", "cancelled"]);
 
@@ -40,7 +40,6 @@ export function finishedAt(issue) {
   return Number.isFinite(t) ? t : null;
 }
 
-export const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 // owner/repo from a workspace's repoUrl (https, ssh or scp-style), lower-cased; null otherwise.
 export function repoFromUrl(url) {

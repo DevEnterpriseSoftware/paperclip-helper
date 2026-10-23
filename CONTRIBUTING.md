@@ -6,22 +6,40 @@ Thanks for helping. Issues describing a Paperclip situation the helper doesn't h
 
 ```
 src/
-  index.mjs       entry point: the service, and command dispatch
-  config.mjs      settings from the environment, validated
-  context.mjs     config + logger + API client + identity, built once
-  paperclip.mjs   HTTP client: timeouts, safe retries, readable errors
-  relay.mjs       GitHub webhooks → decisions and comments
-  conflicts.mjs   the relay's sweep for PRs with merge conflicts
-  github.mjs      GitHub API client, used by that sweep only
-  watchdog.mjs    stalled-work checks and nudges
-  cost-sync.mjs   API-equivalent cost events
-  prices.mjs      model price table
-  commands.mjs    the one-off `pch` commands
-  store.mjs       small JSON state files, written atomically
-  util.mjs        small shared helpers
-  log.mjs         one JSON line per event, with secrets masked
+  index.mjs         entry point: the service, and command dispatch
+  config.mjs        settings from the environment, validated
+  context.mjs       config + logger + API client + identity, built once
+  paperclip.mjs     HTTP client: timeouts, safe retries, readable errors
+  github.mjs        GitHub API client (the conflict sweep, merge-queue drops, CI runs)
+  relay.mjs         GitHub webhooks → decisions and comments
+  conflicts.mjs     the relay's sweep for PRs with merge conflicts
+  merge-queue.mjs   the relay's handling of PRs the merge queue drops
+  quiet-notes.mjs   the relay's quiet notes, in each issue's pull-requests document
+  identifiers.mjs   finding issue identifiers (ACM-12) in PR titles, branches and bodies
+  watchdog.mjs      stalled-work checks and nudges (the list of checks is at its top)
+  ci-runs.mjs       watchdog 11: CI runs agents wait on
+  board-held.mjs    watchdog 12, 13: issues waiting on your review
+  questions.mjs     watchdog 10: question cards addressed to a teammate
+  release.mjs       watchdog 7 and `pch release`: holds Paperclip can't release
+  workspace.mjs     watchdog 8, 9 and `pch workspace`: workspace links
+  resume.mjs        watchdog 15: issues blocked while their agent was paused
+  limits.mjs        watchdog 16: Claude usage limits
+  stages.mjs        watchdog 17: wiped review stages
+  board-note.mjs    notes for the board (log, and WATCHDOG_NOTIFY_ISSUE)
+  cost-sync.mjs     API-equivalent cost events
+  prices.mjs        model price table
+  commands.mjs      the one-off `pch` commands
+  advice.mjs        `pch why`: diagnosis and recommendation
+  blocked.mjs       `pch blocked`
+  worktrees.mjs     `pch worktrees`
+  usage.mjs         `pch usage`
+  answer.mjs        `pch answer`
+  store.mjs         small JSON state files, written atomically
+  util.mjs          small shared helpers
+  log.mjs           one JSON line per event, with secrets masked
 test/
   fake-paperclip.mjs   an in-memory Paperclip for the tests
+  fake-github.mjs      an in-memory GitHub for the tests
   helpers.mjs          shared test set-up
   *.test.mjs
   compat/              the same code against a real Paperclip, one version at a time
@@ -65,7 +83,7 @@ The suite seeds a company with `process`-adapter agents (a shell one-liner each)
 
 To run it against a Paperclip you started yourself, set `PAPERCLIP_COMPAT_API`. That instance must be in `local_trusted` mode and hold no companies of your own: the suite refuses to run otherwise.
 
-The same suite runs in CI on every push, and daily against Paperclip's latest release (`.github/workflows/compat.yml`). When a new Paperclip passes, add its version to that workflow's list. When the helper calls a new endpoint, the suite's last test fails until you add it to `HELPER_ENDPOINTS`.
+The same suite runs in CI on every push, and daily against Paperclip's latest release (`.github/workflows/compat.yml`). When a new Paperclip passes, add its version to that workflow's list. When the helper calls a new endpoint, the suite's last test fails until you add it to `HELPER_ENDPOINTS` (or, for one Paperclip serves but leaves out of its OpenAPI document, `UNDOCUMENTED_ENDPOINTS`).
 
 What it can't reproduce are failures that need real infrastructure: an environment lease that is refused, a failed `workspace_finalize`, a recovery hold, and subscription runs with usage. Those stay covered by the fake server's tests and by `pch why` on a live instance.
 

@@ -5,15 +5,19 @@ In Paperclip, the current participant of a review or approval stage records a de
 | On GitHub | In Paperclip |
 |---|---|
 | **You merge** the PR | The issue is **approved**: `done`, with a comment naming the PR and merge commit. |
+| **You merge** the PR of an issue whose review stages an agent's update wiped | Closed as `done` with the merge comment, as the approval would have (`RELAY_DONE_WITHOUT_STAGES`, [below](#merging-an-issue-whose-review-stages-were-wiped)). |
 | **You "Request changes"** in a review | **Changes requested**: `in_progress` and back to the engineer, with your review text as the brief. |
 | **You comment `/changes …`** on the PR, or start a review with it | Same as Request changes. |
 | Your `/changes`, `/approve` or Request changes **isn't recorded** (the issue isn't waiting on you, several are, or the PR names no issue) | Your text goes to the issue as a comment, as before, and the relay **replies on the PR** with where it went and why (`RELAY_PR_NOTES`, [below](#when-a-decision-isnt-recorded)). |
 | **You comment `/approve …`** on the PR, or start a review with it | Approved without merging. |
 | **You approve** the PR in a GitHub review | Nothing. Merging is the approval. |
 | **You comment** or review anything else | Your text is copied to the issue as a comment, which wakes the assignee. |
-| **Someone else merges**, or the PR is **closed** without merging | A comment only. |
-| **The PR is opened, reopened or marked ready for review** | Its URL is posted on the PR's own issue (the first one its title, branch or body names, or that issue's subtask waiting on you), so Paperclip links the PR (`RELAY_LINK_PRS`). Never on a blocker or another issue it mentions: a link there would show the PR as that issue's. |
-| **A merge leaves another open PR with conflicts** | That PR's issue goes back to its agent to resolve them, and the PR gets a comment saying so (`RELAY_FIX_CONFLICTS`, [below](#prs-with-merge-conflicts)). |
+| **Someone else merges**, or the PR is **closed** without merging | A note on the issue only ([quiet](#quiet-notes)). |
+| **The PR is opened, reopened or marked ready for review** | Its URL is noted on the PR's own issue (the first one its title, branch or body names, or that issue's subtask waiting on you), so Paperclip links the PR (`RELAY_LINK_PRS`). Never on a blocker or another issue it mentions: a link there would show the PR as that issue's. |
+| **A merge leaves another open PR with conflicts** (only with `RELAY_FIX_CONFLICTS`) | That PR's issue goes back to its agent to resolve them, and the PR gets a comment saying so ([below](#prs-with-merge-conflicts)). |
+| **The merge queue drops a PR** without a conflict | A failed check: back to its agent with the failure. A cancelled run or the queue's timeout: the board is told (`RELAY_MERGE_QUEUE`, [below](#prs-the-merge-queue-drops-without-a-conflict)). |
+
+<a id="quiet-notes"></a>**Quiet notes.** A comment from a board user wakes the issue's assigned agent, and Paperclip has no way to comment without waking anyone. The notes above need nothing from the agent, so with `RELAY_QUIET_NOTES` on (the default) they go in the issue's **Pull requests** document (key `pull-requests`) instead, one dated line each: *"2026-10-23 08:12 UTC: PR #12 opened by @carla: https://github.com/…"*. Updating a document wakes nobody, and Paperclip still links the PRs it names. Anything you add to the document is kept. If Paperclip won't take the document (it is locked, say), or an issue already has a `pull-requests` document the relay didn't start, the note is a comment, as before. Your own comments and decisions are still comments: those are meant to wake the agent.
 
 Every delivery's response body says what the relay did, for example `{"identifier":"ACM-2","action":"approve","status":"done"}`. `status` is read back from Paperclip after the decision, and a `warning` says when the issue didn't land where it was sent. You can see it in GitHub's webhook **Recent Deliveries**, and **Redeliver** retries a delivery that failed.
 
@@ -27,7 +31,7 @@ Every delivery's response body says what the relay did, for example `{"identifie
 - Only repositories in `GITHUB_REPOS` are accepted.
 - Only `GITHUB_OWNER_LOGIN` can approve or request changes. Anyone else's reviews and comments are ignored, and their merges only produce a comment.
 - A decision is recorded only when Paperclip says it's waiting on *you*; otherwise the relay comments.
-- The relay never merges, pushes, closes or deletes anything. Without a GitHub token it never calls GitHub at all. With one, it comments on PRs to say a decision wasn't recorded, and with `RELAY_FIX_CONFLICTS` it also reads pull requests and comments on the ones it sends back.
+- The relay never merges, pushes, closes or deletes anything on GitHub. Without a GitHub token it never calls GitHub at all. With one, it comments on PRs to say a decision wasn't recorded; with `RELAY_FIX_CONFLICTS` or `RELAY_MERGE_QUEUE` it also reads pull requests (and the merge queue's runs) and comments on the ones it sends back. Only with `RELAY_REQUEUE_ON_INFRA_DROP` (off by default) does it put a PR a person queued back in the merge queue.
 
 <a id="when-a-decision-isnt-recorded"></a>**When a decision isn't recorded.** A `/changes` on a PR whose issue isn't waiting on you can't be a decision, so the relay copies your text to the first issue the PR names instead. That issue may not be the one you were looking at: a PR opened from a parent's workspace names the parent. With a GitHub token (`GITHUB_TOKEN` or `GITHUB_TOKEN_FILE`, "Pull requests: Read and write"), the relay replies on the PR:
 
@@ -44,6 +48,10 @@ A decision that is recorded gets no reply. For comments, GitHub doesn't send the
 **GitHub won't let you "Request changes" on your own PR.** If your agents open PRs with your own token, comment `/changes …` instead.
 
 **Where to see what's waiting on you.** The Dashboard's "Pending Approvals" and the Approvals page list *formal* approval requests, such as agent hires and budget overrides, not review stages. To see reviews waiting on you, turn on **Instance settings → Experimental → Decisions**.
+
+## Merging an issue whose review stages were wiped
+
+When an agent's update wipes an issue's review stages (a Paperclip bug: [watchdog 17](watchdog.md#17-issues-whose-review-stages-were-wiped)), your merge has no approval stage to record, so the issue stayed open and its dependants couldn't start. With `RELAY_DONE_WITHOUT_STAGES` on (the default), when you merge a PR and its own issue (the first one it names) isn't done or cancelled, has no stage pending, and Paperclip's activity log shows an agent's update removed its stages, the relay closes it as done with the merge comment, as the approval would have. An issue that never had stages, a PR that only mentions the issue, a merge by someone else and a `/approve` on a PR not yet merged are handled as before.
 
 ## PRs with merge conflicts
 
@@ -75,6 +83,30 @@ Every look is one log line, `relay: conflict sweep`, listing each PR it acted on
 - Right after a merge GitHub needs a few seconds to work out which PRs conflict. The relay waits and asks again; a PR GitHub is still unsure about is picked up by the next look.
 - The relay's own PR comments end with a hidden marker, so they are not copied back to the issue as if you had written them.
 
+## PRs the merge queue drops without a conflict
+
+GitHub's merge queue tests each queued PR combined with the base branch and the PRs ahead of it, on a temporary branch (`gh-readonly-queue/<base>/pr-<n>-…`, workflow runs with event `merge_group`), and removes it when that goes wrong (`pull_request.dequeued`, from `github-merge-queue[bot]`, with a `reason`). A drop for a conflict was always sent back; anything else left the PR sitting unmerged until someone noticed.
+
+With `RELAY_MERGE_QUEUE` on (it follows `RELAY_FIX_CONFLICTS` unless you set it) and a GitHub token with **Actions: Read**, the relay goes by GitHub's reason and the runs of the PR's latest merge group:
+
+| Reason | What it finds | What it does |
+|---|---|---|
+| `CI_FAILURE` | A job failed (a test, a check that only fails on the combined change). | Sends the PR back [like a conflict](#prs-with-merge-conflicts), with the run, the failed jobs and the first failure annotation (that needs **Checks: Read**; without it the brief has none), and a note on the PR (`RELAY_CONFLICT_PR_COMMENT`). |
+| `CI_FAILURE` | Only a cancelled job (a runner restarted mid-run). | Tells the board the PR isn't at fault: queue it again. |
+| `CI_FAILURE` | No failed or cancelled job to show. | Tells the board it couldn't tell why, rather than guess. |
+| `CI_TIMEOUT` | (not looked at) | The queue's status-check timeout ran out while the checks waited for a runner. Tells the board to queue it again; never sent back. |
+| `MERGE_CONFLICT` | The PR conflicts with its base. | The [conflict sweep](#prs-with-merge-conflicts) sends it back, as before. |
+| `MERGE_CONFLICT` | It conflicts only with a PR ahead of it. | Tells the board to queue it again once that PR has merged. |
+| anything else | | Nothing: removed by hand, branch protections, the queue cleared. |
+
+Without a reason (an older GitHub Enterprise Server), the runs decide the same way; with no merge-group run found, nothing is done.
+
+**Telling the board without waking the implementer:** a board comment wakes the issue's assigned agent. So the note goes on the issue only while no agent is assigned (the issue waits on a person, as it does while its PR is in the queue for your approval); otherwise it goes on the PR and in the [board notes](watchdog.md#notes-for-the-board) (`WATCHDOG_NOTIFY_ISSUE`, and the log).
+
+**Queue it again yourself:** with `RELAY_REQUEUE_ON_INFRA_DROP=true` (off by default), the relay re-queues a PR dropped by a cancelled run or the timeout with GitHub's `enqueuePullRequest`, once per head commit, and only if a person queued it (the relay remembers who did, from `pull_request.enqueued`, in its state file). Never after a failed check. The token must be allowed to merge into the base branch; if it isn't, the board note still goes out and the log says why.
+
+Once per merge group. Merged PRs, PRs that name no issue, and issues that are done or cancelled are left alone. If the work fails part-way (GitHub didn't answer), the log says which PR, and GitHub's **Redeliver** tries again. The webhook's **Pull requests** events already include `enqueued` and `dequeued`.
+
 ### The GitHub token
 
 The relay needs a token to read pull requests and comment on them. A **fine-grained personal access token** limited to your repositories is the safest:
@@ -83,7 +115,7 @@ The relay needs a token to read pull requests and comment on them. A **fine-grai
 2. **Token name:** `paperclip-helper`. **Expiration:** your choice; when it expires the log says `GitHub rejected GITHUB_TOKEN`, and you create a new one.
 3. **Resource owner:** the account or organization that owns the repositories. An organization may have to approve the token first.
 4. **Repository access:** **Only select repositories**, and pick the ones in `GITHUB_REPOS`.
-5. **Permissions → Repository permissions → Pull requests: Read and write.** GitHub adds **Metadata: Read-only** by itself. With `RELAY_CONFLICT_PR_COMMENT=false`, **Read-only** is enough. The watchdog uses the same token to read the CI runs agents wait on ([`WATCHDOG_CI_RUNS`](watchdog.md#11-ci-runs-an-agent-waits-on)): add **Actions: Read-only** for that, or **Read and write** if you set `WATCHDOG_CI_RERUN_JOBS` to re-run flaky jobs.
+5. **Permissions → Repository permissions → Pull requests: Read and write.** GitHub adds **Metadata: Read-only** by itself. With `RELAY_CONFLICT_PR_COMMENT=false`, **Read-only** is enough. The watchdog uses the same token to read the CI runs agents wait on ([`WATCHDOG_CI_RUNS`](watchdog.md#11-ci-runs-an-agent-waits-on)): add **Actions: Read-only** for that, or **Read and write** if you set `WATCHDOG_CI_RERUN_JOBS` to re-run flaky jobs. [Merge-queue drops](#prs-the-merge-queue-drops-without-a-conflict) need **Actions: Read-only** too, and **Checks: Read-only** to quote the failure annotation.
 6. **Generate token**, and copy it (`github_pat_…`). GitHub shows it once.
 7. Re-run the installer and answer yes to "Send PRs with merge conflicts back to their agents automatically?", or put it in `.env` yourself and run `docker compose up -d`:
 
@@ -123,7 +155,7 @@ The PR comments are written by the token's account. With your own token they app
 
 ## Why an issue can show the wrong PRs
 
-Paperclip builds an issue's "GitHub Pull Request" rows from full `github.com/<owner>/<repo>/pull/<n>` URLs anywhere in the issue's text. Agents usually write "PR #16", which links nothing, and a PR URL quoted from another issue shows up as if it belonged to this one. The relay posts the real PR's URL when the PR opens, so **the issue's latest "PR #N opened" comment is the one to trust.** The rows only appear with **Instance settings → Experimental → External Objects** turned on.
+Paperclip builds an issue's "GitHub Pull Request" rows from full `github.com/<owner>/<repo>/pull/<n>` URLs anywhere in the issue's text. Agents usually write "PR #16", which links nothing, and a PR URL quoted from another issue shows up as if it belonged to this one. The relay notes the real PR's URL when the PR opens, so **the latest "PR #N opened" line in the issue's Pull requests document** (a comment, with `RELAY_QUIET_NOTES=false`) **is the one to trust.** The rows only appear with **Instance settings → Experimental → External Objects** turned on.
 
 ## Relay settings
 
@@ -134,14 +166,18 @@ Paperclip builds an issue's "GitHub Pull Request" rows from full `github.com/<ow
 | `GITHUB_OWNER_LOGIN` | none | Your GitHub login. **Required.** |
 | `GITHUB_REPOS` | none | Comma-separated `owner/repo` list. **Required.** |
 | `ISSUE_PREFIXES` | every company's own | Prefixes to look for, such as `ACM,OPS`. |
-| `RELAY_LINK_PRS` | `true` | Post a newly opened PR's URL on its issue. |
+| `RELAY_LINK_PRS` | `true` | Note a newly opened PR's URL on its issue. |
+| `RELAY_QUIET_NOTES` | `true` | Put the notes that need nothing from the agent (PR opened, closed, merged by someone else) in the issue's `pull-requests` document, which wakes nobody. `false`: comments, which wake the assignee. |
 | `RELAY_PR_NOTES` | `true` | Reply on the PR when a `/changes`, `/approve` or Request changes isn't recorded as a decision. Needs `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE`. |
 | `RELAY_FIX_CONFLICTS` | `false` | Send PRs with merge conflicts back to their agents. Needs `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE`. |
-| `GITHUB_TOKEN` | none | The [token](#the-github-token) the relay reads pull requests and comments with (conflict send-backs and `RELAY_PR_NOTES`). |
+| `GITHUB_TOKEN` | none | The [token](#the-github-token) the relay reads pull requests and comments with (conflict send-backs, merge-queue drops and `RELAY_PR_NOTES`); the watchdog uses it too (CI runs, wiped stages). |
 | `GITHUB_TOKEN_FILE` | none | Instead of `GITHUB_TOKEN`: [a file](#a-token-file-github-app) holding the token, read for every request (a GitHub App's hourly token). |
 | `GITHUB_TOKEN_HOST_FILE` | none | That file's path on the host. Only the installer reads it, to write the mount. |
 | `RELAY_CONFLICT_MAX_ATTEMPTS` | `2` | Send-backs per PR while it keeps conflicting, one per push, before it is left to you. |
 | `RELAY_CONFLICT_PR_COMMENT` | `true` | Say on the PR that it was sent back. |
+| `RELAY_DONE_WITHOUT_STAGES` | `true` | When you merge an issue's own PR and its review stages were wiped, close it as done. |
+| `RELAY_MERGE_QUEUE` | as `RELAY_FIX_CONFLICTS` | When the merge queue drops a PR without a conflict: send it back if a check failed, or tell the board if a run was cancelled or the queue timed out. Needs a GitHub token with **Actions: Read** (and **Checks: Read** for the failure annotation). |
+| `RELAY_REQUEUE_ON_INFRA_DROP` | `false` | Also queue such a PR again (not after a failed check), once per head commit, if a person queued it. Needs a token allowed to merge. |
 | `RELAY_CONFLICT_SWEEP_SEC` | `900` | Also look at every open PR this often. `0`: only after a merge. Otherwise at least 60. |
 | `GITHUB_API` | `https://api.github.com` | For GitHub Enterprise Server: `https://<host>/api/v3`. |
 | `RELAY_HOST`, `RELAY_PORT`, `RELAY_PATH` | `127.0.0.1`, `3110`, `/hooks/github` | Where the relay listens. |

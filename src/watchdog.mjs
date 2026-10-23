@@ -91,7 +91,8 @@
 //    Paperclip monitor's notes), then stops, or its monitor gives up before the
 //    run finishes. A monitor that has fired, timed out or used up its attempts
 //    won't fire again, and a wake that hasn't started within the stall window may
-//    never start, so neither holds the report back. With
+//    never start, so neither holds the report back; nor does a monitor whose notes
+//    name the run, which is cleared in the same step as the report. With
 //    WATCHDOG_CI_RUNS on and a GitHub token, once that run has finished and the
 //    agent hasn't run on the issue since, the watchdog comments with the result,
 //    which wakes it. With WATCHDOG_CI_RERUN_JOBS set, a run whose failed jobs all
@@ -135,17 +136,40 @@
 //    acted on since, and an issue blocked for any other reason are never touched.
 //    6 leaves alone the issues a sweep under way is still to restore.
 //
+// 16. Claude usage limits (limits.mjs). When an account hits its 5-hour, weekly or
+//    spend limit, every Claude agent on it fails its next run and Paperclip keeps
+//    retrying them. With WATCHDOG_LIMIT_PAUSE on, a Claude agent's run that failed
+//    with the limit wording pauses every agent on the same account (the secret its
+//    ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN comes from, or the machine's own
+//    login), each once it has no run queued or going: pausing mid-run cancels the run. The board is told
+//    once (the log, and WATCHDOG_NOTIFY_ISSUE). At the reset the message gives
+//    (an hour later when it gives none), plus WATCHDOG_LIMIT_RESUME_GRACE_MIN, it
+//    resumes exactly the agents it paused, never one a person paused, and 15
+//    restores their issues. Codex agents' quota failures are left to Paperclip.
+//
+// 17. Wiped review stages (stages.mjs). An agent's update that sends an empty
+//    executionPolicy.stages removes the issue's reviews (a Paperclip bug), and the
+//    issue closes with its PR open and unreviewed. With WATCHDOG_STAGES_WIPE on, a
+//    done issue whose own PR is still open is set back to in_progress with a
+//    comment, and an issue in progress or in review whose activity shows its stages
+//    were removed is reported; the board is told either way. Stages aren't
+//    re-created. (The relay closes an issue on its PR's merge when no stage is
+//    left to approve: RELAY_DONE_WITHOUT_STAGES.)
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
 import { companyAgents, listIssues } from "./paperclip.mjs";
-import { agentMention, approvalWaitingOn, every, mapLimit, ts } from "./util.mjs";
+import { agentMention, approvalWaitingOn, asleep, every, mapLimit, ts } from "./util.mjs";
 import { holdFacts, releaseHold, releaseProblems, unprovable } from "./release.mjs";
 import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
 import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue, strandedCard } from "./questions.mjs";
 import { createGitHub } from "./github.mjs";
 import { ciMessage, failedJobs, monitorPending, onlyFlaky, runRefs, UNINFORMATIVE, waitingOn } from "./ci-runs.mjs";
 import { answeredCards, answerText, escalatedReview, quote, reviewStage } from "./board-held.mjs";
+import { createLimitCheck } from "./limits.mjs";
+import { createStagesCheck } from "./stages.mjs";
+import { findIdentifiers } from "./identifiers.mjs";
 import { concurrencyOf, holdingBlockers, pauseRecoveryAction, recoveryNotice, restoreStatus, statusChangedSince, sweepOrder } from "./resume.mjs";
 
 const WATCHED_STATUSES = "todo,in_progress,in_review";
@@ -161,6 +185,9 @@ const CONCURRENCY = 4;
 const PROVIDER_FAILURE = /^(provider_quota|[a-z]+_transient_upstream|transient_upstream)$/;
 const PROVIDER_FAILURE_HOLD_MS = 6 * 60 * 60_000;
 const PARKED_BUDGET_RESET_MS = 24 * 60 * 60_000;
+// A long-lived record is touched this often, so the state file (which forgets records
+// untouched for a week) keeps it.
+const RECORD_REFRESH_MS = 24 * 60 * 60_000;
 const latestRun = (runs) =>
   runs.reduce((a, r) => (!a || ts(r.finishedAt ?? r.createdAt) > ts(a.finishedAt ?? a.createdAt) ? r : a), null);
 // Plain text, no URL: Paperclip links every github.com pull-request URL in a
@@ -221,15 +248,15 @@ const ANSWER_WAIT_MS = 30 * 60_000;
 const RESUME_SWEEP_MS = 24 * 60 * 60_000;
 // Clock slack between the helper and Paperclip when comparing a comment's time with a pause.
 const CLOCK_SLACK_MS = 5_000;
-// Restored issues a sweep keeps to count runs still in flight (more than any limit).
-const MAX_CONCURRENT_RESTORES = 50;
+// Restored issues a resume sweep remembers, to count their runs still in flight (more than any limit).
+const MAX_REMEMBERED_RESTORES = 50;
 
 export function createWatchdog(ctx, state, deps = {}) {
   const { config, api, log } = ctx;
   const records = state.nudges;
   const stats = {
     ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, questions: 0,
-    ciReports: 0, ciReruns: 0, returned: 0, resumed: 0, lastError: null,
+    ciReports: 0, ciReruns: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, lastError: null,
   };
   const stallMs = config.watchdogStallSec * 1000;
   const liveWorkspaces = new Map(); // workspaceId → when it was last seen live
@@ -250,6 +277,7 @@ export function createWatchdog(ctx, state, deps = {}) {
   const sweepHeld = new Map(); // agentId → ids of its issues a resume sweep will restore on a later tick
   const hasGitHubToken = Boolean(config.githubToken || config.githubTokenFile);
   const github = deps.github ?? (hasGitHubToken ? createGitHub({ config, log }) : null);
+  const stagesCheck = createStagesCheck({ ctx, records, state, stats, dryRunSeen, github, identifiersOf: (pr) => findIdentifiers(pr, ctx.prefixes()) });
   const rerunPattern = (() => {
     if (!config.watchdogCiRerunJobs) return null;
     try {
@@ -259,6 +287,7 @@ export function createWatchdog(ctx, state, deps = {}) {
     }
   })();
   const now = () => ctx.now();
+  const limits = createLimitCheck({ api, config, log, records, state, now, stats, dryRunSeen });
 
   async function agentFor(id, agents) {
     if (!agents.has(id)) agents.set(id, await api.request("GET", `/api/agents/${id}`));
@@ -571,8 +600,6 @@ export function createWatchdog(ctx, state, deps = {}) {
     });
   }
 
-  // Paperclip doesn't wake these (agent-eligibility.ts), so a nudge can't help.
-  const asleep = (agent) => ["paused", "terminated", "pending_approval"].includes(agent?.status);
 
   // ---------------------------------------------------------------- 1. hand-offs
 
@@ -720,8 +747,10 @@ export function createWatchdog(ctx, state, deps = {}) {
   // ---------------------------------------------------------------- nudges
 
   // Posts the comment unless this situation already had its nudges, or had one
-  // within the stall window.
-  async function nudge(issue, key, agent, message, logExtra) {
+  // within the stall window. With `patch`, the comment travels in a PATCH of the
+  // issue with those fields, so both happen in one step, and `patchNote` is added
+  // to it; if Paperclip refuses the fields, the comment goes alone, without the note.
+  async function nudge(issue, key, agent, message, logExtra, { patch = null, patchNote = "" } = {}) {
     const prior = records.get(key);
     const count = prior?.count ?? 0;
     if (count >= config.watchdogMaxNudges || (prior && now() - prior.at < stallMs)) return false;
@@ -735,9 +764,19 @@ export function createWatchdog(ctx, state, deps = {}) {
     }
     records.set(key, { count: count + 1, at: now() });
     state.touch();
-    const body = `${agentMention(agent)} ${message}\n\n_Paperclip Helper watchdog, nudge ${count + 1}/${config.watchdogMaxNudges}._`;
+    const bodyOf = (text) => `${agentMention(agent)} ${text}\n\n_Paperclip Helper watchdog, nudge ${count + 1}/${config.watchdogMaxNudges}._`;
+    let patched = null;
     try {
-      await api.request("POST", `/api/issues/${issue.id}/comments`, { body });
+      if (patch) {
+        patched = true;
+        await api.request("PATCH", `/api/issues/${issue.id}`, { ...patch, comment: bodyOf(`${message}${patchNote}`) }).catch((err) => {
+          if (pausedRefusal(err)) throw err;
+          // The comment matters more than the rest: send it on its own.
+          patched = false;
+          log.warn("watchdog: Paperclip refused the change sent with a nudge; sending the comment alone", { issue: who, error: err.message });
+          return api.request("POST", `/api/issues/${issue.id}/comments`, { body: bodyOf(message) });
+        });
+      } else await api.request("POST", `/api/issues/${issue.id}/comments`, { body: bodyOf(message) });
     } catch (err) {
       if (!pausedRefusal(err)) throw err;
       // Try again a stall window later, without using up a nudge.
@@ -746,7 +785,7 @@ export function createWatchdog(ctx, state, deps = {}) {
       return false;
     }
     stats.nudges += 1;
-    log("watchdog: nudged", { issue: who, agent: agent.name, nudge: count + 1, ...logExtra });
+    log("watchdog: nudged", { issue: who, agent: agent.name, nudge: count + 1, ...logExtra, ...(patch ? { patched } : {}) });
     return true;
   }
 
@@ -1379,7 +1418,14 @@ export function createWatchdog(ctx, state, deps = {}) {
     full ??= await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
     if (!full || full.assigneeAgentId !== assignee) return;
     const monitor = full.executionState?.monitor;
-    if (monitorPending(monitor, now())) return silent("the agent's Paperclip monitor will still fire", { nextCheckAt: monitor.nextCheckAt });
+    const monitorDue = monitorPending(monitor, now());
+    // A monitor still due that watches this very run would only wake the agent again
+    // to find it finished: report now, and clear the monitor in the same step. One
+    // that watches something else is left to fire. (Paperclip redacts a monitor's
+    // externalRef, so only its notes can name the run.)
+    if (monitorDue && !watchesOnly(monitor, run)) return silent("the agent's Paperclip monitor will still fire", { nextCheckAt: monitor.nextCheckAt });
+    // A monitor Paperclip shows without the policy that holds it can't be cleared: leave it to fire.
+    if (monitorDue && !full.executionPolicy?.monitor) return silent("the agent's monitor can't be cleared");
     // A wake still waiting gets the stall window to start a run. One older than
     // that may never be delivered (a monitor's own wake can sit deferred for
     // hours), and the comment's wake joins any that is: report anyway.
@@ -1388,13 +1434,41 @@ export function createWatchdog(ctx, state, deps = {}) {
     // Pushed since: that push's own run is what counts now.
     if (!dispatchedOnDefault && (await headMoved(found.repo, run)) === true) return silent("its branch or pull request has moved on");
     const reruns = records.get(record.ciRerun(found.repo, run))?.count ?? 0;
-    const posted = await nudge(full, key, agent, ciMessage({ run, jobs: found.jobs, reruns }), {
-      reason: "CI run finished",
-      repo: found.repo,
-      run: run.id,
-      conclusion: run.conclusion,
-    });
+    // The policy is replaced whole: read it again now, so nothing changed meanwhile is overwritten.
+    let clearMonitor;
+    if (monitorDue) {
+      const fresh = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+      const freshMonitor = fresh?.executionState?.monitor;
+      if (!fresh || (monitorPending(freshMonitor, now()) && (!watchesOnly(freshMonitor, run) || !fresh.executionPolicy?.monitor))) {
+        return silent("the agent's monitor changed while the report was prepared");
+      }
+      if (monitorPending(freshMonitor, now())) clearMonitor = withoutMonitor(fresh.executionPolicy);
+    }
+    const posted = await nudge(
+      full,
+      key,
+      agent,
+      ciMessage({ run, jobs: found.jobs, reruns }),
+      { reason: "CI run finished", repo: found.repo, run: run.id, conclusion: run.conclusion },
+      clearMonitor !== undefined
+        ? { patch: { executionPolicy: clearMonitor }, patchNote: "\n\nYour Paperclip monitor for this run was cleared: it would only have woken you to find the run finished." }
+        : {},
+    );
     if (posted) stats.ciReports += 1;
+  }
+
+  // The issue's execution policy without its monitor (Paperclip replaces the policy
+  // whole and clears the monitor when it's gone); undefined when there's no policy.
+  function withoutMonitor(policy) {
+    if (!policy?.monitor) return undefined;
+    const { monitor, ...rest } = policy;
+    return rest;
+  }
+
+  // Does the monitor watch this run and nothing else? Every run its notes name is it.
+  function watchesOnly(monitor, run) {
+    const refs = runRefs(monitor?.notes);
+    return refs.length > 0 && refs.every((r) => String(r.id) === String(run.id));
   }
 
   // ---------------------------------------------------------------- 12, 13. issues waiting on your review
@@ -1602,7 +1676,7 @@ export function createWatchdog(ctx, state, deps = {}) {
           records.delete(key);
           records.set(record.agentPaused(agentId), { count: 1, at: now(), since: r.since, companyId });
           state.touch();
-        } else if (now() - (r.at ?? 0) > PARKED_BUDGET_RESET_MS) {
+        } else if (now() - (r.at ?? 0) > RECORD_REFRESH_MS) {
           records.set(key, { ...r, at: now() }); // the state file forgets records untouched for a week
           state.touch();
         }
@@ -1704,7 +1778,7 @@ export function createWatchdog(ctx, state, deps = {}) {
       log.debug("watchdog: resume sweep finished", { agent: agent.name, restored: (entry.count ?? 0) + restoredNow.length });
     } else {
       // Only the restored issues whose runs may still be going are worth keeping.
-      const restored = [...earlier, ...restoredNow].slice(-MAX_CONCURRENT_RESTORES);
+      const restored = [...earlier, ...restoredNow].slice(-MAX_REMEMBERED_RESTORES);
       records.set(key, { ...entry, count: (entry.count ?? 0) + restoredNow.length, restored, at: now() });
     }
     state.touch();
@@ -1800,6 +1874,8 @@ export function createWatchdog(ctx, state, deps = {}) {
         });
         const agents = new Map(list.map((a) => [a.id, a]));
         // Without the agents' statuses a pause or resume can't be told: wait for the next tick.
+        // Pauses for a usage limit first, then resumes, which the resume sweep then sees.
+        if (config.watchdogLimitPause && listed) await limits.check(companyId, agents);
         if (config.watchdogResumeSweep && listed) await checkResumes(companyId, agents, started);
         if (config.watchdogClearDeadLinks) {
           await checkDeadLinks(companyId, agents);
@@ -1810,6 +1886,7 @@ export function createWatchdog(ctx, state, deps = {}) {
         if (config.watchdogRouteQuestions) await checkQuestions(companyId, agents);
         await checkWaitingOnYou(companyId, agents);
         if (config.watchdogCiRuns) await checkCiRuns(companyId, agents);
+        if (config.watchdogStagesWipe) await stagesCheck.check(companyId, agents);
       }
       stats.lastError = null;
     } catch (err) {
@@ -1843,6 +1920,8 @@ export function createWatchdog(ctx, state, deps = {}) {
         deliverAnswers: config.watchdogDeliverAnswers,
         returnEscalatedReviews: config.watchdogReturnEscalatedReviews,
         cancelledBlockers: config.watchdogCancelledBlockers,
+        limitPause: config.watchdogLimitPause ? { graceMin: config.watchdogLimitResumeGraceMin, notifyIssue: config.watchdogNotifyIssue || null } : false,
+        stagesWipe: config.watchdogStagesWipe ? (github ? true : "on, without the open-PR part: no GitHub token") : false,
         resumeSweep: config.watchdogResumeSweep ? config.watchdogResumeSweepLimit || "the agent's maxConcurrentRuns" : false,
       });
       loop = every("watchdog", config.watchdogIntervalSec, 5_000, tick, log);

@@ -82,6 +82,15 @@ export async function mapLimit(items, limit, fn) {
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Agent statuses Paperclip never invokes (agent-eligibility.ts): waking such an agent does nothing.
+export const asleep = (agent) => ["paused", "terminated", "pending_approval"].includes(agent?.status);
+
+// "1 issue", "3 issues".
+export const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+// An agent's reasoning effort, whichever key its adapter uses.
+export const effortOf = (cfg) => cfg?.effort ?? cfg?.modelReasoningEffort ?? cfg?.reasoningEffort ?? "";
+
 export function agentMention(agent) {
   return `[@${agent.name}](agent://${agent.id})`;
 }

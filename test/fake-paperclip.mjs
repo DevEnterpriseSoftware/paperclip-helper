@@ -44,6 +44,7 @@ export function emptyDb() {
     budgets: { policies: [] },
     interactions: {}, // issueId → [{ id, kind, status, addresseeAgentId, addresseeUserId, createdByAgentId, payload, createdAt }]
     created: [], // issues created through POST /api/companies/:id/issues
+    documents: {}, // issueId → { key → { body, latestRevisionId, … } }
     // Off by default: with it on, a board update or comment wakes the issue's assignee
     // as Paperclip does (a queued run in issueRuns), for tests that check the wake.
     simulateWakes: false,
@@ -211,7 +212,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     if ((m = p.match(/^\/api\/companies\/([^/]+)\/heartbeat-runs$/))) {
       const limit = Math.min(Number(q.get("limit") ?? 1000), 1000);
       const list = db.heartbeatRuns
-        .filter((r) => r.companyId === m[1])
+        .filter((r) => r.companyId === m[1] && (!q.get("agentId") || r.agentId === q.get("agentId")))
         .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
         .slice(0, limit);
       return send(200, list);
@@ -227,8 +228,25 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       return send(201, event);
     }
     if ((m = p.match(/^\/api\/companies\/([^/]+)\/activity$/))) {
+      // Newest first, like Paperclip's activity list, filtered by entityType and entityId.
       const type = q.get("entityType");
-      return send(200, db.activity.filter((a) => !type || a.entityType === type));
+      const entity = q.get("entityId");
+      return send(200, db.activity.filter((a) => (!type || a.entityType === type) && (!entity || a.entityId === entity)).slice().reverse());
+    }
+    if ((m = p.match(/^\/api\/companies\/([^/]+)\/costs\/by-agent$/)) && req.method === "GET") {
+      // Like Paperclip's costs.byAgent: cost events in [from, to], summed per agent.
+      const from = Date.parse(q.get("from") ?? "") || 0;
+      const to = Date.parse(q.get("to") ?? "") || Infinity;
+      const rows = new Map();
+      for (const e of db.costEvents) {
+        const at = Date.parse(e.occurredAt ?? "");
+        if (e.companyId !== m[1] || !(at >= from && at <= to)) continue;
+        const row = rows.get(e.agentId) ?? { agentId: e.agentId, costCents: 0, eventCount: 0 };
+        row.costCents += e.costCents ?? 0;
+        row.eventCount += 1;
+        rows.set(e.agentId, row);
+      }
+      return send(200, [...rows.values()]);
     }
     if ((m = p.match(/^\/api\/companies\/([^/]+)\/budgets\/overview$/))) {
       return send(200, { companyId: m[1], ...db.budgets });
@@ -244,6 +262,25 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     }
 
     // ---- agents
+    // Like Paperclip's POST /api/agents/:id/pause and /resume (routes/agents.ts): a board
+    // pause records pausedAt and pauseReason "manual" and cancels the agent's active runs.
+    if ((m = p.match(/^\/api\/agents\/([^/]+)\/(pause|resume)$/)) && req.method === "POST") {
+      const ACTIVE = ["queued", "running", "scheduled_retry"]; // heartbeat/recovery.ts cancels scheduled retries too
+      const agent = db.agents.find((a) => a.id === m[1]);
+      if (!agent) return send(404, { error: "Agent not found" });
+      db.lifecycle = [...(db.lifecycle ?? []), { agentId: agent.id, action: m[2] }];
+      if (m[2] === "pause") {
+        // db.now: a test's own clock, when it runs on one.
+        if (agent.status !== "paused") Object.assign(agent, { status: "paused", pausedAt: new Date(db.now?.() ?? Date.now()).toISOString(), pauseReason: "manual" });
+        for (const runs of Object.values(db.issueRuns)) {
+          for (const r of runs) if (r.agentId === agent.id && ACTIVE.includes(r.status)) Object.assign(r, { status: "cancelled", errorCode: "agent_paused" });
+        }
+        for (const r of db.heartbeatRuns) if (r.agentId === agent.id && ACTIVE.includes(r.status)) Object.assign(r, { status: "cancelled", errorCode: "agent_paused" });
+      } else {
+        Object.assign(agent, { status: "idle", pausedAt: null, pauseReason: null });
+      }
+      return send(200, agent);
+    }
     if ((m = p.match(/^\/api\/agents\/([^/]+)$/))) {
       const agent = db.agents.find((a) => a.id === m[1]);
       if (!agent) return send(404, { error: "Agent not found" });
@@ -279,8 +316,22 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           const next = issue.nextStages.shift();
           issue.executionState = { status: "pending", currentStageType: next.type, currentParticipant: next.participant };
           issue.status = "in_review";
-        } else if (body.status) issue.status = body.status;
+        } else if (body.status) {
+          // Like Paperclip's policy transition: leaving done or cancelled clears the execution state.
+          if (["done", "cancelled"].includes(issue.status) && !["done", "cancelled"].includes(body.status)) issue.executionState = null;
+          issue.status = body.status;
+        }
         if (body.blockedByIssueIds) issue.blockedBy = body.blockedByIssueIds.map((id) => ({ id }));
+        if ("executionPolicy" in body) {
+          // Like Paperclip's applyMonitorTransition: a policy sent without its monitor clears it ("manual").
+          const had = issue.executionPolicy?.monitor;
+          // normalizeIssueExecutionPolicy: no stages and no monitor left is no policy.
+          const policy = body.executionPolicy;
+          issue.executionPolicy = policy && (policy.stages?.length || policy.monitor) ? policy : null;
+          if (had && !body.executionPolicy?.monitor && issue.executionState?.monitor) {
+            issue.executionState = { ...issue.executionState, monitor: { ...issue.executionState.monitor, status: "cleared", clearReason: "manual", nextCheckAt: null } };
+          }
+        }
         // Like Paperclip's issue update: with isolated workspaces off, the
         // workspace fields are dropped without an error.
         if (db.experimental?.enableIsolatedWorkspaces !== false) {
@@ -304,6 +355,45 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         return send(201, { id: comment.id, body: body.body });
       }
       if (rest === "/runs") return send(200, db.issueRuns[issue.id] ?? []);
+      if ((m = rest.match(/^\/documents\/([^/]+)$/))) {
+        // Like Paperclip's issue documents: an update must name the latest revision (409 otherwise).
+        const docs = (db.documents[issue.id] ??= {});
+        const doc = docs[m[1]];
+        if (req.method === "GET") return doc ? send(200, doc) : send(404, { error: "Document not found" });
+        if (req.method === "PUT") {
+          if (doc?.lockedAt) return send(409, { error: "Document is locked" });
+          if (doc && body.baseRevisionId !== doc.latestRevisionId) return send(409, { error: "Document was updated by someone else" });
+          const next = { key: m[1], title: body.title ?? null, format: body.format, body: body.body, latestRevisionId: uuid(), latestRevisionNumber: (doc?.latestRevisionNumber ?? 0) + 1 };
+          docs[m[1]] = next;
+          return send(doc ? 200 : 201, next);
+        }
+      }
+      // Like Paperclip's activity.forIssue: the issue's whole log, newest first.
+      if (rest === "/activity") return send(200, db.activity.filter((a) => a.entityType === "issue" && a.entityId === issue.id).slice().reverse());
+      if ((m = rest.match(/^\/interactions\/([^/]+)\/respond$/)) && req.method === "POST") {
+        // Like Paperclip: a pending ask_user_questions card takes answers [{ questionId, optionIds, otherText }].
+        const card = (db.interactions[issue.id] ?? []).find((c) => c.id === m[1]);
+        if (!card) return send(404, { error: "Interaction not found" });
+        if (card.status !== "pending") return send(409, { error: "Interaction is not pending" });
+        if (!Array.isArray(body?.answers)) return send(400, { error: "answers: expected array" });
+        const questions = card.payload?.questions ?? [];
+        for (const a of body.answers) {
+          const q = questions.find((x) => x.id === a.questionId);
+          if (!q) return send(422, { error: `Unknown question ${a.questionId}` });
+          const ids = new Set((q.options ?? []).map((o) => o.id));
+          if ((a.optionIds ?? []).some((id) => !ids.has(id))) return send(422, { error: `Unknown option for question ${q.id}` });
+          if (q.selectionMode !== "multi" && (a.optionIds ?? []).length > 1) return send(422, { error: `Question ${q.id} takes one option` });
+        }
+        for (const q of questions) {
+          const a = body.answers.find((x) => x.questionId === q.id);
+          // A text question (its only option the free-text one) is answered by otherText alone, as Paperclip reads it.
+          const textOnly = (q.options ?? []).length > 0 && (q.options ?? []).every((o) => o.freeText);
+          const answered = textOnly ? Boolean(a?.otherText) : Boolean(a?.optionIds?.length || a?.otherText);
+          if (q.required === true && !answered) return send(422, { error: `Question ${q.id} requires an answer` });
+        }
+        Object.assign(card, { status: "answered", result: { version: 1, answers: body.answers }, resolvedAt: new Date().toISOString(), resolvedByUserId: who.userId });
+        return send(200, card);
+      }
       if (rest === "/interactions" && req.method === "GET") {
         if (db.noInteractions) return send(404, { error: "Not found" });
         return send(200, db.interactions[issue.id] ?? []);
