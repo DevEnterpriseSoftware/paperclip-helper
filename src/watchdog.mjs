@@ -118,6 +118,23 @@
 //    agent, quoting why the blocker was cancelled, so it can remove or replace
 //    the blocker itself. Once per blocker.
 //
+// 15. Issues blocked by recovery while their agent was paused (resume.mjs). Pausing
+//    an agent with runs queued or in flight makes Paperclip's recovery give up on
+//    each affected issue: it is set to blocked with a system comment whose
+//    "Recovery" section says the board must decide ("the original assignee is not
+//    invokable"). Resuming the agent restarts none of them. With
+//    WATCHDOG_RESUME_SWEEP on, the watchdog remembers each agent's status every
+//    tick; when one goes from paused to available, it restores that agent's issues
+//    whose newest comment is that recovery notice, posted while the agent was
+//    paused, with no unresolved blocker and no status change since. Each goes back
+//    to in_review if a review stage is pending, else to the status Paperclip
+//    recorded before the block (todo if it didn't), with one comment, which wakes
+//    the assignee. At most WATCHDOG_RESUME_SWEEP_LIMIT runs in flight per agent
+//    from the sweep (default: the agent's maxConcurrentRuns); the rest follow on
+//    later ticks. A block from while the agent was running, an issue a person has
+//    acted on since, and an issue blocked for any other reason are never touched.
+//    6 leaves alone the issues a sweep under way is still to restore.
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
@@ -129,6 +146,7 @@ import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue
 import { createGitHub } from "./github.mjs";
 import { ciMessage, failedJobs, monitorPending, onlyFlaky, runRefs, UNINFORMATIVE, waitingOn } from "./ci-runs.mjs";
 import { answeredCards, answerText, escalatedReview, quote, reviewStage } from "./board-held.mjs";
+import { concurrencyOf, holdingBlockers, pauseRecoveryAction, recoveryNotice, restoreStatus, statusChangedSince, sweepOrder } from "./resume.mjs";
 
 const WATCHED_STATUSES = "todo,in_progress,in_review";
 const OPEN_STATUSES = "backlog,todo,in_progress,in_review,blocked";
@@ -184,6 +202,9 @@ const record = {
   escalated: (issue) => `escalated:${issue.id}`, // returns of reviews Paperclip escalated to you, per issue
   escalatedSeen: (issue, decisionId) => `escalated-seen:${issue.id}:${decisionId ?? "?"}`, // one return per escalation, or its report
   cancelledBlocker: (issue, ids) => `cancelled-blocker:${issue.id}:${ids.join(",")}`, // nudges about cancelled blockers
+  agentPaused: (agentId) => `agent-paused:${agentId}`, // an agent seen paused: { since, companyId }
+  agentResumed: (agentId) => `agent-resumed:${agentId}`, // its resume, while its issues are restored: { since, resumedAt, companyId }
+  resumeRestore: (issue, commentId) => `resume-restore:${issue.id}:${commentId ?? "?"}`, // the one restore of an issue after a pause's recovery block
 };
 
 // Issues the CI-run check reads: an agent that waits on CI leaves its issue in
@@ -196,13 +217,19 @@ const BOARD_STATUSES = "in_review";
 // How long after you answer an agent's card the watchdog waits before returning
 // the issue: time for you to approve it, or send it back yourself.
 const ANSWER_WAIT_MS = 30 * 60_000;
+// 15. A resumed agent's issues are looked for for at most this long after the resume.
+const RESUME_SWEEP_MS = 24 * 60 * 60_000;
+// Clock slack between the helper and Paperclip when comparing a comment's time with a pause.
+const CLOCK_SLACK_MS = 5_000;
+// Restored issues a sweep keeps to count runs still in flight (more than any limit).
+const MAX_CONCURRENT_RESTORES = 50;
 
 export function createWatchdog(ctx, state, deps = {}) {
   const { config, api, log } = ctx;
   const records = state.nudges;
   const stats = {
     ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, questions: 0,
-    ciReports: 0, ciReruns: 0, returned: 0, lastError: null,
+    ciReports: 0, ciReruns: 0, returned: 0, resumed: 0, lastError: null,
   };
   const stallMs = config.watchdogStallSec * 1000;
   const liveWorkspaces = new Map(); // workspaceId → when it was last seen live
@@ -218,6 +245,9 @@ export function createWatchdog(ctx, state, deps = {}) {
   const ciRepoWarned = new Set(); // repos whose default branch GitHub didn't give, warned once until it does
   const ciSilenced = new Map(); // CI record key → { companyId, reasons }: why a finished run isn't reported, as logged
   const ciRefused = new Set(); // repos whose runs the GitHub token may not read, warned once until it can
+  const seenStatus = new Map(); // agentId → its status at this process's previous tick
+  let previousTickAt = null; // when this process's previous tick started
+  const sweepHeld = new Map(); // agentId → ids of its issues a resume sweep will restore on a later tick
   const hasGitHubToken = Boolean(config.githubToken || config.githubTokenFile);
   const github = deps.github ?? (hasGitHubToken ? createGitHub({ config, log }) : null);
   const rerunPattern = (() => {
@@ -746,7 +776,8 @@ export function createWatchdog(ctx, state, deps = {}) {
 
   async function checkBlocked(companyId, agents) {
     const issues = (await listIssues(api, companyId, "blocked")).filter(
-      (issue) => issue.assigneeAgentId && !issue.executionRunId && !issue.checkoutRunId,
+      // An agent just resumed: its issues blocked during the pause are 15's to restore.
+      (issue) => issue.assigneeAgentId && !issue.executionRunId && !issue.checkoutRunId && !resumeSweepHolds(issue),
     );
     await mapLimit(issues, CONCURRENCY, async (issue) => {
       try {
@@ -1527,13 +1558,249 @@ export function createWatchdog(ctx, state, deps = {}) {
     }
   }
 
+  // ---------------------------------------------------------------- 15. issues blocked during a pause
+
+  // An agent missing from the company's list: gone for good only when Paperclip says
+  // so (404, or terminated, which the list leaves out). Unknown otherwise.
+  async function agentGone(agentId) {
+    try {
+      const agent = await api.request("GET", `/api/agents/${agentId}`);
+      return agent?.status === "terminated" ? true : agent ?? null;
+    } catch (err) {
+      return err.status === 404 ? true : null;
+    }
+  }
+
+  // Records each agent's pause and resume, and returns the agents of this company
+  // resumed since (this tick or before, while their issues are still being restored).
+  // Kept in the state file, so a resume while the helper was down is still seen.
+  async function trackPauses(companyId, agents, tickAt) {
+    const resumed = [];
+    for (const [key, r] of records.entries()) {
+      if (r?.companyId !== companyId) continue;
+      const paused = key.startsWith("agent-paused:");
+      if (!paused && !key.startsWith("agent-resumed:")) continue;
+      const agentId = key.slice(key.indexOf(":") + 1);
+      let agent = agents.get(agentId);
+      if (!agent) {
+        const gone = await agentGone(agentId);
+        if (gone === true) {
+          records.delete(key); // terminated or deleted: nothing to restore
+          state.touch();
+        }
+        if (!gone || gone === true) continue; // can't tell: look again next tick
+        agent = gone;
+      }
+      if (agent.status === "terminated") {
+        records.delete(key);
+        state.touch();
+        continue;
+      }
+      if (agent.status === "paused") {
+        if (!paused) {
+          // Paused again before its issues were all restored: the next resume covers both pauses.
+          records.delete(key);
+          records.set(record.agentPaused(agentId), { count: 1, at: now(), since: r.since, companyId });
+          state.touch();
+        } else if (now() - (r.at ?? 0) > PARKED_BUDGET_RESET_MS) {
+          records.set(key, { ...r, at: now() }); // the state file forgets records untouched for a week
+          state.touch();
+        }
+        continue;
+      }
+      if (paused) {
+        if (asleep(agent)) continue; // awaiting approval: not invokable yet
+        records.delete(key);
+        const entry = { count: 0, at: now(), since: r.since, resumedAt: tickAt, companyId, restored: [] };
+        records.set(record.agentResumed(agentId), entry);
+        state.touch();
+        log("watchdog: an agent was resumed; looking for its issues Paperclip's recovery blocked during the pause", {
+          agent: agent.name,
+          pausedSince: new Date(r.since).toISOString(),
+        });
+        resumed.push({ agent, entry });
+        continue;
+      }
+      if (asleep(agent)) continue; // awaiting approval: its issues wait
+      if (now() - (r.resumedAt ?? 0) > RESUME_SWEEP_MS) {
+        records.delete(key);
+        sweepHeld.delete(agentId);
+        state.touch();
+        continue;
+      }
+      resumed.push({ agent, entry: r });
+    }
+    // Agents seen paused for the first time. Paperclip's pausedAt says when; without
+    // it, no earlier than this process's previous tick that saw the agent unpaused,
+    // or now on the first tick (a block from before then isn't attributed to the pause).
+    for (const agent of agents.values()) {
+      if (agent.status !== "paused") continue;
+      if (records.has(record.agentPaused(agent.id)) || records.has(record.agentResumed(agent.id))) continue;
+      const known = seenStatus.has(agent.id) && seenStatus.get(agent.id) !== "paused" && previousTickAt != null;
+      const since = ts(agent.pausedAt) || (known ? previousTickAt : tickAt);
+      records.set(record.agentPaused(agent.id), { count: 1, at: now(), since, companyId });
+      state.touch();
+    }
+    for (const agent of agents.values()) seenStatus.set(agent.id, agent.status);
+    return resumed;
+  }
+
+  // Is this issue waiting for a sweep under way (to be restored on a later tick, or
+  // postponed)? Then 6 leaves it to the sweep. Issues the sweep turned down aren't held.
+  const resumeSweepHolds = (issue) => config.watchdogResumeSweep && Boolean(sweepHeld.get(issue.assigneeAgentId)?.has(issue.id));
+
+  async function checkResumes(companyId, agents, tickAt) {
+    const resumed = await trackPauses(companyId, agents, tickAt);
+    if (!resumed.length) return;
+    const blocked = (await listIssues(api, companyId, "blocked")).sort(sweepOrder);
+    for (const { agent, entry } of resumed) {
+      try {
+        await sweepAgent(agent, entry, blocked.filter((i) => i.assigneeAgentId === agent.id));
+      } catch (err) {
+        log.warn("watchdog: resume sweep failed", { agent: agent.name, error: err.message });
+      }
+    }
+  }
+
+  // Each tick: every one of the agent's blocked issues is looked at, and up to the
+  // limit restored, less those this sweep restored earlier that still have a run
+  // queued or going, so a resume never puts more than the limit of runs in flight.
+  // The sweep ends at the first tick with nothing left to restore and nothing postponed.
+  async function sweepAgent(agent, entry, issues) {
+    const limit = config.watchdogResumeSweepLimit || concurrencyOf(agent);
+    const earlier = Array.isArray(entry.restored) ? entry.restored : [];
+    let inFlight = 0;
+    for (const id of earlier) {
+      const runs = await api.request("GET", `/api/issues/${id}/runs`).catch(() => null);
+      // Unknown counts as in flight: prefer waiting a tick to queueing too many.
+      if (!Array.isArray(runs) || runs.some((r) => r.agentId === agent.id && ACTIVE_RUN.has(r.status))) inFlight += 1;
+    }
+    let budget = Math.max(0, limit - inFlight);
+    const held = new Set();
+    const restoredNow = [];
+    for (const issue of issues) {
+      const verdict = await pauseBlocked(issue, agent, entry);
+      if (verdict === "postponed") {
+        held.add(issue.id);
+        continue;
+      }
+      if (!verdict) continue;
+      if (budget <= 0) {
+        held.add(issue.id); // a later tick
+        continue;
+      }
+      const result = await restoreIssue(issue, agent, verdict);
+      if (result === "restored") {
+        budget -= 1;
+        restoredNow.push(issue.id);
+      } else if (result === "postponed") held.add(issue.id);
+    }
+    const key = record.agentResumed(agent.id);
+    if (held.size) sweepHeld.set(agent.id, held);
+    else sweepHeld.delete(agent.id);
+    // In a dry run nothing changed, so nothing is used up: the sweep stays for the real run (until it expires).
+    if (!held.size && !config.dryRun) {
+      records.delete(key);
+      log.debug("watchdog: resume sweep finished", { agent: agent.name, restored: (entry.count ?? 0) + restoredNow.length });
+    } else {
+      // Only the restored issues whose runs may still be going are worth keeping.
+      const restored = [...earlier, ...restoredNow].slice(-MAX_CONCURRENT_RESTORES);
+      records.set(key, { ...entry, count: (entry.count ?? 0) + restoredNow.length, restored, at: now() });
+    }
+    state.touch();
+  }
+
+  // Is this an issue Paperclip's recovery blocked because the agent was paused, and
+  // that nobody has touched since? { latest, action, target } if so, "postponed"
+  // when Paperclip couldn't say right now, else false.
+  async function pauseBlocked(row, agent, entry) {
+    if (row.status !== "blocked" || row.assigneeAgentId !== agent.id || row.executionRunId || row.checkoutRunId) return false;
+    const full = await api.request("GET", `/api/issues/${row.id}`).catch(() => null);
+    if (!full) return "postponed";
+    if (full.status !== "blocked" || full.assigneeAgentId !== agent.id) return false;
+    // Blocked by another issue: that is why it is blocked, not the pause.
+    if (holdingBlockers(full).length) return false;
+    // The newest comment must be the recovery notice: anything after it (a person,
+    // the agent, the watchdog) means someone has acted on the issue since.
+    const comments = await api.request("GET", `/api/issues/${row.id}/comments?order=desc&limit=1`).catch(() => null);
+    if (!Array.isArray(comments)) return "postponed";
+    const latest = comments[0];
+    const notice = recoveryNotice(latest);
+    if (!notice) return false;
+    const key = record.resumeRestore(full, latest.id);
+    if (records.has(key) || dryRunSeen.has(key)) return false;
+    // Posted while the agent was paused; one from before the pause was a real failure.
+    const at = ts(latest.createdAt);
+    if (!at || at < entry.since - CLOCK_SLACK_MS || at > entry.resumedAt + CLOCK_SLACK_MS) return false;
+    if (statusChangedSince(full, at)) return false;
+    let actions = null;
+    try {
+      actions = await api.request("GET", `/api/issues/${row.id}/recovery-actions`);
+    } catch (err) {
+      if (err.status !== 404) return "postponed"; // not knowing the action's cause, wait rather than guess
+    }
+    const list = [...(actions?.active ? [actions.active] : []), ...(Array.isArray(actions?.actions) ? actions.actions : [])];
+    const action = (notice.actionId ? list.find((a) => a?.id === notice.actionId) : actions?.active) ?? null;
+    const kind = pauseRecoveryAction(action);
+    // An action of another cause (a lost process, a failed workspace) isn't the pause.
+    if (kind === false) return false;
+    // Without the action, other recovery families post the same Recovery section:
+    // only the "not invokable" notice, or a run the pause cancelled, is the pause's.
+    if (kind === null && !notice.notInvokable) return false;
+    const runs = await api.request("GET", `/api/issues/${row.id}/runs`).catch(() => null);
+    if (!Array.isArray(runs)) return "postponed";
+    if (runs.some((r) => ACTIVE_RUN.has(r.status))) return false;
+    return { latest, target: restoreStatus(full, action) };
+  }
+
+  // "restored" (or, in a dry run, would have been), "postponed" (try again next
+  // tick), or false (refused: left to you).
+  async function restoreIssue(row, agent, { latest, target }) {
+    const who = row.identifier ?? row.id;
+    const key = record.resumeRestore(row, latest.id);
+    const extra = { issue: who, agent: agent.name, status: target.status, from: target.from };
+    if (config.dryRun) {
+      dryRunSeen.add(key);
+      log("watchdog: would restore an issue blocked while its agent was paused (dry run)", extra);
+      return "restored";
+    }
+    const comment =
+      `${agentMention(agent)} was resumed: retrying the original owner (the recovery block came from the pause).` +
+      `\n\n_Paperclip Helper watchdog._`;
+    try {
+      // Status and comment in one request: a board user's comment wakes the assignee,
+      // and so does the move out of blocked.
+      await api.request("PATCH", `/api/issues/${row.id}`, { status: target.status, comment });
+    } catch (err) {
+      if (pausedRefusal(err)) {
+        log.debug("watchdog: the issue is paused; restore postponed", { issue: who });
+        return "postponed";
+      }
+      records.set(key, { count: 1, at: now(), failed: true });
+      state.touch();
+      log.warn("watchdog: Paperclip refused to restore an issue blocked while its agent was paused; left to you", { ...extra, error: err.message });
+      return false;
+    }
+    records.set(key, { count: 1, at: now() });
+    state.touch();
+    stats.resumed += 1;
+    log("watchdog: restored an issue Paperclip's recovery blocked while its agent was paused", extra);
+    return "restored";
+  }
+
   async function tick() {
     const started = now();
     const { companyIds = [] } = await ctx.identity();
     try {
       for (const companyId of companyIds) {
-        const list = await companyAgents(api, companyId).catch(() => []);
+        let listed = true;
+        const list = await companyAgents(api, companyId).catch(() => {
+          listed = false;
+          return [];
+        });
         const agents = new Map(list.map((a) => [a.id, a]));
+        // Without the agents' statuses a pause or resume can't be told: wait for the next tick.
+        if (config.watchdogResumeSweep && listed) await checkResumes(companyId, agents, started);
         if (config.watchdogClearDeadLinks) {
           await checkDeadLinks(companyId, agents);
           await checkScheduledWorkspaces(companyId, agents);
@@ -1549,6 +1816,7 @@ export function createWatchdog(ctx, state, deps = {}) {
       stats.lastError = err.message;
       throw err;
     } finally {
+      previousTickAt = started;
       stats.ticks += 1;
       stats.lastTickAt = new Date(started).toISOString();
       stats.lastTickMs = now() - started;
@@ -1575,6 +1843,7 @@ export function createWatchdog(ctx, state, deps = {}) {
         deliverAnswers: config.watchdogDeliverAnswers,
         returnEscalatedReviews: config.watchdogReturnEscalatedReviews,
         cancelledBlockers: config.watchdogCancelledBlockers,
+        resumeSweep: config.watchdogResumeSweep ? config.watchdogResumeSweepLimit || "the agent's maxConcurrentRuns" : false,
       });
       loop = every("watchdog", config.watchdogIntervalSec, 5_000, tick, log);
     },

@@ -198,7 +198,7 @@ function Install-PaperclipHelper {
     'WATCHDOG', 'WATCHDOG_INTERVAL_SEC', 'WATCHDOG_STALL_SEC', 'WATCHDOG_MAX_NUDGES', 'WATCHDOG_HEAL_FAILED_FINALIZE',
     'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'WATCHDOG_CLEAR_DEAD_LINKS', 'WATCHDOG_ROUTE_QUESTIONS',
     'WATCHDOG_CI_RUNS', 'WATCHDOG_CI_RERUN_JOBS', 'WATCHDOG_CI_RERUN_MAX', 'WATCHDOG_DELIVER_ANSWERS', 'WATCHDOG_RETURN_ESCALATED_REVIEWS',
-    'WATCHDOG_CANCELLED_BLOCKERS', 'COST_SYNC', 'COST_SYNC_SINCE')
+    'WATCHDOG_CANCELLED_BLOCKERS', 'WATCHDOG_RESUME_SWEEP', 'WATCHDOG_RESUME_SWEEP_LIMIT', 'COST_SYNC', 'COST_SYNC_SINCE')
 
   function Get-EnvText {
     $lines = @(
@@ -531,6 +531,8 @@ $network
   $s.WATCHDOG_DELIVER_ANSWERS = Pick 'WATCHDOG_DELIVER_ANSWERS' 'true'
   $s.WATCHDOG_RETURN_ESCALATED_REVIEWS = Pick 'WATCHDOG_RETURN_ESCALATED_REVIEWS' 'false'
   $s.WATCHDOG_CANCELLED_BLOCKERS = Pick 'WATCHDOG_CANCELLED_BLOCKERS' 'true'
+  $s.WATCHDOG_RESUME_SWEEP = Pick 'WATCHDOG_RESUME_SWEEP' 'true'
+  $s.WATCHDOG_RESUME_SWEEP_LIMIT = Pick 'WATCHDOG_RESUME_SWEEP_LIMIT' '0'
   Say 'It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without'
   Say 'anything picking them up, and repairs blockers stuck on a failed workspace clean-up.'
   if (Confirm 'Turn the watchdog on?' (Truthy $s.WATCHDOG)) {
@@ -565,6 +567,8 @@ $network
     Say 'After 3 agent change requests in a row, Paperclip hands a review to you instead of back to the implementer.'
     $s.WATCHDOG_RETURN_ESCALATED_REVIEWS = if (Confirm "Return such reviews to the implementer (at most $($s.WATCHDOG_MAX_NUDGES) times per issue)?" (Truthy $s.WATCHDOG_RETURN_ESCALATED_REVIEWS)) { 'true' } else { 'false' }
     $s.WATCHDOG_CANCELLED_BLOCKERS = if (Confirm 'Tell an agent when its issue is blocked by a cancelled issue (Paperclip never counts it resolved)?' (Truthy $s.WATCHDOG_CANCELLED_BLOCKERS)) { 'true' } else { 'false' }
+    Say 'Pausing an agent with runs queued makes Paperclip block those issues, and resuming it restarts none of them.'
+    $s.WATCHDOG_RESUME_SWEEP = if (Confirm 'Restore such issues when the agent is resumed (a few at a time; others are never touched)?' (Truthy $s.WATCHDOG_RESUME_SWEEP)) { 'true' } else { 'false' }
   } else {
     $s.WATCHDOG = 'false'
   }

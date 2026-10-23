@@ -44,16 +44,40 @@ export function emptyDb() {
     budgets: { policies: [] },
     interactions: {}, // issueId → [{ id, kind, status, addresseeAgentId, addresseeUserId, createdByAgentId, payload, createdAt }]
     created: [], // issues created through POST /api/companies/:id/issues
+    // Off by default: with it on, a board update or comment wakes the issue's assignee
+    // as Paperclip does (a queued run in issueRuns), for tests that check the wake.
+    simulateWakes: false,
   };
 }
 
 const GUARD =
   "This hostname is not allowed for this Paperclip instance. If you want to allow a hostname, run npx paperclipai allowed-hostname <host>.";
 
+// A comment by the key's user, with the fields Paperclip's comment list carries.
+function boardComment(issue, body, via, who) {
+  return {
+    id: uuid(), issueId: issue.id, identifier: issue.identifier, body, via,
+    authorType: "user", authorUserId: who?.userId ?? null, authorAgentId: null, createdAt: new Date().toISOString(),
+  };
+}
+
 export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
   const requests = [];
   const failures = []; // { method, path (regex), status, body, times, hang }
 
+  // Like Paperclip's PATCH /api/issues/:id and issue-comment-wakeup: a board user's
+  // comment, or a move out of blocked or backlog to todo, wakes the assignee unless the
+  // issue is done or cancelled or the agent can't be invoked (agent-eligibility.ts).
+  // Only with db.simulateWakes: the other tests predate it and count runs themselves.
+  const wakeAssignee = (issue, reason) => {
+    if (!db.simulateWakes || !issue.assigneeAgentId || ["done", "cancelled"].includes(issue.status)) return;
+    const agent = db.agents.find((a) => a.id === issue.assigneeAgentId);
+    if (!agent || ["paused", "terminated", "pending_approval"].includes(agent.status)) return;
+    const runs = (db.issueRuns[issue.id] ??= []);
+    // One wake per issue and agent at a time: a later one coalesces into the queued run.
+    if (runs.some((r) => r.agentId === agent.id && r.status === "queued")) return;
+    runs.unshift({ runId: uuid(), agentId: agent.id, status: "queued", reason, createdAt: new Date().toISOString() });
+  };
   const issueByRef = (ref) => db.issues.find((i) => i.id === ref || i.identifier?.toUpperCase() === String(ref).toUpperCase());
   const actor = (req) => {
     const auth = req.headers.authorization ?? "";
@@ -248,6 +272,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       if (rest === "" && req.method === "PATCH") {
         if (body.comment && issue.paused) return send(409, { error: "Task is paused. Resume it before sending a message." });
         db.patches.push({ issueId: issue.id, identifier: issue.identifier, body });
+        const before = issue.status;
         if (body.status === "done" && issue.nextStages?.length && issue.executionState?.status === "pending") {
           // Like Paperclip's applyIssueExecutionStageTransition: approving a stage
           // that isn't the last moves the issue to the next stage, still in review.
@@ -263,16 +288,20 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
             if (k in body) issue[k] = body[k];
           }
         }
-        if (body.comment) db.comments.push({ issueId: issue.id, identifier: issue.identifier, body: body.comment, via: "patch" });
+        if (body.comment) db.comments.push(boardComment(issue, body.comment, "patch", who));
         issue.updatedAt = new Date().toISOString();
+        if (body.comment) wakeAssignee(issue, "issue_commented");
+        else if (issue.status === "todo" && (before === "blocked" || before === "backlog")) wakeAssignee(issue, "issue_status_changed");
         return send(200, issue);
       }
       if (rest === "/comments" && req.method === "POST") {
         // Paperclip's assertBoardCommentNotPaused: a paused task tree refuses board comments.
         if (issue.paused) return send(409, { error: "Task is paused. Resume it before sending a message." });
-        db.comments.push({ issueId: issue.id, identifier: issue.identifier, body: body.body, via: "comment" });
+        const comment = boardComment(issue, body.body, "comment", who);
+        db.comments.push(comment);
         issue.updatedAt = new Date().toISOString();
-        return send(201, { id: uuid(), body: body.body });
+        wakeAssignee(issue, "issue_commented");
+        return send(201, { id: comment.id, body: body.body });
       }
       if (rest === "/runs") return send(200, db.issueRuns[issue.id] ?? []);
       if (rest === "/interactions" && req.method === "GET") {

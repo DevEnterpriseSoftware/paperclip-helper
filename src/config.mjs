@@ -176,6 +176,11 @@ export function loadConfig(env = process.env) {
     // Tell an agent its issue is blocked by a cancelled issue, which Paperclip never
     // counts as resolved.
     watchdogCancelledBlockers: bool("WATCHDOG_CANCELLED_BLOCKERS", true),
+    // When a paused agent is resumed, restore its issues Paperclip's recovery blocked
+    // during the pause ("the original assignee is not invokable"), at most
+    // WATCHDOG_RESUME_SWEEP_LIMIT per agent per tick (0: the agent's maxConcurrentRuns).
+    watchdogResumeSweep: bool("WATCHDOG_RESUME_SWEEP", true),
+    watchdogResumeSweepLimit: Math.floor(num("WATCHDOG_RESUME_SWEEP_LIMIT", 0)),
 
     // cost-sync.mjs: API-equivalent cost of subscription runs
     costSync: bool("COST_SYNC", true),

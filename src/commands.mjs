@@ -801,7 +801,8 @@ export async function status(ctx) {
             `${w.questions ? `; ${w.questions} undelivered question cards routed` : ""}` +
             `${w.ciReports ? `; ${w.ciReports} finished CI runs reported` : ""}` +
             `${w.ciReruns ? `; ${w.ciReruns} flaky CI runs re-run` : ""}` +
-            `${w.returned ? `; ${w.returned} issues returned to their agent` : ""}${w.lastError ? `; last error: ${w.lastError}` : ""}`
+            `${w.returned ? `; ${w.returned} issues returned to their agent` : ""}` +
+            `${w.resumed ? `; ${w.resumed} issues restored after their agent was resumed` : ""}${w.lastError ? `; last error: ${w.lastError}` : ""}`
         : "Watchdog: off",
     );
     const c = s.costSync;

@@ -14,7 +14,7 @@ Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that 
 | **A blocked issue that stays blocked** after its blockers are done, or whose done blocker is "finalizing" forever. | **Watchdog.** It wakes the owner, and removes a blocker stuck on a failed workspace clean-up. |
 | **"Waiting for execution recovery"** or **"Automatic recovery blocked"** after a hand-off, with your message saved but never delivered. | **Watchdog.** It presses Paperclip's own **send queued messages now** / **Interrupt** for you. |
 | **"Automatic recovery of this task stopped"**, and every message or **Interrupt** is saved again with "The previous run has no verified stop record". | **Watchdog.** Paperclip wants proof that a run cut off at a hand-off has stopped, and that run never recorded any, so the hold never clears. The watchdog records that the run stopped, releases the hold and delivers the saved messages. **[`pch release ISSUE`](docs/commands.md#release-a-hold-messages-cant-clear)** does the same by hand. |
-| **Issues left blocked after you pause and resume agents** ("the original assignee is not invokable"). | **Watchdog.** Once the agent is back, it comments on each issue Paperclip parked, which un-parks it and wakes the agent. |
+| **Issues left blocked after you pause and resume agents** ("the original assignee is not invokable"). | **[Watchdog](docs/watchdog.md#15-issues-blocked-while-their-agent-was-paused).** When the agent is resumed, it puts each issue Paperclip blocked during the pause back where it was (a review stays in review) and wakes it, a few at a time. Issues blocked for any other reason, or that someone has touched since, are left alone. |
 | **A Costs page that shows $0**, because your agents run on a Claude or ChatGPT subscription. | **[Cost sync](docs/cost-sync.md).** It posts each run's API-equivalent cost: Claude Code's own figure, and for Codex, tokens × OpenAI list prices. |
 | **An issue that sits for hours after CI finished**, because the agent said "waiting on run …" and stopped, or its monitor gave up first. | **[Watchdog](docs/watchdog.md#11-ci-runs-an-agent-waits-on)** (with a GitHub token). It tells the agent the run's result once it finishes, and can re-run jobs you know to be flaky first. Runs started by `workflow_dispatch` on the repository's default branch (read from GitHub) are never re-run and are reported on every conclusion, including cancellation, even after that branch moves on. |
 | **You answered an agent's card, and nothing happened**, because the issue was waiting on your review. | **[Watchdog](docs/watchdog.md#12-answers-that-reach-nobody).** It returns the issue to the agent with your answer. |
@@ -32,6 +32,24 @@ Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that 
 - **Three components, each with its own switch:** the relay receives signed GitHub webhooks, the watchdog checks every minute, and cost sync posts every 15 minutes.
 - **It works through Paperclip's API, as you would in the UI:** comments, review decisions, blocker edits, cost events, and issues for the questions Paperclip didn't deliver. It never merges, pushes or deletes anything. On GitHub it reads pull requests and the CI runs agents wait on, comments on the PRs it sends back if you turn that on, and re-runs failed jobs only if you name them as flaky.
 - **`DRY_RUN=true`** makes every component log what it would do and change nothing.
+
+## Why it saves tokens
+
+Agents on Paperclip often poll. An agent waiting for a CI run sets a monitor that wakes it every few minutes, and each wake starts a run that reloads the agent's whole context, only to find the CI run still queued. On a subscription that is the fastest way to hit a usage limit; on an API key it costs money.
+
+Paperclip Helper turns those waits into events. It watches GitHub and Paperclip for the agent and wakes it **once**, when something has actually changed:
+
+- the CI run it named has finished, with the conclusion and the failed jobs in the comment;
+- a card it raised was answered;
+- a hand-off was dropped;
+- a blocker was cancelled;
+- a merge conflict appeared in the review queue.
+
+So agents can name what they are waiting for and stop.
+
+In one 16-agent company, before its agents were told to rely on the Helper, about 40% of the busiest implementer's runs, and a third of its input tokens, were monitor wakes that found nothing new. One instruction in the team's agent template ("name the run you're waiting for and end your run; the Helper wakes you") removed them. Your numbers will differ.
+
+Rely on the Helper or on short monitors, not both: an agent's own Paperclip monitor that is still due keeps the Helper's CI report back ([watchdog 11](docs/watchdog.md#11-ci-runs-an-agent-waits-on)). If you keep monitors, space them widely (30 minutes or more).
 
 ## Quick start
 
@@ -69,7 +87,7 @@ It acts only on events signed with your webhook secret, from your repositories, 
 
 ### Watchdog: wake stalled work
 
-Most stalls start the same way: an issue changes hands, Paperclip cancels a run at that moment, and the next wake is refused and never retried. Every minute the watchdog looks for the stalls in the table above, fourteen situations in all. It acts only after an issue has been quiet for three minutes, at most twice per situation, and never interrupts a running run. A hold Paperclip can never release by itself is released once its run has been over for three minutes; a hold whose cause it can't be sure of is logged and left to you. A link to a closed workspace, which fails every run at setup, is cleared at once. Details and settings: **[docs/watchdog.md](docs/watchdog.md)**.
+Most stalls start the same way: an issue changes hands, Paperclip cancels a run at that moment, and the next wake is refused and never retried. Every minute the watchdog looks for the stalls in the table above, fifteen situations in all. It acts only after an issue has been quiet for three minutes, at most twice per situation, and never interrupts a running run. A hold Paperclip can never release by itself is released once its run has been over for three minutes; a hold whose cause it can't be sure of is logged and left to you. A link to a closed workspace, which fails every run at setup, is cleared at once. Details and settings: **[docs/watchdog.md](docs/watchdog.md)**.
 
 ### Cost sync: what your subscription runs would have cost
 

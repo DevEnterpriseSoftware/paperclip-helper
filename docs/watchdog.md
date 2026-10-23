@@ -1,6 +1,6 @@
 # The watchdog: wake stalled work
 
-Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for fourteen situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment. The last four are about work that waits on something outside the agent's run: CI, your answer, a review, a cancelled issue.
+Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog looks for fifteen situations Paperclip doesn't recover from by itself. Most of them start the same way: an issue changes hands, and Paperclip cancels a run at that moment. Four are about work that waits on something outside the agent's run (CI, your answer, a review, a cancelled issue), and the last restores work a pause left blocked.
 
 | In Paperclip you see… | The watchdog… |
 |---|---|
@@ -9,7 +9,7 @@ Every `WATCHDOG_INTERVAL_SEC`, for every company your key can see, the watchdog 
 | A blocked issue whose only blocker is done but **"finalizing"** forever. | Removes that blocker, moves the issue to `todo` and explains why. |
 | **"Waiting for execution recovery. Your message is saved."** | Presses Paperclip's **send queued messages now** for it. |
 | **"Automatic recovery blocked"**, board decision required, after a hand-off. | Delivers the saved messages to the current owner, as **Interrupt** does. |
-| **"Automatic recovery blocked … the original assignee is not invokable"**, after you paused and resumed an agent. | Comments on the issue once the agent is back, which un-parks it and wakes the agent. |
+| **"Automatic recovery blocked … the original assignee is not invokable"**, after you paused and resumed an agent. | When the agent is resumed, restores each issue blocked during the pause to the status it had (in review if a review stage is pending) and wakes it, a few per tick (15). Any it doesn't restore get a comment once the agent is back, which un-parks them (6). |
 | **"Automatic recovery of this task stopped"**, with every message saved behind "The previous run has no verified stop record". | Releases the hold, as `pch release --apply` does, and delivers the saved messages. |
 | Every run fails at once with **`setup_failed`: "requested inherited execution workspace reuse … could not be restored"**. | Clears the issue's link to the closed workspace, as `pch workspace --apply` does, and restarts the agent if that run was its last. |
 | An agent scheduled a workspace of its own and left the issue in **todo**, and nothing started its next run. | Comments on it, which wakes the agent on its new workspace. |
@@ -80,6 +80,8 @@ Nothing un-parks the issue when the agent comes back. A comment from a board use
 It waits while the agent is paused, terminated or awaiting approval, and while any run is active on the issue. A recovery action of any other kind, such as a stalled review, asks for a judgement about who continues. The watchdog logs it once and leaves it to you; `pch why ISSUE` prints the kind, Paperclip's next action, and a recommendation.
 
 A comment clearing a parked issue was verified by hand on Paperclip 2026.916.1.
+
+When the agent was paused and has just been resumed, [15](#15-issues-blocked-while-their-agent-was-paused) looks at its blocked issues first, and this check leaves them alone until that sweep is over.
 
 ## 7. Holds Paperclip can never release by itself
 
@@ -152,6 +154,8 @@ With `WATCHDOG_CI_RUNS` on and a GitHub token (`GITHUB_TOKEN` or `GITHUB_TOKEN_F
 - Once per run attempt: a run you (or an agent) re-run is reported again when its new attempt finishes.
 - **Why a run wasn't reported:** with `LOG_LEVEL=debug`, the log has one line per run attempt and reason ("watchdog: a finished CI run an agent waits on isn't reported", with `reason`), for example "the agent has run on the issue since it finished". If GitHub refuses to show a run (401, or a 403 that isn't its rate limit), a warning says so once per repository, with GitHub's answer and the permission the token needs (or that the token was rejected): no run there is reported until it can read them.
 
+**Monitors and the Helper.** An agent's own Paperclip monitor that is still due keeps this report back (see above), and each monitor wake is a full run that reloads the agent's context. So rely on one or the other: tell agents to name the run they wait on and end their run, or, if they keep monitors, space them widely (30 minutes or more). Monitors every few minutes on top of the Helper only add runs that find the CI still going.
+
 **Flaky jobs.** Set `WATCHDOG_CI_RERUN_JOBS` to a regular expression matching the names of jobs you know to be flaky, for example `^e2e \(windows\)$|^ci-gate$`. A finished run whose failed jobs *all* match is re-run instead of reported (GitHub's "Re-run failed jobs"), up to `WATCHDOG_CI_RERUN_MAX` times per run (default 2), and only while the run's commit is still its pull request's head: a newer push runs CI by itself. The agent hears nothing until an attempt passes or the re-runs are used up, and the comment then says how many re-runs there were. A run with any other failure is reported straight away. Re-runs need **Actions: Read and write**; if GitHub refuses one, the run is reported instead and the log says which permission is missing. Empty (the default) never re-runs anything.
 
 ## 12. Answers that reach nobody
@@ -180,6 +184,33 @@ If you'd rather the work went back to the implementer, there are two ways:
 Paperclip counts a blocker as resolved only when it is **done**. A cancelled blocker stays unresolved until someone removes or replaces it in **Blocked by**, so the dependent stays blocked and nothing wakes its agent. Often the work landed elsewhere (another issue's PR carried the fix) and nobody updated the link.
 
 With `WATCHDOG_CANCELLED_BLOCKERS` on, once such an issue has been quiet for the stall window, the watchdog comments on it once, which wakes its agent: which blockers were cancelled, each one's last comment (usually why it was cancelled), and what to do. If the work landed elsewhere or isn't needed, remove the blocker (and link what replaced it); if it is still needed, say so and ask for a replacement. It waits while the agent is paused, terminated or awaiting approval, or a run is active or a wake pending on the issue.
+
+## 15. Issues blocked while their agent was paused
+
+Pausing an agent cancels the runs it has queued or in flight. Paperclip's recovery sweep then finds each of those issues assigned to an agent it can't invoke, and gives up on it: it sets the issue to `blocked`, with no blocker linked, and posts a system comment, "Paperclip cannot safely continue automatic recovery because the original assignee is not invokable. The source assignment is unchanged and the board must choose the next action.", whose details have a **Recovery** section: *Recovery owner: Board decision required*. Resuming the agent restarts none of them. Pausing six agents at once has left sixteen issues to set back by hand.
+
+With `WATCHDOG_RESUME_SWEEP` on, the watchdog remembers every agent's status each tick (in `data/state.json`, so a resume while the helper is down still counts). When an agent goes from `paused` to available, it looks at the agent's blocked issues and restores each one that meets all of these:
+
+- it is still assigned to that agent, with nothing running on it;
+- no unresolved blocker: **Blocked by** is empty, or every blocker is done or cancelled;
+- its newest comment is Paperclip's recovery notice, recognised by the **Recovery** section of its details (board decision required, and not one Paperclip marks for a person to fix, such as a usage limit or a missing login). On a Paperclip whose comments carry no details, by its text, "the original assignee is not invokable";
+- that comment was posted while the agent was paused: after Paperclip's `pausedAt` for the agent (or, without it, after the watchdog's last check that saw the agent running) and before the resume;
+- nothing has changed since: no newer comment from anyone, and the issue hasn't left `blocked` and come back;
+- the recovery action the comment names, when Paperclip shows it, is the "assignee not invokable" kind (`stranded_assigned_issue`), not a lost process or a failed workspace. When Paperclip shows no action, the comment itself must say the assignee was not invokable, or name a run the pause cancelled (`agent_paused`); when reading the action fails, the issue waits for the next tick.
+
+Each issue goes back to:
+
+- `in_review` when a review or approval stage is pending, so the stage's participant is woken rather than the implementer (moving it anywhere else as the board would dissolve the stage);
+- otherwise the status Paperclip recorded before the block (its recovery action's `previousStatus`: todo, in progress or in review);
+- otherwise `todo`.
+
+The status change carries one comment, "*Agent* was resumed: retrying the original owner (the recovery block came from the pause).", and together they wake the assignee, as your own comment would.
+
+**Paced.** It restores at most `WATCHDOG_RESUME_SWEEP_LIMIT` issues per agent per tick; `0` (the default) means the agent's own `maxConcurrentRuns` (its heartbeat setting in Paperclip, which Paperclip sets to 20 for new agents), or 1 if Paperclip doesn't show one. Issues it restored on earlier ticks whose runs are still queued or going count against that limit, so a resume never puts more than the limit of runs in flight. Most urgent first, then longest blocked. The rest follow on later ticks. While a sweep is under way, [6](#6-issues-parked-because-the-assignee-couldnt-be-run) leaves alone the issues the sweep is still to restore; any other blocked issue of the agent is 6's as usual. The sweep ends at the first tick with nothing left to restore or postponed, and after a day at most. If the agents can't be listed on a tick, nothing is decided about pauses until the next one.
+
+**Never touched:** an issue whose recovery block came while the agent was *not* paused (a real failure the board should look at), an issue someone has acted on since, and an issue blocked for any other reason. If the agent is paused again before the sweep ends, the next resume covers both pauses. A task you paused (its own pause, not the agent's) postpones the restore until you resume it; a change Paperclip refuses is logged and left to you. A pause and resume that both fall between two checks isn't seen (6 still un-parks those issues once they have been quiet). With `DRY_RUN=true` it logs what it would restore and keeps the sweep open, so turning dry run off within the day still restores them.
+
+Upstream, a deliberate pause arguably shouldn't make Paperclip give up on the agent's work at all. Recent Paperclip source already skips the block for some paused cases (a run cancelled by the pause); this sweep covers the versions and paths that still block.
 
 ## Limits
 
@@ -211,12 +242,14 @@ These look similar in Paperclip, and `pch why ISSUE` tells them apart:
 | `WATCHDOG_RELEASE_HOLDS` | `true` | Release a hold Paperclip can never release by itself, once its run has been over for the stall window (7 above). |
 | `WATCHDOG_CLEAR_DEAD_LINKS` | `true` | Clear an open issue's link to a closed workspace, and restart its agent if its last run failed on it (8 above). Wake an agent waiting on a workspace it scheduled (9 above). |
 | `WATCHDOG_ROUTE_QUESTIONS` | `true` | Give an agent an issue for each question card a teammate addressed to it that Paperclip never delivered, and close it once the card is answered (10 above). `false` leaves them to you; `pch blocked` lists them. |
-| `WATCHDOG_CI_RUNS` | `true` | Tell an agent that a CI run it said it waits on has finished (11 above). Needs `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE` with **Actions: Read**; without a token it is off. |
+| `WATCHDOG_CI_RUNS` | `true` | Tell an agent that a CI run it said it waits on has finished (11 above). Needs `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE` with **Actions: Read**; without a token it is off. An agent's own Paperclip monitor that is still due keeps this report back, so rely on the Helper or space monitors widely (30 minutes or more), not both at short intervals. |
 | `WATCHDOG_CI_RERUN_JOBS` | none | A regular expression for jobs known to be flaky. A run whose failed jobs all match is re-run before it is reported. Needs **Actions: Read and write**. Empty: never re-run. |
 | `WATCHDOG_CI_RERUN_MAX` | `2` | Re-runs per run, at most. |
 | `WATCHDOG_DELIVER_ANSWERS` | `true` | Return an issue waiting on your decision to the agent whose card you answered meanwhile, as your "changes requested" (12 above). |
 | `WATCHDOG_RETURN_ESCALATED_REVIEWS` | `false` | Return a review Paperclip escalated to you after its review-round limit to the implementer, `WATCHDOG_MAX_NUDGES` times per issue (13 above). |
 | `WATCHDOG_CANCELLED_BLOCKERS` | `true` | Tell an agent once that its issue is blocked by a cancelled issue, with why it was cancelled (14 above). |
+| `WATCHDOG_RESUME_SWEEP` | `true` | When a paused agent is resumed, restore its issues Paperclip's recovery blocked during the pause, and wake them (15 above). |
+| `WATCHDOG_RESUME_SWEEP_LIMIT` | `0` | Issues restored per agent per tick. `0`: the agent's `maxConcurrentRuns`, or 1 if Paperclip doesn't show one. |
 
 
 ---
