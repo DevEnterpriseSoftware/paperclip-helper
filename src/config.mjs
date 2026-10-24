@@ -63,6 +63,17 @@ export function loadConfig(env = process.env) {
     }
     return raw;
   };
+  const zone = (name) => {
+    const raw = get(name);
+    if (!raw) return "";
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: raw });
+    } catch {
+      problems.push(`${name}=${raw} is not a time zone (use an IANA name, e.g. Europe/London or UTC)`);
+      return "";
+    }
+    return raw;
+  };
   const date = (name) => {
     const raw = get(name);
     if (!raw) return null;
@@ -207,11 +218,16 @@ export function loadConfig(env = process.env) {
     // Minutes a resume must hold before the agent's blocked issues are touched: a
     // resume to check one thing, then a pause again, restores and wakes nothing.
     watchdogResumeSettleMin: Math.max(0, num("WATCHDOG_RESUME_SETTLE_MIN", 10)),
-    // When a Claude account hits its usage limit, pause its agents (each once idle) and
-    // resume them this many minutes after the reset. A comment goes on
-    // WATCHDOG_NOTIFY_ISSUE (an issue identifier) when it happens, if set.
-    watchdogLimitPause: bool("WATCHDOG_LIMIT_PAUSE", true),
+    // When a plan hits its usage limit (a Claude or Codex agent's run fails with the
+    // limit wording), pause the agents on that account (each once idle) and resume them
+    // this many minutes after the reset. A comment goes on WATCHDOG_NOTIFY_ISSUE (an
+    // issue identifier) when it happens, if set. WATCHDOG_LIMIT_PAUSE is the name
+    // before 1.12, still read when the new one isn't set.
+    watchdogLimitPause: bool("WATCHDOG_USAGE_LIMIT_PAUSE", bool("WATCHDOG_LIMIT_PAUSE", true)),
     watchdogLimitResumeGraceMin: num("WATCHDOG_LIMIT_RESUME_GRACE_MIN", 5),
+    // The time zone Codex writes its reset times in ("try again at 3:45 PM"): that of
+    // the machine Paperclip runs on. Empty: the helper's own.
+    watchdogLimitTimeZone: zone("WATCHDOG_LIMIT_TIME_ZONE"),
     watchdogNotifyIssue: get("WATCHDOG_NOTIFY_ISSUE"),
     // Reopen a done issue whose own PR is still open, and report issues whose review
     // stages an update removed (the open-PR part needs a GitHub token).

@@ -4,7 +4,9 @@ import { setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { createWatchdog } from "../src/watchdog.mjs";
 import { createStateStore } from "../src/store.mjs";
-import { isClaudeLimitFailure, parseReset, resetLabel, subscriptionOf } from "../src/limits.mjs";
+import { accountOf, classifyFailure, codexAccountOf, isClaudeLimitFailure, parseCodexReset, parseReset, resetLabel, subscriptionOf } from "../src/limits.mjs";
+import { loadConfig } from "../src/config.mjs";
+import { CLAUDE_MESSAGES, CODEX_MESSAGES } from "./fixtures/limit-messages.mjs";
 
 const MIN = 60_000;
 const iso = (ms) => new Date(ms).toISOString();
@@ -203,7 +205,7 @@ test("a limit message with no reset time pauses for an hour, then looks again", 
   assert.equal(engineer.status, "idle");
 });
 
-test("a transient failure, a Codex quota failure, or an old limit already reset does nothing", async (t) => {
+test("a transient failure, a Codex agent's model at capacity, or an old limit already reset does nothing", async (t) => {
   const env = await limitEnv(t);
   const engineer = claude(env.db, "Engineer");
   const codex = { id: uuid(), companyId: ids.company, name: "Codex", status: "idle", adapterType: "codex_local", adapterConfig: {} };
@@ -385,4 +387,223 @@ test("isClaudeLimitFailure and subscriptionOf", () => {
   assert.equal(subscriptionOf({ id: "g", adapterType: "claude_local", adapterConfig: { env: ownDir } }), "agent:g");
   assert.equal(subscriptionOf({ id: "g", adapterType: "claude_local", adapterConfig: { env: { CLAUDE_CONFIG_DIR: "/home/pc/.claude-a" } } }), "host-login:/home/pc/.claude-a");
   assert.equal(subscriptionOf({ id: "h", adapterType: "claude_local", adapterConfig: {}, runtimeConfig: { aiConnection: { mode: "grant" } } }), "agent:h");
+});
+
+// ---------------------------------------------------------------- Codex (and other adapters)
+
+const apiKey = (secretId) => ({ OPENAI_API_KEY: { type: "secret_ref", secretId } });
+const PLUS_LIMIT = CODEX_MESSAGES.find(([name]) => name === "Plus plan")[1];
+
+function codex(db, name, env = apiKey("openai-1"), extra = {}) {
+  const a = { id: uuid(), companyId: ids.company, name, status: "idle", adapterType: "codex_local", adapterConfig: { env }, ...extra };
+  db.agents.push(a);
+  return a;
+}
+// Codex's reset times are in its machine's local time: London here.
+const codexEnv = (t, extra = {}) => limitEnv(t, { WATCHDOG_LIMIT_TIME_ZONE: "Europe/London", ...extra });
+
+test("a Codex plan's usage limit pauses the Codex agents on the same API key, not Claude's, and resumes them at the reset", async (t) => {
+  const env = await codexEnv(t);
+  const a = codex(env.db, "Codex Engineer");
+  const b = codex(env.db, "Codex Reviewer");
+  const otherKey = codex(env.db, "Other key", apiKey("openai-2"));
+  const claudeAgent = claude(env.db, "Claude Engineer");
+  failedRun(env.db, a, { at: T0 - MIN, errorCode: "provider_quota", error: PLUS_LIMIT });
+
+  await env.watchdog.tick();
+  assert.deepEqual([a, b, otherKey, claudeAgent].map((x) => x.status), ["paused", "paused", "idle", "idle"]);
+  const [note] = env.db.comments.filter((c) => c.identifier === "ACM-1");
+  assert.match(
+    note.body,
+    /^Codex usage limit reached: 2 agents paused \(Codex Engineer, Codex Reviewer\)\. The limit resets Mon 12 Oct, 15:45 \(Europe\/London\); the watchdog resumes them at Mon 12 Oct, 15:50 \(Europe\/London\)\. Claude agents are unaffected and keep working\./,
+  );
+  assert.equal(env.logs.filter((l) => /a Codex account hit its usage limit/.test(l.msg)).length, 1);
+
+  env.clock.at = Date.parse("2026-10-12T14:49:00Z"); // 15:49 London: within the grace
+  await env.watchdog.tick();
+  assert.equal(a.status, "paused");
+  env.clock.at = Date.parse("2026-10-12T14:50:00Z");
+  await env.watchdog.tick();
+  assert.deepEqual([a, b].map((x) => x.status), ["idle", "idle"]);
+});
+
+test("Codex agents are grouped by their Codex login: the same CODEX_HOME, or the machine's shared login", async (t) => {
+  const env = await codexEnv(t);
+  const home = (path) => ({ CODEX_HOME: path });
+  const shared1 = codex(env.db, "Shared 1", {});
+  const shared2 = codex(env.db, "Shared 2", {});
+  const ownA = codex(env.db, "Own home A", home("/home/pc/.codex-a"));
+  const ownA2 = codex(env.db, "Own home A too", home("/home/pc/.codex-a"));
+  const ownB = codex(env.db, "Own home B", home("/home/pc/.codex-b"));
+  // A home Paperclip redacts can't be compared: that agent is its own group.
+  const hidden = codex(env.db, "Hidden home", { CODEX_HOME: { type: "plain", value: "***REDACTED***" } });
+  failedRun(env.db, ownA, { at: T0 - MIN, error: "You’ve hit your usage limit. Try again at 3:45 PM." });
+  failedRun(env.db, shared1, { at: T0 - MIN, error: "You’ve hit your usage limit. Try again at 3:45 PM." });
+  await env.watchdog.tick();
+  assert.deepEqual(
+    [shared1, shared2, ownA, ownA2, ownB, hidden].map((x) => x.status),
+    ["paused", "paused", "paused", "paused", "idle", "idle"],
+  );
+  failedRun(env.db, hidden, { at: env.clock.at, error: "Quota exceeded. Check your plan and billing details." });
+  env.clock.at += MIN;
+  await env.watchdog.tick();
+  assert.equal(hidden.status, "paused");
+  assert.equal(ownB.status, "idle");
+});
+
+test("one Codex model's own limit pauses only the agent that hit it", async (t) => {
+  const env = await codexEnv(t);
+  const a = codex(env.db, "On the limited model");
+  const b = codex(env.db, "Same key, other model");
+  failedRun(env.db, a, { at: T0 - MIN, error: "You’ve hit your usage limit for codex_other. Switch to another model now, or try again at 3:45 PM." });
+  await env.watchdog.tick();
+  assert.deepEqual([a.status, b.status], ["paused", "idle"]);
+  assert.match(env.db.comments.find((c) => c.identifier === "ACM-1").body, /^Codex usage limit for codex_other reached: 1 agent paused \(On the limited model\)\./);
+  env.clock.at = Date.parse("2026-10-12T14:50:00Z");
+  await env.watchdog.tick();
+  assert.equal(a.status, "idle");
+});
+
+test("a Codex quota or billing error has no reset time: an hour, then it looks again", async (t) => {
+  const env = await codexEnv(t);
+  const a = codex(env.db, "Codex Engineer");
+  failedRun(env.db, a, { at: T0 - 2 * MIN, error: "Quota exceeded. Check your plan and billing details." });
+  await env.watchdog.tick();
+  assert.equal(a.status, "paused");
+  assert.match(env.db.comments.find((c) => c.identifier === "ACM-1").body, /^Codex quota or billing limit reached: 1 agent paused \(Codex Engineer\)\. Codex didn't say when the limit resets, so the watchdog resumes them at Mon 12 Oct, 11:03 \(Europe\/London\)/);
+  env.clock.at = T0 + 63 * MIN;
+  await env.watchdog.tick();
+  assert.equal(a.status, "idle");
+});
+
+test("Codex capacity and high demand, a plan without Codex, and an adapter without a recogniser pause nothing", async (t) => {
+  const env = await codexEnv(t);
+  const a = codex(env.db, "Codex Engineer");
+  const b = codex(env.db, "Codex Reviewer");
+  const c = codex(env.db, "Codex Architect");
+  const gemini = { id: uuid(), companyId: ids.company, name: "Gemini", status: "idle", adapterType: "gemini_local", adapterConfig: {} };
+  env.db.agents.push(gemini);
+  failedRun(env.db, a, { at: T0 - MIN, errorCode: "provider_quota", error: "Selected model is at capacity. Please try a different model." });
+  failedRun(env.db, b, { at: T0 - MIN, errorCode: "codex_transient_upstream", error: "We’re currently experiencing high demand, which may cause temporary errors." });
+  failedRun(env.db, c, { at: T0 - MIN, errorCode: null, error: "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus." });
+  failedRun(env.db, gemini, { at: T0 - MIN, errorCode: "provider_quota", error: "You've hit your usage limit. Try again at 3:45 PM." });
+  await env.watchdog.tick();
+  await env.watchdog.tick();
+  assert.equal(lifecycle(env, "pause").length, 0);
+  assert.equal(env.db.comments.length, 0);
+});
+
+test("WATCHDOG_USAGE_LIMIT_PAUSE=false pauses nothing; WATCHDOG_LIMIT_PAUSE is still read when it isn't set", async (t) => {
+  const env = await codexEnv(t, { WATCHDOG_USAGE_LIMIT_PAUSE: "false" });
+  const a = codex(env.db, "Codex Engineer");
+  failedRun(env.db, a, { at: T0 - MIN, error: PLUS_LIMIT });
+  await env.watchdog.tick();
+  assert.equal(a.status, "idle");
+
+  assert.equal(loadConfig({}).config.watchdogLimitPause, true);
+  assert.equal(loadConfig({ WATCHDOG_LIMIT_PAUSE: "false" }).config.watchdogLimitPause, false);
+  assert.equal(loadConfig({ WATCHDOG_LIMIT_PAUSE: "false", WATCHDOG_USAGE_LIMIT_PAUSE: "true" }).config.watchdogLimitPause, true);
+  assert.equal(loadConfig({ WATCHDOG_USAGE_LIMIT_PAUSE: "off" }).config.watchdogLimitPause, false);
+  assert.equal(loadConfig({ WATCHDOG_LIMIT_TIME_ZONE: "Europe/London" }).config.watchdogLimitTimeZone, "Europe/London");
+  assert.match(loadConfig({ WATCHDOG_LIMIT_TIME_ZONE: "Mars/Olympus" }).problems.join("\n"), /WATCHDOG_LIMIT_TIME_ZONE=Mars\/Olympus is not a time zone/);
+});
+
+test("a limit record from before 1.12 (no adapter) is still a Claude limit and is resumed", async (t) => {
+  const env = await limitEnv(t);
+  const engineer = claude(env.db, "Engineer", secret("sub-1"), { status: "paused", pausedAt: iso(T0 - MIN), pauseReason: "manual" });
+  env.state.nudges.set(`limit:${ids.company}:CLAUDE_CODE_OAUTH_TOKEN:secret:sub-1`, {
+    companyId: ids.company, account: "CLAUDE_CODE_OAUTH_TOKEN:secret:sub-1", runId: "r", lastFailureAt: T0 - 2 * MIN,
+    resetAt: T0 + 30 * MIN, timeZone: "UTC", unknownReset: false, waitMs: 0, paused: { [engineer.id]: { name: "Engineer", pausedAt: iso(T0 - MIN), tries: 0 } },
+    waitTicks: {}, notified: true, count: 1, at: T0,
+  });
+  env.clock.at = T0 + 36 * MIN;
+  await env.watchdog.tick();
+  assert.equal(engineer.status, "idle");
+});
+
+// Each message, word for word from the Codex CLI's source (test/fixtures/limit-messages.mjs).
+test("the Codex recogniser: every Codex CLI message is a limit, transient, or neither, with its reset", () => {
+  const agent = { id: "x", adapterType: "codex_local", adapterConfig: {} };
+  const at = Date.parse("2026-10-12T09:00:00Z"); // 10:00 in London
+  for (const [name, error, expected] of CODEX_MESSAGES) {
+    const run = { id: "r", status: "failed", errorCode: "provider_quota", error, finishedAt: iso(at) };
+    const verdict = classifyFailure(run, agent, { timeZone: "Europe/London" });
+    if (expected === null) {
+      assert.equal(verdict, null, name);
+      continue;
+    }
+    assert.equal(verdict?.kind, expected.kind, name);
+    if (expected.kind !== "limit") continue;
+    assert.equal(verdict.scope, expected.scope, name);
+    const resetAt = { today: "2026-10-12T14:45:00.000Z", dated: "2026-10-13T14:45:00.000Z" }[expected.reset];
+    assert.equal(verdict.reset ? new Date(verdict.reset.at).toISOString() : null, resetAt ?? null, name);
+  }
+  // Only a failed run counts, whatever its error code.
+  assert.equal(classifyFailure({ status: "succeeded", error: PLUS_LIMIT }, agent), null);
+  assert.equal(classifyFailure({ status: "failed", errorCode: null, error: PLUS_LIMIT, finishedAt: iso(at) }, agent).kind, "limit");
+});
+
+test("the Claude recogniser: its limit wording only with its error codes; Codex wording on a Claude agent goes by Claude's rules", () => {
+  const agent = { id: "c", adapterType: "claude_local", adapterConfig: {} };
+  for (const [name, error, expected] of CLAUDE_MESSAGES) {
+    const verdict = classifyFailure({ status: "failed", errorCode: "claude_transient_upstream", error, finishedAt: iso(T0) }, agent);
+    assert.equal(verdict?.kind, expected.kind, name);
+  }
+  assert.equal(classifyFailure({ status: "failed", errorCode: "adapter_failed", error: CLAUDE_MESSAGES[0][1] }, agent), null);
+  assert.equal(classifyFailure({ status: "failed", errorCode: "provider_quota", error: "x" }, { adapterType: "gemini_local" }), null);
+});
+
+test("parseCodexReset reads Codex's clock times in the given zone; a dateless time already passed is a zone mismatch, not tomorrow", () => {
+  const now = Date.parse("2026-10-12T09:00:00Z");
+  const iso2 = (r) => (r ? new Date(r.at).toISOString() : null);
+  assert.equal(iso2(parseCodexReset("Try again at 3:45 PM.", now, "Europe/London")), "2026-10-12T14:45:00.000Z");
+  assert.equal(iso2(parseCodexReset("Try again at 3:45 PM.", now, "UTC")), "2026-10-12T15:45:00.000Z");
+  assert.equal(iso2(parseCodexReset("Try again at 9:15 AM.", now, "UTC")), "2026-10-12T09:15:00.000Z");
+  // Codex writes a time without a date only for later the same day, in its own zone.
+  assert.equal(parseCodexReset("Try again at 8:15 AM.", now, "UTC"), null);
+  assert.equal(parseCodexReset("Try again at 12:05 AM.", now, "UTC"), null);
+  // Paperclip on UTC said 9:30 AM; read as London (UTC+1) it would be 08:30 UTC, already past.
+  assert.equal(parseCodexReset("Try again at 9:30 AM.", now, "Europe/London"), null);
+  assert.equal(iso2(parseCodexReset("or try again at Oct 18th, 2026 1:00 AM.", now, "Europe/London")), "2026-10-18T00:00:00.000Z");
+  // After the clocks go back (25 October in London), GMT again.
+  assert.equal(iso2(parseCodexReset("try again at Oct 26th, 2026 9:00 AM.", Date.parse("2026-10-24T09:00:00Z"), "Europe/London")), "2026-10-26T09:00:00.000Z");
+  assert.equal(parseCodexReset("Try again later.", now), null);
+  assert.equal(parseCodexReset("try again at Oct 1st, 2026 9:00 AM.", now, "UTC"), null, "in the past");
+  assert.equal(parseCodexReset("try again at Dec 1st, 2026 9:00 AM.", now, "UTC"), null, "more than a week away");
+  assert.equal(parseCodexReset("try again at 13:00 PM.", now, "UTC"), null);
+});
+
+test("codexAccountOf and accountOf", () => {
+  const agent = (env, extra = {}) => ({ id: "x", adapterType: "codex_local", adapterConfig: { env }, ...extra });
+  assert.equal(codexAccountOf(agent(apiKey("k1"))), "codex:OPENAI_API_KEY:secret:k1");
+  // The key wins over the home, as in Paperclip's codex-local adapter.
+  assert.equal(codexAccountOf(agent({ ...apiKey("k1"), CODEX_HOME: "/h" })), "codex:OPENAI_API_KEY:secret:k1");
+  assert.equal(codexAccountOf(agent({ OPENAI_API_KEY: { type: "plain", value: "***REDACTED***" } })), "agent:x");
+  assert.equal(codexAccountOf(agent({})), "codex:host-login");
+  assert.equal(codexAccountOf(agent({ CODEX_HOME: "/home/pc/.codex-a" })), "codex:home:/home/pc/.codex-a");
+  assert.equal(codexAccountOf(agent({ CODEX_HOME: { type: "plain", value: "/home/pc/.codex-a" } })), "codex:home:/home/pc/.codex-a");
+  assert.equal(codexAccountOf(agent({ CODEX_HOME: { type: "secret_ref", secretId: "h1" } })), "codex:CODEX_HOME:secret:h1");
+  assert.equal(codexAccountOf(agent({ CODEX_HOME: { type: "plain", value: "***REDACTED***" } })), "agent:x");
+  for (const env of [{ OPENAI_BASE_URL: "http://proxy" }, { CODEX_API_KEY: { type: "plain", value: "***REDACTED***" } }]) {
+    assert.equal(codexAccountOf(agent(env)), "agent:x", JSON.stringify(env));
+  }
+  assert.equal(codexAccountOf(agent({}, { runtimeConfig: { aiConnection: { mode: "grant" } } })), "agent:x");
+  assert.equal(codexAccountOf({ id: "c", adapterType: "claude_local" }), null);
+
+  assert.equal(accountOf(agent({})), "codex:host-login");
+  assert.equal(accountOf({ id: "b", adapterType: "claude_local", adapterConfig: {} }), "host-login");
+  assert.equal(accountOf({ id: "g", adapterType: "gemini_local" }), null);
+});
+
+test("a Codex reset time that has already passed in the configured zone is a guessed hour, not tomorrow", async (t) => {
+  // Paperclip (and so Codex) on UTC, the helper told London: Codex's "9:30 AM" reads as 08:30 UTC, already past.
+  const env = await codexEnv(t);
+  const a = codex(env.db, "Codex Engineer");
+  failedRun(env.db, a, { at: T0 - 2 * MIN, error: "You’ve hit your usage limit. Try again at 9:30 AM." });
+  await env.watchdog.tick();
+  assert.equal(a.status, "paused");
+  assert.match(env.db.comments.find((c) => c.identifier === "ACM-1").body, /Codex didn't say when the limit resets, so the watchdog resumes them at Mon 12 Oct, 11:03 \(Europe\/London\)/);
+  env.clock.at = T0 + 63 * MIN;
+  await env.watchdog.tick();
+  assert.equal(a.status, "idle");
 });

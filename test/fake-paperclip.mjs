@@ -305,6 +305,8 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       } else {
         Object.assign(agent, { status: "idle", pausedAt: null, pauseReason: null });
       }
+      // Both are in the activity log ("agent.paused", "agent.resumed").
+      db.activity.push({ action: `agent.${m[2]}d`, entityType: "agent", entityId: agent.id, createdAt: new Date(db.now?.() ?? Date.now()).toISOString() });
       return send(200, agent);
     }
     if ((m = p.match(/^\/api\/agents\/([^/]+)$/))) {
@@ -347,6 +349,10 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           // implementer who submitted the work (returnAssignee), which wakes it.
           issue.executionState = { ...issue.executionState, status: "changes_requested" };
           Object.assign(issue, { status: "in_progress", assigneeAgentId: issue.executionState.returnAssignee.agentId, assigneeUserId: null });
+        } else if (body.status === "in_review" && issue.executionState?.status === "pending" && issue.executionState.currentParticipant?.type === "agent") {
+          // Like Paperclip's drifted-stage repair (applyIssueExecutionPolicyTransition): moving an
+          // issue back to review re-pends its stage and assigns it to the stage's participant.
+          Object.assign(issue, { status: "in_review", assigneeAgentId: issue.executionState.currentParticipant.agentId, assigneeUserId: null });
         } else if (body.status) {
           // Like Paperclip's policy transition: leaving done or cancelled clears the execution state.
           if (["done", "cancelled"].includes(issue.status) && !["done", "cancelled"].includes(body.status)) issue.executionState = null;

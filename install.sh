@@ -21,22 +21,38 @@ NONINTERACTIVE="${PCH_NONINTERACTIVE:-}"
 
 # ------------------------------------------------------------------ output and input
 
-bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+# Colour on a terminal, unless NO_COLOR is set (https://no-color.org). Red and black
+# for the sections, green for what went right, yellow for warnings.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+  C_RESET=$'\033[0m' C_BOLD=$'\033[1m' C_DIM=$'\033[2m' C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_CYAN=$'\033[36m'
+else
+  C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
+fi
+
+bold() { printf '%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
 say() { printf '%s\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
-warn() { printf '\033[33m! %s\033[0m\n' "$*" >&2; }
-die() { printf '\033[31mx %s\033[0m\n' "$*" >&2; exit 1; }
-step() { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+ok() { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s! %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
+die() { printf '%s%sx %s%s\n' "$C_BOLD" "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+step() { printf '\n%s%s==%s %s%s%s\n' "$C_BOLD" "$C_RED" "$C_RESET" "$C_BOLD" "$*" "$C_RESET"; }
+# The question itself, then its default in brackets.
+prompt() {
+  if [ -n "$2" ]; then printf '%s%s%s %s[%s]%s%s ' "$C_BOLD" "$1" "$C_RESET" "$C_CYAN" "$2" "$C_RESET" "$3" >/dev/tty
+  else printf '%s%s%s%s ' "$C_BOLD" "$1" "$C_RESET" "$3" >/dev/tty; fi
+}
 
 # ask VAR "Question" "default": reads from the terminal, even under `curl | bash`.
+# A blank line after each answer keeps one question apart from the next.
 ask() {
   local var="$1" question="$2" default="${3:-}" answer=""
   if [ -n "$NONINTERACTIVE" ]; then
     printf -v "$var" '%s' "$default"
     return
   fi
-  if [ -n "$default" ]; then printf '%s [%s]: ' "$question" "$default" >/dev/tty; else printf '%s: ' "$question" >/dev/tty; fi
+  prompt "$question" "$default" ":"
   IFS= read -r answer </dev/tty || true
+  printf '\n' >/dev/tty
   printf -v "$var" '%s' "${answer:-$default}"
 }
 
@@ -48,9 +64,9 @@ ask_secret() {
     printf -v "$var" '%s' "$current"
     return
   fi
-  if [ -n "$current" ]; then printf '%s [keep %s]: ' "$question" "$(mask "$current")" >/dev/tty; else printf '%s: ' "$question" >/dev/tty; fi
+  prompt "$question" "${current:+keep $(mask "$current")}" ":"
   IFS= read -rs answer </dev/tty || true
-  printf '\n' >/dev/tty
+  printf '\n\n' >/dev/tty
   answer="$(printf '%s' "$answer" | tr -d '[:space:]')"
   printf -v "$var" '%s' "${answer:-$current}"
 }
@@ -59,9 +75,10 @@ ask_secret() {
 confirm() {
   local question="$1" default="${2:-y}" answer=""
   if [ -n "$NONINTERACTIVE" ]; then [ "$default" = y ]; return; fi
-  local hint="[Y/n]"; [ "$default" = n ] && hint="[y/N]"
-  printf '%s %s ' "$question" "$hint" >/dev/tty
+  local hint="Y/n"; [ "$default" = n ] && hint="y/N"
+  prompt "$question" "$hint" ""
   IFS= read -r answer </dev/tty || true
+  printf '\n' >/dev/tty
   answer="$(printf '%s' "${answer:-$default}" | tr '[:upper:]' '[:lower:]')"
   [ "${answer#y}" != "$answer" ]
 }
@@ -126,7 +143,7 @@ check_docker() {
   if [ "$(uname -s)" = Darwin ] || printf '%s' "$os" | grep -qiE 'docker desktop|rancher|colima|orbstack|lima|podman'; then
     VM_ENGINE=1
   fi
-  note "Docker: $(docker version --format '{{.Server.Version}}' 2>/dev/null </dev/null) on ${os:-unknown}${VM_ENGINE:+ (runs in a VM: bridge networking)}"
+  ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null </dev/null) on ${os:-unknown}${VM_ENGINE:+ (runs in a VM: bridge networking)}"
 }
 
 # ------------------------------------------------------------------ finding Paperclip
@@ -167,7 +184,7 @@ find_paperclip() {
     result="$(probe "$url" "$(net_args_for "$mode")")"
     if printf '%s' "$result" | grep -q '"ok":true'; then
       PAPERCLIP_API="$url"; NET_MODE="$mode"
-      note "Found Paperclip at $url ($(printf '%s' "$result" | json_field deploymentMode) mode, ${mode/net:/network })"
+      ok "Found Paperclip at $url ($(printf '%s' "$result" | json_field deploymentMode) mode, ${mode/net:/network })"
       return 0
     fi
     if printf '%s' "$result" | grep -q hostname_guard; then
@@ -190,6 +207,48 @@ find_paperclip() {
     say "  (That variable replaces the config file's list: include hostnames you already allowed.)"
   fi
   return 1
+}
+
+# ------------------------------------------------------------------ time zone
+
+# Codex writes its usage-limit reset times ("try again at 3:45 PM") in local time,
+# without naming the zone. The helper's container runs on UTC, so the installer
+# writes this machine's time zone into .env as WATCHDOG_LIMIT_TIME_ZONE.
+
+# An IANA time zone name from a TZ value, /etc/timezone or a zoneinfo path; empty otherwise.
+iana_zone() {
+  local z="${1#:}"
+  z="${z##*zoneinfo/}"; z="${z#posix/}"; z="${z#right/}"
+  z="$(printf '%s' "$z" | tr -d '[:space:]')"
+  case "$z" in
+    UTC|GMT|Etc/*) printf '%s' "$z" ;;
+    */*) printf '%s' "$z" | grep -E '^[A-Z][A-Za-z_]+(/[A-Za-z0-9_+-]+)+$' || true ;;
+  esac
+}
+
+# This machine's time zone, or empty when it can't be told.
+machine_zone() {
+  local z
+  z="$(iana_zone "${TZ:-}")"
+  [ -n "$z" ] || z="$(iana_zone "$(timedatectl show -p Timezone --value 2>/dev/null </dev/null || true)")"
+  [ -n "$z" ] || z="$(iana_zone "$(cat /etc/timezone 2>/dev/null || true)")"
+  [ -n "$z" ] || z="$(iana_zone "$(readlink /etc/localtime 2>/dev/null || true)")"
+  [ -n "$z" ] || z="$(iana_zone "$(node -p 'Intl.DateTimeFormat().resolvedOptions().timeZone' 2>/dev/null </dev/null || true)")"
+  printf '%s' "$z"
+}
+
+# Sets WATCHDOG_LIMIT_TIME_ZONE to this machine's time zone when .env doesn't have one.
+detect_limit_zone() {
+  if [ -n "$WATCHDOG_LIMIT_TIME_ZONE" ]; then
+    note "Codex's reset times are read in $WATCHDOG_LIMIT_TIME_ZONE (WATCHDOG_LIMIT_TIME_ZONE in your settings)."
+    return 0
+  fi
+  WATCHDOG_LIMIT_TIME_ZONE="$(machine_zone)"
+  if [ -n "$WATCHDOG_LIMIT_TIME_ZONE" ]; then
+    note "Codex's reset times will be read in $WATCHDOG_LIMIT_TIME_ZONE, this machine's time zone."
+  else
+    warn "Couldn't tell this machine's time zone. Set WATCHDOG_LIMIT_TIME_ZONE in $DIR/.env (e.g. Europe/London), or Codex agents at a usage limit may be resumed early or late."
+  fi
 }
 
 # ------------------------------------------------------------------ files
@@ -236,7 +295,9 @@ EOF
   } >"$1"
 }
 
-MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS RELAY_MERGE_QUEUE RELAY_REQUEUE_ON_INFRA_DROP RELAY_DONE_WITHOUT_STAGES RELAY_QUIET_NOTES GITHUB_TOKEN GITHUB_TOKEN_FILE GITHUB_TOKEN_HOST_FILE RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS WATCHDOG_CLEAR_DEAD_LINKS WATCHDOG_ROUTE_QUESTIONS WATCHDOG_CI_RUNS WATCHDOG_CI_RERUN_JOBS WATCHDOG_CI_RERUN_MAX WATCHDOG_DELIVER_ANSWERS WATCHDOG_RETURN_ESCALATED_REVIEWS WATCHDOG_CANCELLED_BLOCKERS WATCHDOG_RESUME_SWEEP WATCHDOG_RESUME_SWEEP_LIMIT WATCHDOG_RESUME_SETTLE_MIN WATCHDOG_LIMIT_PAUSE WATCHDOG_LIMIT_RESUME_GRACE_MIN WATCHDOG_NOTIFY_ISSUE WATCHDOG_STAGES_WIPE COST_SYNC COST_SYNC_SINCE"
+MANAGED="PCH_UID PCH_GID PCH_IMAGE PAPERCLIP_API PAPERCLIP_PUBLIC_URL RELAY GITHUB_WEBHOOK_SECRET GITHUB_OWNER_LOGIN GITHUB_REPOS ISSUE_PREFIXES RELAY_LINK_PRS RELAY_FIX_CONFLICTS RELAY_MERGE_QUEUE RELAY_REQUEUE_ON_INFRA_DROP RELAY_DONE_WITHOUT_STAGES RELAY_QUIET_NOTES GITHUB_TOKEN GITHUB_TOKEN_FILE GITHUB_TOKEN_HOST_FILE RELAY_HOST RELAY_PORT RELAY_PATH WATCHDOG WATCHDOG_INTERVAL_SEC WATCHDOG_STALL_SEC WATCHDOG_MAX_NUDGES WATCHDOG_HEAL_FAILED_FINALIZE WATCHDOG_RETRY_DEFERRED WATCHDOG_RELEASE_HOLDS WATCHDOG_CLEAR_DEAD_LINKS WATCHDOG_ROUTE_QUESTIONS WATCHDOG_CI_RUNS WATCHDOG_CI_RERUN_JOBS WATCHDOG_CI_RERUN_MAX WATCHDOG_DELIVER_ANSWERS WATCHDOG_RETURN_ESCALATED_REVIEWS WATCHDOG_CANCELLED_BLOCKERS WATCHDOG_RESUME_SWEEP WATCHDOG_RESUME_SWEEP_LIMIT WATCHDOG_RESUME_SETTLE_MIN WATCHDOG_USAGE_LIMIT_PAUSE WATCHDOG_LIMIT_RESUME_GRACE_MIN WATCHDOG_LIMIT_TIME_ZONE WATCHDOG_NOTIFY_ISSUE WATCHDOG_STAGES_WIPE COST_SYNC COST_SYNC_SINCE"
+# Old names of managed settings: read once (pick), then dropped from .env.
+RETIRED="WATCHDOG_LIMIT_PAUSE"
 
 write_env() {
   local key
@@ -249,7 +310,7 @@ write_env() {
       local extra
       # The "(pattern)" form: bash 3.2 can't parse a bare "pattern)" inside $(...).
       extra="$({ grep -E '^[A-Z_][A-Z0-9_]*=' "$DIR/.env" || true; } | while IFS= read -r l; do
-        case " $MANAGED " in (*" ${l%%=*} "*) ;; (*) printf '%s\n' "$l" ;; esac
+        case " $MANAGED $RETIRED " in (*" ${l%%=*} "*) ;; (*) printf '%s\n' "$l" ;; esac
       done)"
       if [ -n "$extra" ]; then printf '\n# Your other settings\n%s\n' "$extra"; fi
     fi
@@ -371,8 +432,10 @@ main() {
     die "No terminal to ask questions on. Run it in a terminal, or set PCH_NONINTERACTIVE=1 with your settings."
   fi
 
-  bold "Paperclip Helper installer"
-  say "Merge-to-approve relay, stalled-work watchdog and subscription cost sync for Paperclip."
+  printf '\n%s%sPaperclip Helper%s %sinstaller%s\n' "$C_BOLD" "$C_RED" "$C_RESET" "$C_BOLD" "$C_RESET"
+  say "Fixes what a self-hosted Paperclip doesn't recover from by itself: approve agents' work by merging"
+  say "their PRs, restart stalled work, pause agents at a usage limit, and record what subscription runs cost."
+  printf '%sEnter keeps the value in [brackets]. Re-run the installer any time to change an answer.%s\n' "$C_DIM" "$C_RESET"
 
   step "Checking Docker"
   check_docker
@@ -394,7 +457,7 @@ main() {
     docker image inspect "$IMAGE" >/dev/null 2>&1 </dev/null || die "Couldn't pull $IMAGE: $(printf '%s' "$pull_out" | tail -n 1)"
     warn "Couldn't pull $IMAGE; using the copy already on this machine."
   fi
-  note "Image $(docker run --rm "$IMAGE" version </dev/null)"
+  ok "Image $(docker run --rm "$IMAGE" version </dev/null)"
 
   step "Finding Paperclip"
   PAPERCLIP_API="$(pick PAPERCLIP_API)"
@@ -568,14 +631,18 @@ main() {
   WATCHDOG_RESUME_SWEEP_LIMIT="$(pick WATCHDOG_RESUME_SWEEP_LIMIT 0)"
   # shellcheck disable=SC2034  # written to .env by write_env
   WATCHDOG_RESUME_SETTLE_MIN="$(pick WATCHDOG_RESUME_SETTLE_MIN 10)"
-  WATCHDOG_LIMIT_PAUSE="$(pick WATCHDOG_LIMIT_PAUSE true)"
+  # WATCHDOG_LIMIT_PAUSE: the setting's name before 1.12.
+  WATCHDOG_USAGE_LIMIT_PAUSE="$(pick WATCHDOG_USAGE_LIMIT_PAUSE "$(pick WATCHDOG_LIMIT_PAUSE true)")"
   # shellcheck disable=SC2034  # written to .env by write_env
   WATCHDOG_LIMIT_RESUME_GRACE_MIN="$(pick WATCHDOG_LIMIT_RESUME_GRACE_MIN 5)"
+  WATCHDOG_LIMIT_TIME_ZONE="$(pick WATCHDOG_LIMIT_TIME_ZONE)"
   WATCHDOG_NOTIFY_ISSUE="$(pick WATCHDOG_NOTIFY_ISSUE)"
   # shellcheck disable=SC2034  # written to .env by write_env
   WATCHDOG_STAGES_WIPE="$(pick WATCHDOG_STAGES_WIPE true)"
-  say "It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without"
-  say "anything picking them up, and repairs blockers stuck on a failed workspace clean-up."
+  say "Paperclip loses track of work in a few known ways: a hand-off whose wake is dropped, blockers that"
+  say "finish without anything picking the issue up, holds nobody can release. Every minute the watchdog"
+  say "looks for these and wakes the right agent. Below, each check can be turned off on its own."
+  say ""
   local wd_default=y; truthy "$WATCHDOG" || wd_default=n
   if confirm "Turn the watchdog on?" "$wd_default"; then
     WATCHDOG=true
@@ -585,6 +652,7 @@ main() {
       ask WATCHDOG_MAX_NUDGES "Nudge comments per stalled issue" "$WATCHDOG_MAX_NUDGES"
     fi
     local heal=y; truthy "$WATCHDOG_HEAL_FAILED_FINALIZE" || heal=n
+    say "A done blocker whose workspace clean-up failed keeps its dependants blocked for good."
     if confirm "Repair blockers stuck on a failed workspace clean-up?" "$heal"; then WATCHDOG_HEAL_FAILED_FINALIZE=true; else WATCHDOG_HEAL_FAILED_FINALIZE=false; fi
     local retry=y; truthy "$WATCHDOG_RETRY_DEFERRED" || retry=n
     say "A wake deferred behind a stopped run waits forever. Paperclip's \"send queued messages now\" retries it."
@@ -617,15 +685,18 @@ main() {
     say "After 3 agent change requests in a row, Paperclip hands a review to you instead of back to the implementer."
     if confirm "Return such reviews to the implementer (at most $WATCHDOG_MAX_NUDGES times per issue)?" "$escalate"; then WATCHDOG_RETURN_ESCALATED_REVIEWS=true; else WATCHDOG_RETURN_ESCALATED_REVIEWS=false; fi
     local cancelled=y; truthy "$WATCHDOG_CANCELLED_BLOCKERS" || cancelled=n
-    if confirm "Tell an agent when its issue is blocked by a cancelled issue (Paperclip never counts it resolved)?" "$cancelled"; then WATCHDOG_CANCELLED_BLOCKERS=true; else WATCHDOG_CANCELLED_BLOCKERS=false; fi
+    say "Paperclip never counts a cancelled blocker as resolved, so its dependants stay blocked."
+    if confirm "Tell the dependant's agent why the blocker was cancelled, so it can remove or replace it?" "$cancelled"; then WATCHDOG_CANCELLED_BLOCKERS=true; else WATCHDOG_CANCELLED_BLOCKERS=false; fi
     local resume=y; truthy "$WATCHDOG_RESUME_SWEEP" || resume=n
     say "Pausing an agent with runs queued makes Paperclip block those issues, and resuming it restarts none of them."
     if confirm "Restore such issues when the agent is resumed (a few at a time; others are never touched)?" "$resume"; then WATCHDOG_RESUME_SWEEP=true; else WATCHDOG_RESUME_SWEEP=false; fi
-    local limit=y; truthy "$WATCHDOG_LIMIT_PAUSE" || limit=n
-    say "At a Claude usage limit every Claude agent's next run fails, and Paperclip keeps retrying them."
-    if confirm "Pause the Claude agents on that account (each once idle) and resume them when the limit resets?" "$limit"; then WATCHDOG_LIMIT_PAUSE=true; else WATCHDOG_LIMIT_PAUSE=false; fi
-    say "Some things only the board can settle: a usage-limit pause, wiped review stages, a merge-queue drop."
+    local limit=y; truthy "$WATCHDOG_USAGE_LIMIT_PAUSE" || limit=n
+    say "When a plan hits its usage limit (Claude or Codex), every agent on it fails its next run, and Paperclip keeps retrying them."
+    if confirm "Pause the agents on a plan that hits its usage limit (each once idle) and resume them when it resets?" "$limit"; then WATCHDOG_USAGE_LIMIT_PAUSE=true; else WATCHDOG_USAGE_LIMIT_PAUSE=false; fi
+    if truthy "$WATCHDOG_USAGE_LIMIT_PAUSE"; then detect_limit_zone; fi
+    say "Some things only you can settle: a usage-limit pause, wiped review stages, a merge-queue drop."
     say "The helper always logs them; it can also comment on an issue you watch (in the same company)."
+    say "Pick one assigned to a person or to nobody: a comment wakes an agent assignee."
     ask WATCHDOG_NOTIFY_ISSUE "Issue for the helper's notes to you, e.g. ACM-12 (empty: the log only)" "$WATCHDOG_NOTIFY_ISSUE"
   else
     WATCHDOG=false
@@ -677,7 +748,7 @@ main() {
   if truthy "$RELAY"; then
     step "Webhook"
     if curl -s -m 5 "http://127.0.0.1:$RELAY_PORT$RELAY_PATH" </dev/null 2>/dev/null | grep -q 'POST only'; then
-      note "The relay answers on this machine at http://localhost:$RELAY_PORT$RELAY_PATH."
+      ok "The relay answers on this machine at http://localhost:$RELAY_PORT$RELAY_PATH."
     else
       warn "The relay doesn't answer on http://localhost:$RELAY_PORT$RELAY_PATH yet: check \`docker compose logs\`."
     fi
@@ -693,7 +764,7 @@ main() {
           create_webhooks "$webhook_url"
           sleep 4
           if (cd "$DIR" && docker compose logs --no-log-prefix --since 30s helper </dev/null) | grep -q '"event":"ping"'; then
-            note "The relay received GitHub's ping."
+            ok "The relay received GitHub's ping."
           fi
         else
           manual_webhook_steps "$webhook_url"
@@ -710,7 +781,9 @@ main() {
   if [ -z "${PCH_NO_ALIAS:-}" ]; then install_alias; else write_wrapper || true; fi
 
   step "Done"
-  say "The helper runs in the background and restarts with Docker. Try:"
+  ok "Paperclip Helper is running. It runs in the background and restarts with Docker."
+  say ""
+  say "Try:"
   say "  pch status         what it's doing"
   say "  pch why ISSUE-1    why nobody is working on an issue"
   say "  pch help           every command"

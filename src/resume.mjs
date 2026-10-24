@@ -6,8 +6,13 @@
 // and a system comment ("Paperclip cannot safely continue automatic recovery
 // because the original assignee is not invokable…") whose metadata has a
 // "Recovery" section, "Recovery owner: Board decision required". Resuming the
-// agent restarts none of them. The pure helpers the watchdog's sweep uses are
-// here; the sweep itself is in watchdog.mjs.
+// agent restarts none of them. An issue in review whose pending stage waits on the
+// paused agent gets the same treatment from the review-participant recovery: blocked,
+// with "Paperclip cannot continue the pending execution-review participant because
+// the participant is not invokable…" (a recovery action of cause
+// execution_review_participant_recovery), and executionState.currentParticipant
+// still the paused agent. The pure helpers the watchdog's sweep uses are here; the
+// sweep itself is in watchdog.mjs.
 
 import { ts } from "./util.mjs";
 
@@ -22,6 +27,11 @@ const SETTLED_BLOCKER = new Set(["done", "cancelled"]);
 const MAX_CONCURRENT_RUNS_LIMIT = 50;
 
 const NOT_INVOKABLE = /original assignee is not invokable/i;
+// buildExecutionReviewParticipantUnavailableNoticeSeed (services/recovery/stranded-notice.ts).
+// Its sibling, "Paperclip retried the pending execution-review participant once, but…",
+// is a reviewer that ran and failed, not a pause, and never matches.
+const PARTICIPANT_NOT_INVOKABLE = /pending\s+execution-review\s+participant\s+because\s+the\s+participant\s+is\s+not\s+invokable/i;
+export const PARTICIPANT_RECOVERY_CAUSE = "execution_review_participant_recovery";
 
 const rowValue = (section, label) => {
   const row = (Array.isArray(section?.rows) ? section.rows : []).find((r) => r?.label === label);
@@ -33,12 +43,19 @@ const rowValue = (section, label) => {
 // "Recovery" section owned by the board, and not be one Paperclip says is for a
 // person to fix (recoveryResponsibility "user": a usage limit, a missing login),
 // which no resume fixes. Without metadata (older Paperclip), its body must say the
-// assignee was not invokable. { actionId } names the recovery action when the
-// comment says which; notInvokable is whether the comment itself says it was the
-// assignee that couldn't be run (needed when the action can't be read).
+// assignee (or the review participant) was not invokable.
+//
+// { kind, actionId, notInvokable }: kind "assignee" for the issue's assignee,
+// "participant" for the pending review stage's participant (its body always says
+// the participant was not invokable: the same cause's "retried once" notice is a
+// failed reviewer, not a pause); actionId names the recovery action when the comment
+// says which; notInvokable is whether the comment itself says it was the pause
+// (needed when the action can't be read).
 export function recoveryNotice(comment) {
   if (!comment || comment.authorAgentId || comment.authorUserId) return null;
   if (comment.authorType != null && comment.authorType !== "system") return null;
+  const body = String(comment.body ?? "");
+  const participant = PARTICIPANT_NOT_INVOKABLE.test(body);
   const meta = comment.metadata;
   if (meta && Array.isArray(meta.sections)) {
     const section = meta.sections.find((s) => s?.title === "Recovery");
@@ -46,13 +63,22 @@ export function recoveryNotice(comment) {
     if (meta.recoveryResponsibility === "user") return null;
     const evidence = meta.sections.find((s) => s?.title === "Run evidence");
     return {
+      kind: participant ? "participant" : "assignee",
       actionId: rowValue(section, "Recovery action") ?? null,
       // What says it was the pause when the recovery action can't be read: the
       // not-invokable text, or a source run the pause cancelled.
-      notInvokable: NOT_INVOKABLE.test(String(comment.body ?? "")) || rowValue(evidence, "Failure code") === "agent_paused",
+      notInvokable: participant || NOT_INVOKABLE.test(body) || rowValue(evidence, "Failure code") === "agent_paused",
     };
   }
-  return NOT_INVOKABLE.test(String(comment.body ?? "")) ? { actionId: null, notInvokable: true } : null;
+  if (participant) return { kind: "participant", actionId: null, notInvokable: true };
+  return NOT_INVOKABLE.test(body) ? { kind: "assignee", actionId: null, notInvokable: true } : null;
+}
+
+// The agent a pending review or approval stage waits on, or null.
+export function reviewParticipantOf(issue) {
+  const state = issue?.executionState;
+  const p = state?.status === "pending" ? state.currentParticipant : null;
+  return p?.type === "agent" && p.agentId ? p.agentId : null;
 }
 
 // Blockers that still hold the issue: anything not done or cancelled, or whose
@@ -77,6 +103,16 @@ export function pauseRecoveryAction(action) {
   const kind = action.kind ?? "stranded_assigned_issue";
   const cause = action.cause ?? "stranded_assigned_issue";
   return kind === "stranded_assigned_issue" && cause === "stranded_assigned_issue";
+}
+
+// Is this the review-participant recovery's action (it can't invoke the stage's
+// participant)? Unknown (null) when the action wasn't found: the notice decides.
+export function participantRecoveryAction(action) {
+  if (!action) return null;
+  if (action.ownerType && action.ownerType !== "board") return false;
+  const kind = action.kind ?? "stranded_assigned_issue";
+  const cause = action.cause ?? PARTICIPANT_RECOVERY_CAUSE;
+  return kind === "stranded_assigned_issue" && cause === PARTICIPANT_RECOVERY_CAUSE;
 }
 
 // The status to restore: in_review while a review or approval stage is pending, so

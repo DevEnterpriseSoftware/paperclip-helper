@@ -4,7 +4,7 @@ import { setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { createWatchdog } from "../src/watchdog.mjs";
 import { createStateStore } from "../src/store.mjs";
-import { concurrencyOf, holdingBlockers, pauseRecoveryAction, recoveryNotice, restoreStatus, statusChangedSince } from "../src/resume.mjs";
+import { concurrencyOf, holdingBlockers, participantRecoveryAction, pauseRecoveryAction, recoveryNotice, restoreStatus, reviewParticipantOf, statusChangedSince } from "../src/resume.mjs";
 
 const MIN = 60_000;
 const iso = (ms) => new Date(ms).toISOString();
@@ -630,7 +630,7 @@ test("a dry run leaves the sweep for the real run", async (t) => {
 test("recoveryNotice reads the Recovery section, and the text only without metadata", () => {
   const issue = { id: "i", identifier: "ACM-1" };
   const c = recoveryComment(issue, { at: Date.now(), actionId: "a1", runId: "r1" });
-  assert.deepEqual(recoveryNotice(c), { actionId: "a1", notInvokable: true });
+  assert.deepEqual(recoveryNotice(c), { kind: "assignee", actionId: "a1", notInvokable: true });
   // Another recovery family with the same section: not invokable only if its run was the pause's.
   const other = { ...c, body: "Paperclip could not restore a live execution path for this issue automatically." };
   assert.equal(recoveryNotice(other).notInvokable, true); // its Failure code is agent_paused
@@ -642,7 +642,7 @@ test("recoveryNotice reads the Recovery section, and the text only without metad
   assert.equal(recoveryNotice({ ...c, metadata: { version: 1, sections: [{ title: "Run evidence", rows: [] }] } }), null);
   // Metadata decides over the text: the same words with another owner aren't it.
   assert.equal(recoveryNotice(recoveryComment(issue, { at: 0, actionId: "a", runId: "r", owner: "Recovery Agent" })), null);
-  assert.deepEqual(recoveryNotice({ ...c, metadata: null }), { actionId: null, notInvokable: true });
+  assert.deepEqual(recoveryNotice({ ...c, metadata: null }), { kind: "assignee", actionId: null, notInvokable: true });
   assert.equal(recoveryNotice({ ...c, metadata: null, body: "Something else." }), null);
   assert.equal(recoveryNotice(null), null);
 });
@@ -673,4 +673,244 @@ test("restoreStatus, concurrencyOf, holdingBlockers, statusChangedSince, pauseRe
   assert.equal(pauseRecoveryAction({ kind: "stranded_assigned_issue", cause: "process_lost", ownerType: "board" }), false);
   assert.equal(pauseRecoveryAction({ kind: "workspace_validation", ownerType: "board" }), false);
   assert.equal(pauseRecoveryAction({ kind: "stranded_assigned_issue", ownerType: "system" }), false);
+});
+
+// ---------------------------------------------------------------- the review's participant
+
+// Word for word from Paperclip (buildExecutionReviewParticipantUnavailableNoticeSeed and
+// buildExecutionReviewParticipantRecoveryNoticeSeed, services/recovery/stranded-notice.ts).
+const PARTICIPANT_NOT_INVOKABLE =
+  "Paperclip cannot continue the pending execution-review participant because the participant is not " +
+  "invokable and the review stage has no completed decision or live reviewer run. Moving it to `blocked` " +
+  "so the board can inspect the evidence, repair the reviewer runtime, restore the review stage, or record an " +
+  "intentional manual resolution.";
+const PARTICIPANT_RETRIED =
+  "Paperclip retried the pending execution-review participant once, but the review stage still has no " +
+  "completed decision or live reviewer run. Moving it to `blocked` so the board can inspect the evidence, repair the " +
+  "reviewer runtime, restore the review stage, or record an intentional manual resolution.";
+
+// An issue in review whose pending stage waits on `reviewer`, blocked at `at` by the
+// review-participant recovery (escalateStrandedAssignedIssue with cause
+// execution_review_participant_recovery): its notice has no Run evidence when the
+// reviewer had no run on it yet.
+function participantBlock(db, reviewer, { at, implementer = null, body = PARTICIPANT_NOT_INVOKABLE, metadata = true, action = {}, participantId = reviewer.id }) {
+  n += 1;
+  const issue = {
+    id: uuid(), identifier: `ACM-${n}`, companyId: ids.company, status: "blocked", priority: "medium",
+    // While a stage is pending Paperclip assigns the issue to its participant; an implementer
+    // still assigned is the drifted case.
+    assigneeAgentId: implementer?.id ?? reviewer.id,
+    executionState: {
+      status: "pending", currentStageId: "stage-1", currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: participantId }, returnAssignee: { type: "agent", agentId: implementer?.id ?? uuid() },
+    },
+    updatedAt: iso(at), blockedTransitionAt: iso(at), blockedBy: [],
+  };
+  db.issues.push(issue);
+  db.issueRuns[issue.id] = [];
+  const actionId = uuid();
+  db.recoveryActions[issue.id] = {
+    id: actionId, kind: "stranded_assigned_issue", cause: "execution_review_participant_recovery", status: "active", ownerType: "board",
+    evidence: { previousStatus: "in_review" }, ...action,
+  };
+  db.comments.push({
+    id: uuid(), issueId: issue.id, identifier: issue.identifier, authorType: "system", authorAgentId: null, authorUserId: null,
+    body, createdAt: iso(at),
+    presentation: { kind: "system_notice", tone: "danger", title: "Review recovery stalled", detailsDefaultOpen: false },
+    metadata: metadata
+      ? {
+          version: 1, recoveryResponsibility: "system", sourceRunId: null,
+          sections: [{ title: "Recovery", rows: [
+            kv("Recovery action", actionId),
+            kv("Recovery owner", "Board decision required"),
+            kv("Next action", "Inspect the evidence, then retry the original owner, explicitly reassign, repair the execution path, or record an intentional resolution"),
+          ] }],
+        }
+      : null,
+  });
+  return issue;
+}
+
+test("a review blocked because its paused participant couldn't be woken goes back to review on resume, and wakes the participant", async (t) => {
+  const env = await resumeEnv(t);
+  const reviewer = agent(env.db, { name: "Reviewer" });
+  await env.watchdog.tick();
+  pause(env, reviewer);
+  await env.watchdog.tick();
+  env.clock.at += MIN;
+  const issue = participantBlock(env.db, reviewer, { at: env.clock.at });
+  env.clock.at += 5 * MIN;
+  resume(reviewer);
+  await env.watchdog.tick();
+
+  assert.equal(issue.status, "in_review");
+  assert.equal(env.db.patches.length, 1);
+  assert.equal(env.db.patches[0].body.status, "in_review");
+  const [comment] = restoredComments(env);
+  assert.equal(
+    comment.body,
+    `[@Reviewer](agent://${reviewer.id}) was resumed: back to review, so the pending review stage goes on (the recovery block came from the pause).\n\n_Paperclip Helper watchdog._`,
+  );
+  assert.equal(queuedRuns(env, issue)[0]?.agentId, reviewer.id);
+  assert.equal(env.watchdog.stats.resumed, 1);
+  env.clock.at += 10 * MIN;
+  await env.watchdog.tick();
+  assert.equal(env.db.patches.length, 1, "once");
+});
+
+test("the participant's review is restored even when another agent is still assigned, and check 6 doesn't nudge the assignee meanwhile", async (t) => {
+  const env = await resumeEnv(t, { WATCHDOG_RESUME_SETTLE_MIN: "10" });
+  const implementer = agent(env.db, { name: "Implementer" });
+  const reviewer = agent(env.db, { name: "Reviewer" });
+  await env.watchdog.tick();
+  pause(env, reviewer);
+  await env.watchdog.tick();
+  env.clock.at += MIN;
+  const issue = participantBlock(env.db, reviewer, { at: env.clock.at, implementer });
+  // Quiet for longer than the stall window while the reviewer is paused, then during the settle window.
+  env.clock.at += 10 * MIN;
+  await env.watchdog.tick();
+  resume(reviewer);
+  env.clock.at += MIN;
+  await env.watchdog.tick();
+  env.clock.at += 5 * MIN;
+  await env.watchdog.tick();
+  assert.equal(env.db.patches.length, 0);
+  assert.equal(env.db.comments.filter((c) => c.issueId === issue.id && c.authorType === "user").length, 0);
+
+  env.clock.at += 6 * MIN;
+  await env.watchdog.tick();
+  assert.equal(issue.status, "in_review");
+  assert.equal(issue.assigneeAgentId, reviewer.id, "Paperclip re-pends the stage with its participant");
+  assert.equal(restoredComments(env).length, 1);
+  assert.match(restoredComments(env)[0].body, new RegExp(`agent://${reviewer.id}`));
+});
+
+test("a reviewer that ran and failed, a stage waiting on someone else, or another cause's action is left alone", async (t) => {
+  const env = await resumeEnv(t);
+  const reviewer = agent(env.db, { name: "Reviewer", runtimeConfig: { heartbeat: { maxConcurrentRuns: 5 } } });
+  const other = agent(env.db, { name: "Other reviewer" });
+  await env.watchdog.tick();
+  pause(env, reviewer);
+  await env.watchdog.tick();
+  env.clock.at += MIN;
+  const at = env.clock.at;
+  const retried = participantBlock(env.db, reviewer, { at, body: PARTICIPANT_RETRIED });
+  const elsewhere = participantBlock(env.db, reviewer, { at, participantId: other.id, implementer: reviewer });
+  const otherCause = participantBlock(env.db, reviewer, { at, action: { cause: "process_lost" } });
+  // The assignee's own notice on a review blocked for the participant: not this agent's to restore as assignee.
+  const assigneeNotice = participantBlock(env.db, reviewer, { at, body: NOT_INVOKABLE, action: { cause: "execution_review_participant_recovery" } });
+  const ok = participantBlock(env.db, reviewer, { at, metadata: false });
+  env.clock.at += 5 * MIN;
+  resume(reviewer);
+  await env.watchdog.tick();
+  assert.deepEqual([retried, elsewhere, otherCause, assigneeNotice, ok].map((i) => i.status), ["blocked", "blocked", "blocked", "blocked", "in_review"]);
+});
+
+test("participant restores share the agent's run limit with its other restores", async (t) => {
+  const env = await resumeEnv(t);
+  const reviewer = agent(env.db, { name: "Reviewer" }); // maxConcurrentRuns 1
+  await env.watchdog.tick();
+  pause(env, reviewer);
+  await env.watchdog.tick();
+  env.clock.at += MIN;
+  const review = participantBlock(env.db, reviewer, { at: env.clock.at });
+  const own = recoveryBlock(env.db, reviewer, { at: env.clock.at });
+  env.clock.at += 5 * MIN;
+  resume(reviewer);
+  await env.watchdog.tick();
+  assert.equal([review, own].filter((i) => i.status !== "blocked").length, 1);
+  finishRuns(env);
+  env.clock.at += MIN;
+  await env.watchdog.tick();
+  assert.equal(review.status, "in_review");
+  assert.equal(own.status, "in_progress");
+});
+
+// ---------------------------------------------------------------- start-up
+
+test("an agent already paused when the helper starts, without Paperclip's pausedAt, counts from its 'agent.paused' activity", async (t) => {
+  const env = await resumeEnv(t);
+  const engineer = agent(env.db, { status: "paused", runtimeConfig: { heartbeat: { maxConcurrentRuns: 5 } } });
+  const pausedAt = env.clock.at - 60 * MIN;
+  env.db.activity.push({ action: "agent.paused", entityType: "agent", entityId: engineer.id, createdAt: iso(pausedAt) });
+  const before = recoveryBlock(env.db, engineer, { at: pausedAt - 10 * MIN }); // before the pause: a real failure
+  const during = recoveryBlock(env.db, engineer, { at: pausedAt + 10 * MIN });
+  await env.watchdog.tick(); // the helper's first tick: the agent is already paused
+  env.clock.at += MIN;
+  resume(engineer);
+  await env.watchdog.tick();
+  assert.equal(before.status, "blocked");
+  assert.equal(during.status, "in_progress");
+});
+
+test("an agent already paused when the helper starts, with no record of when, has its pause's blocks restored on resume", async (t) => {
+  const env = await resumeEnv(t);
+  const engineer = agent(env.db, { status: "paused" });
+  const issue = recoveryBlock(env.db, engineer, { at: env.clock.at - 3 * 60 * MIN });
+  await env.watchdog.tick();
+  env.clock.at += 2 * MIN;
+  resume(engineer);
+  await env.watchdog.tick();
+  assert.equal(issue.status, "in_progress");
+});
+
+test("an agent paused before a restart and resumed before the first tick is still swept, once, and not again after another restart", async (t) => {
+  const env = await resumeEnv(t);
+  const engineer = agent(env.db);
+  const pausedAt = env.clock.at - 30 * MIN;
+  env.db.activity.push({ action: "agent.paused", entityType: "agent", entityId: engineer.id, createdAt: iso(pausedAt) });
+  const issue = recoveryBlock(env.db, engineer, { at: pausedAt + 5 * MIN });
+  env.db.activity.push({ action: "agent.resumed", entityType: "agent", entityId: engineer.id, createdAt: iso(env.clock.at - MIN) });
+  await env.watchdog.tick();
+  assert.equal(issue.status, "in_progress");
+  assert.equal(env.logs.filter((l) => /resumed while the helper was starting/.test(l.msg)).length, 1);
+  env.state.save({ force: true });
+
+  // Another restart: the activity log still shows that resume, but its sweep is done.
+  issue.status = "blocked"; // even if the issue was blocked again since
+  const restarted = createWatchdog(env.ctx, createStateStore(env.ctx.config.stateFile));
+  env.clock.at += MIN;
+  await restarted.tick();
+  assert.equal(env.logs.filter((l) => /resumed while the helper was starting/.test(l.msg)).length, 1);
+  assert.equal(env.db.patches.length, 1);
+});
+
+test("at start-up, a resume older than a sweep's lifetime, or one with no pause before it, is not swept", async (t) => {
+  const env = await resumeEnv(t);
+  const old = agent(env.db, { name: "Old" });
+  const noPause = agent(env.db, { name: "No pause" });
+  env.db.activity.push({ action: "agent.paused", entityType: "agent", entityId: old.id, createdAt: iso(env.clock.at - 30 * 60 * MIN) });
+  const oldIssue = recoveryBlock(env.db, old, { at: env.clock.at - 29 * 60 * MIN });
+  env.db.activity.push({ action: "agent.resumed", entityType: "agent", entityId: old.id, createdAt: iso(env.clock.at - 25 * 60 * MIN) });
+  env.db.activity.push({ action: "agent.resumed", entityType: "agent", entityId: noPause.id, createdAt: iso(env.clock.at - MIN) });
+  const noPauseIssue = recoveryBlock(env.db, noPause, { at: env.clock.at - 10 * MIN });
+  await env.watchdog.tick();
+  assert.equal(oldIssue.status, "blocked");
+  assert.equal(noPauseIssue.status, "blocked");
+  assert.equal(env.logs.filter((l) => /resumed while the helper was starting/.test(l.msg)).length, 0);
+});
+
+test("recoveryNotice tells the participant's notice apart; participantRecoveryAction and reviewParticipantOf", () => {
+  const db = { issues: [], issueRuns: {}, recoveryActions: {}, comments: [] };
+  const reviewer = { id: "r1" };
+  const issue = participantBlock(db, reviewer, { at: Date.now() });
+  const [c] = db.comments;
+  assert.deepEqual(recoveryNotice(c), { kind: "participant", actionId: db.recoveryActions[issue.id].id, notInvokable: true });
+  assert.deepEqual(recoveryNotice({ ...c, metadata: null }), { kind: "participant", actionId: null, notInvokable: true });
+  // The failed-reviewer notice is the same cause, but no pause: never "not invokable".
+  assert.equal(recoveryNotice({ ...c, body: PARTICIPANT_RETRIED }).notInvokable, false);
+  assert.equal(recoveryNotice({ ...c, body: PARTICIPANT_RETRIED, metadata: null }), null);
+  assert.equal(recoveryNotice({ ...c, metadata: { ...c.metadata, recoveryResponsibility: "user" } }), null);
+
+  assert.equal(participantRecoveryAction(null), null);
+  assert.equal(participantRecoveryAction({ kind: "stranded_assigned_issue", cause: "execution_review_participant_recovery", ownerType: "board" }), true);
+  assert.equal(participantRecoveryAction({ kind: "stranded_assigned_issue", cause: "stranded_assigned_issue", ownerType: "board" }), false);
+  assert.equal(participantRecoveryAction({ kind: "stranded_assigned_issue", cause: "execution_review_participant_recovery", ownerType: "agent" }), false);
+  assert.equal(pauseRecoveryAction({ kind: "stranded_assigned_issue", cause: "execution_review_participant_recovery", ownerType: "board" }), false);
+
+  assert.equal(reviewParticipantOf(issue), "r1");
+  assert.equal(reviewParticipantOf({ executionState: { status: "changes_requested", currentParticipant: { type: "agent", agentId: "r1" } } }), null);
+  assert.equal(reviewParticipantOf({ executionState: { status: "pending", currentParticipant: { type: "user", userId: "u" } } }), null);
+  assert.equal(reviewParticipantOf({}), null);
 });

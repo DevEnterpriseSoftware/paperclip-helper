@@ -22,16 +22,32 @@ function Install-PaperclipHelper {
 
   # ---------------------------------------------------------------- output and input
 
+  # Colour unless NO_COLOR is set (https://no-color.org): red for the sections, green
+  # for what went right, yellow for warnings, cyan for the value Enter keeps.
+  $UseColor = -not $env:NO_COLOR
+  function Paint([string]$Text, [string]$Color, [switch]$NoNewline) {
+    if ($UseColor -and $Color) { Write-Host $Text -ForegroundColor $Color -NoNewline:$NoNewline }
+    else { Write-Host $Text -NoNewline:$NoNewline }
+  }
   function Say([string]$Text) { Write-Host $Text }
   function Note([string]$Text) { Write-Host "  $Text" }
-  function Warn([string]$Text) { Write-Host "! $Text" -ForegroundColor Yellow }
-  function Die([string]$Text) { Write-Host "x $Text" -ForegroundColor Red; $script:PchDied = $true; throw $Text }
-  function Step([string]$Text) { Write-Host ''; Write-Host "== $Text" -ForegroundColor Cyan }
+  function Ok([string]$Text) { Paint '  + ' Green -NoNewline; Write-Host $Text }
+  function Warn([string]$Text) { Paint "! $Text" Yellow }
+  function Die([string]$Text) { Paint "x $Text" Red; $script:PchDied = $true; throw $Text }
+  function Step([string]$Text) { Write-Host ''; Paint '== ' Red -NoNewline; Paint $Text White }
+  # The question, then the value Enter keeps in [brackets]. A blank line after each
+  # answer keeps one question apart from the next.
+  function Write-Question([string]$Question, [string]$Default, [string]$End = ':') {
+    Paint "$Question " White -NoNewline
+    if ($Default) { Paint "[$Default]" Cyan -NoNewline }
+    Write-Host "$End " -NoNewline
+  }
 
   function Ask([string]$Question, [string]$Default) {
     if ($NonInteractive) { return $Default }
-    $prompt = if ($Default) { "$Question [$Default]" } else { $Question }
-    $answer = Read-Host $prompt
+    Write-Question $Question $Default
+    $answer = Read-Host
+    Write-Host ''
     if ([string]::IsNullOrWhiteSpace($answer)) { return $Default }
     return $answer.Trim()
   }
@@ -44,8 +60,9 @@ function Install-PaperclipHelper {
   # Like Ask, but typing is hidden and the current value is shown masked. Enter keeps it.
   function Ask-Secret([string]$Question, [string]$Current) {
     if ($NonInteractive) { return $Current }
-    $prompt = if ($Current) { "$Question [keep $(Mask $Current)]" } else { $Question }
-    $secure = Read-Host $prompt -AsSecureString
+    Write-Question $Question $(if ($Current) { "keep $(Mask $Current)" } else { '' })
+    $secure = Read-Host -AsSecureString
+    Write-Host ''
     $answer = [System.Net.NetworkCredential]::new('', $secure).Password
     if ([string]::IsNullOrWhiteSpace($answer)) { return $Current }
     return ($answer -replace '\s', '')
@@ -53,8 +70,9 @@ function Install-PaperclipHelper {
 
   function Confirm([string]$Question, [bool]$Default = $true) {
     if ($NonInteractive) { return $Default }
-    $hint = if ($Default) { '[Y/n]' } else { '[y/N]' }
-    $answer = Read-Host "$Question $hint"
+    Write-Question $Question $(if ($Default) { 'Y/n' } else { 'y/N' }) ''
+    $answer = Read-Host
+    Write-Host ''
     if ([string]::IsNullOrWhiteSpace($answer)) { return $Default }
     return $answer.Trim().ToLower().StartsWith('y')
   }
@@ -169,7 +187,7 @@ function Install-PaperclipHelper {
       $result = Invoke-Probe $url $mode
       if ($result.ok) {
         $script:Settings.PAPERCLIP_API = $url; $script:NetMode = $mode
-        Note "Found Paperclip at $url ($($result.deploymentMode) mode, $($mode -replace '^net:', 'network '))"
+        Ok "Found Paperclip at $url ($($result.deploymentMode) mode, $($mode -replace '^net:', 'network '))"
         return $true
       }
       if ($result.code -eq 'hostname_guard') {
@@ -190,6 +208,55 @@ function Install-PaperclipHelper {
     return $false
   }
 
+  # ---------------------------------------------------------------- time zone
+
+  # Codex writes its usage-limit reset times ("try again at 3:45 PM") in local time,
+  # without naming the zone. The helper's container runs on UTC, so the installer
+  # writes this machine's time zone into .env as WATCHDOG_LIMIT_TIME_ZONE.
+
+  # An IANA time zone name from a TZ value, /etc/timezone or a zoneinfo path; empty otherwise.
+  function ConvertTo-IanaZone([string]$Value) {
+    if (-not $Value) { return '' }
+    $z = $Value.Trim().TrimStart(':')
+    $i = $z.LastIndexOf('zoneinfo/')
+    if ($i -ge 0) { $z = $z.Substring($i + 9) }
+    $z = $z -replace '^(posix|right)/', ''
+    if ($z -cmatch '^(UTC|GMT|Etc/[A-Za-z0-9+-]+)$' -or $z -cmatch '^[A-Z][A-Za-z_]+(/[A-Za-z0-9_+-]+)+$') { return $z }
+    return ''
+  }
+
+  # This machine's time zone, or empty when it can't be told.
+  function Get-MachineZone {
+    $z = ConvertTo-IanaZone $env:TZ
+    if ($z) { return $z }
+    $id = [TimeZoneInfo]::Local.Id
+    $z = ConvertTo-IanaZone $id # PowerShell 7 on Linux or macOS
+    if ($z) { return $z }
+    # Windows names its zones its own way ("GMT Standard Time"); .NET 6 and later (PowerShell 7) convert them.
+    try {
+      $iana = $null
+      if ([TimeZoneInfo]::TryConvertWindowsIdToIanaId($id, [ref]$iana)) { $z = ConvertTo-IanaZone $iana }
+    } catch {}
+    if ($z) { return $z }
+    try { $z = ConvertTo-IanaZone ((& node -p 'Intl.DateTimeFormat().resolvedOptions().timeZone' 2>$null) | Select-Object -First 1) } catch {}
+    return $z
+  }
+
+  # Sets WATCHDOG_LIMIT_TIME_ZONE to this machine's time zone when .env doesn't have one.
+  function Set-LimitZone {
+    $s = $script:Settings
+    if ($s.WATCHDOG_LIMIT_TIME_ZONE) {
+      Note "Codex's reset times are read in $($s.WATCHDOG_LIMIT_TIME_ZONE) (WATCHDOG_LIMIT_TIME_ZONE in your settings)."
+      return
+    }
+    $s.WATCHDOG_LIMIT_TIME_ZONE = Get-MachineZone
+    if ($s.WATCHDOG_LIMIT_TIME_ZONE) {
+      Note "Codex's reset times will be read in $($s.WATCHDOG_LIMIT_TIME_ZONE), this machine's time zone."
+    } else {
+      Warn "Couldn't tell this machine's time zone. Set WATCHDOG_LIMIT_TIME_ZONE in $envPath (e.g. Europe/London), or Codex agents at a usage limit may be resumed early or late."
+    }
+  }
+
   # ---------------------------------------------------------------- files
 
   $Managed = @('PCH_UID', 'PCH_GID', 'PCH_IMAGE', 'PAPERCLIP_API', 'PAPERCLIP_PUBLIC_URL', 'RELAY', 'GITHUB_WEBHOOK_SECRET',
@@ -199,7 +266,10 @@ function Install-PaperclipHelper {
     'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'WATCHDOG_CLEAR_DEAD_LINKS', 'WATCHDOG_ROUTE_QUESTIONS',
     'WATCHDOG_CI_RUNS', 'WATCHDOG_CI_RERUN_JOBS', 'WATCHDOG_CI_RERUN_MAX', 'WATCHDOG_DELIVER_ANSWERS', 'WATCHDOG_RETURN_ESCALATED_REVIEWS',
     'WATCHDOG_CANCELLED_BLOCKERS', 'WATCHDOG_RESUME_SWEEP', 'WATCHDOG_RESUME_SWEEP_LIMIT', 'WATCHDOG_RESUME_SETTLE_MIN',
-    'WATCHDOG_LIMIT_PAUSE', 'WATCHDOG_LIMIT_RESUME_GRACE_MIN', 'WATCHDOG_NOTIFY_ISSUE', 'WATCHDOG_STAGES_WIPE', 'COST_SYNC', 'COST_SYNC_SINCE')
+    'WATCHDOG_USAGE_LIMIT_PAUSE', 'WATCHDOG_LIMIT_RESUME_GRACE_MIN', 'WATCHDOG_LIMIT_TIME_ZONE', 'WATCHDOG_NOTIFY_ISSUE', 'WATCHDOG_STAGES_WIPE', 'COST_SYNC', 'COST_SYNC_SINCE')
+
+  # Old names of managed settings: read once (Pick), then dropped from .env.
+  $Retired = @('WATCHDOG_LIMIT_PAUSE')
 
   function Get-EnvText {
     $lines = @(
@@ -207,7 +277,7 @@ function Install-PaperclipHelper {
       '# Change them by re-running the installer, or edit this file and run: docker compose up -d')
     foreach ($key in $Managed) { $lines += "$key=$($script:Settings[$key])" }
     $extra = @()
-    foreach ($key in $script:ExistingEnv.Keys) { if ($Managed -notcontains $key) { $extra += "$key=$($script:ExistingEnv[$key])" } }
+    foreach ($key in $script:ExistingEnv.Keys) { if ($Managed -notcontains $key -and $Retired -notcontains $key) { $extra += "$key=$($script:ExistingEnv[$key])" } }
     if ($extra.Count) { $lines += ''; $lines += '# Your other settings'; $lines += $extra }
     return ($lines -join "`n") + "`n"
   }
@@ -310,7 +380,7 @@ $network
       Warn "$Url didn't answer ($($_.Exception.GetBaseException().Message))."
       return
     } finally { $client.Dispose() }
-    if ($code -eq 405 -and $body -like '*POST only*') { Note "$Url reaches the relay."; return }
+    if ($code -eq 405 -and $body -like '*POST only*') { Ok "$Url reaches the relay."; return }
     if ($body -match 'cloudflareaccess|cf-access|<form|sign in|log in') {
       Warn "$Url shows a login page: an access policy (e.g. Cloudflare Access) is in the way."
       Note 'Add a bypass for exactly this path. GitHub has no identity to log in with; the webhook signature is the lock.'
@@ -355,8 +425,11 @@ $network
 
   # ---------------------------------------------------------------- main
 
-  Write-Host 'Paperclip Helper installer' -ForegroundColor White
-  Say 'Merge-to-approve relay, stalled-work watchdog and subscription cost sync for Paperclip.'
+  Write-Host ''
+  Paint 'Paperclip Helper ' Red -NoNewline; Paint 'installer' White
+  Say "Fixes what a self-hosted Paperclip doesn't recover from by itself: approve agents' work by merging"
+  Say 'their PRs, restart stalled work, pause agents at a usage limit, and record what subscription runs cost.'
+  Paint 'Enter keeps the value in [brackets]. Re-run the installer any time to change an answer.' DarkGray
 
   Step 'Checking Docker'
   if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { Die 'Docker is required: install Docker Desktop (https://docs.docker.com/desktop/) or another Docker engine.' }
@@ -372,7 +445,7 @@ $network
   $engineOs = (Invoke-Docker info --format '{{.OperatingSystem}}').Text.Trim()
   $script:VmEngine = $OnWindows -or $IsMacOS -or ($engineOs -match 'docker desktop|rancher|colima|orbstack|lima|podman')
   $vmNote = if ($script:VmEngine) { ' (runs in a VM: bridge networking)' } else { '' }
-  Note "Docker: $((Invoke-Docker version --format '{{.Server.Version}}').Text.Trim()) on $engineOs$vmNote"
+  Ok "Docker $((Invoke-Docker version --format '{{.Server.Version}}').Text.Trim()) on $engineOs$vmNote"
 
   Step 'Install directory'
   $defaultDir = if ($env:PCH_DIR) { $env:PCH_DIR } else { Join-Path $HOME 'paperclip-helper' }
@@ -397,7 +470,7 @@ $network
     if ((Invoke-Docker image inspect $Image).Code -ne 0) { Die "Couldn't pull ${Image}: $(($pull.Text -split "`n")[-1])" }
     Warn "Couldn't pull $Image; using the copy already on this machine."
   }
-  Note "Image $((Invoke-Docker run --rm $Image version).Text.Trim())"
+  Ok "Image $((Invoke-Docker run --rm $Image version).Text.Trim())"
 
   Step 'Finding Paperclip'
   $s.PAPERCLIP_API = Pick 'PAPERCLIP_API'
@@ -539,12 +612,16 @@ $network
   $s.WATCHDOG_RESUME_SWEEP = Pick 'WATCHDOG_RESUME_SWEEP' 'true'
   $s.WATCHDOG_RESUME_SWEEP_LIMIT = Pick 'WATCHDOG_RESUME_SWEEP_LIMIT' '0'
   $s.WATCHDOG_RESUME_SETTLE_MIN = Pick 'WATCHDOG_RESUME_SETTLE_MIN' '10'
-  $s.WATCHDOG_LIMIT_PAUSE = Pick 'WATCHDOG_LIMIT_PAUSE' 'true'
+  # WATCHDOG_LIMIT_PAUSE: the setting's name before 1.12.
+  $s.WATCHDOG_USAGE_LIMIT_PAUSE = Pick 'WATCHDOG_USAGE_LIMIT_PAUSE' (Pick 'WATCHDOG_LIMIT_PAUSE' 'true')
   $s.WATCHDOG_LIMIT_RESUME_GRACE_MIN = Pick 'WATCHDOG_LIMIT_RESUME_GRACE_MIN' '5'
+  $s.WATCHDOG_LIMIT_TIME_ZONE = Pick 'WATCHDOG_LIMIT_TIME_ZONE' ''
   $s.WATCHDOG_NOTIFY_ISSUE = Pick 'WATCHDOG_NOTIFY_ISSUE' ''
   $s.WATCHDOG_STAGES_WIPE = Pick 'WATCHDOG_STAGES_WIPE' 'true'
-  Say 'It comments on issues whose hand-off wake Paperclip dropped, or whose blockers finished without'
-  Say 'anything picking them up, and repairs blockers stuck on a failed workspace clean-up.'
+  Say 'Paperclip loses track of work in a few known ways: a hand-off whose wake is dropped, blockers that'
+  Say 'finish without anything picking the issue up, holds nobody can release. Every minute the watchdog'
+  Say 'looks for these and wakes the right agent. Below, each check can be turned off on its own.'
+  Say ''
   if (Confirm 'Turn the watchdog on?' (Truthy $s.WATCHDOG)) {
     $s.WATCHDOG = 'true'
     if (Confirm 'Adjust its timing?' $false) {
@@ -552,6 +629,7 @@ $network
       $s.WATCHDOG_STALL_SEC = Ask 'Act after an issue has been quiet for (seconds)' $s.WATCHDOG_STALL_SEC
       $s.WATCHDOG_MAX_NUDGES = Ask 'Nudge comments per stalled issue' $s.WATCHDOG_MAX_NUDGES
     }
+    Say 'A done blocker whose workspace clean-up failed keeps its dependants blocked for good.'
     $s.WATCHDOG_HEAL_FAILED_FINALIZE = if (Confirm 'Repair blockers stuck on a failed workspace clean-up?' (Truthy $s.WATCHDOG_HEAL_FAILED_FINALIZE)) { 'true' } else { 'false' }
     Say 'A wake deferred behind a stopped run waits forever. Paperclip''s "send queued messages now" retries it.'
     $s.WATCHDOG_RETRY_DEFERRED = if (Confirm 'Press it for such wakes (never interrupts a running run)?' (Truthy $s.WATCHDOG_RETRY_DEFERRED)) { 'true' } else { 'false' }
@@ -576,13 +654,16 @@ $network
     $s.WATCHDOG_DELIVER_ANSWERS = if (Confirm 'Return such an issue to the agent with your answer (your "changes requested")?' (Truthy $s.WATCHDOG_DELIVER_ANSWERS)) { 'true' } else { 'false' }
     Say 'After 3 agent change requests in a row, Paperclip hands a review to you instead of back to the implementer.'
     $s.WATCHDOG_RETURN_ESCALATED_REVIEWS = if (Confirm "Return such reviews to the implementer (at most $($s.WATCHDOG_MAX_NUDGES) times per issue)?" (Truthy $s.WATCHDOG_RETURN_ESCALATED_REVIEWS)) { 'true' } else { 'false' }
-    $s.WATCHDOG_CANCELLED_BLOCKERS = if (Confirm 'Tell an agent when its issue is blocked by a cancelled issue (Paperclip never counts it resolved)?' (Truthy $s.WATCHDOG_CANCELLED_BLOCKERS)) { 'true' } else { 'false' }
+    Say 'Paperclip never counts a cancelled blocker as resolved, so its dependants stay blocked.'
+    $s.WATCHDOG_CANCELLED_BLOCKERS = if (Confirm 'Tell the dependant''s agent why the blocker was cancelled, so it can remove or replace it?' (Truthy $s.WATCHDOG_CANCELLED_BLOCKERS)) { 'true' } else { 'false' }
     Say 'Pausing an agent with runs queued makes Paperclip block those issues, and resuming it restarts none of them.'
     $s.WATCHDOG_RESUME_SWEEP = if (Confirm 'Restore such issues when the agent is resumed (a few at a time; others are never touched)?' (Truthy $s.WATCHDOG_RESUME_SWEEP)) { 'true' } else { 'false' }
-    Say 'At a Claude usage limit every Claude agent''s next run fails, and Paperclip keeps retrying them.'
-    $s.WATCHDOG_LIMIT_PAUSE = if (Confirm 'Pause the Claude agents on that account (each once idle) and resume them when the limit resets?' (Truthy $s.WATCHDOG_LIMIT_PAUSE)) { 'true' } else { 'false' }
-    Say 'Some things only the board can settle: a usage-limit pause, wiped review stages, a merge-queue drop.'
+    Say 'When a plan hits its usage limit (Claude or Codex), every agent on it fails its next run, and Paperclip keeps retrying them.'
+    $s.WATCHDOG_USAGE_LIMIT_PAUSE = if (Confirm 'Pause the agents on a plan that hits its usage limit (each once idle) and resume them when it resets?' (Truthy $s.WATCHDOG_USAGE_LIMIT_PAUSE)) { 'true' } else { 'false' }
+    if (Truthy $s.WATCHDOG_USAGE_LIMIT_PAUSE) { Set-LimitZone }
+    Say 'Some things only you can settle: a usage-limit pause, wiped review stages, a merge-queue drop.'
     Say 'The helper always logs them; it can also comment on an issue you watch (in the same company).'
+    Say 'Pick one assigned to a person or to nobody: a comment wakes an agent assignee.'
     $s.WATCHDOG_NOTIFY_ISSUE = Ask 'Issue for the helper''s notes to you, e.g. ACM-12 (empty: the log only)' $s.WATCHDOG_NOTIFY_ISSUE
   } else {
     $s.WATCHDOG = 'false'
@@ -650,7 +731,7 @@ $network
       if ($ghReady -and (Confirm "Create or update the webhook on $($s.GITHUB_REPOS) with gh?" $true)) {
         New-Webhooks $webhookUrl
         Start-Sleep -Seconds 4
-        if ((Invoke-Docker compose -f $composePath logs --no-log-prefix --since 30s helper).Text -match '"event":"ping"') { Note "The relay received GitHub's ping." }
+        if ((Invoke-Docker compose -f $composePath logs --no-log-prefix --since 30s helper).Text -match '"event":"ping"') { Ok "The relay received GitHub's ping." }
       } else {
         Show-ManualWebhook $webhookUrl
       }
@@ -668,7 +749,9 @@ $network
   Set-Item -Path Function:global:pch -Value $pchBody
 
   Step 'Done'
-  Say 'The helper runs in the background and restarts with Docker. Try:'
+  Ok 'Paperclip Helper is running. It runs in the background and restarts with Docker.'
+  Say ''
+  Say 'Try:'
   Say '  pch status         what it is doing'
   Say '  pch why ISSUE-1    why nobody is working on an issue'
   Say '  pch help           every command'

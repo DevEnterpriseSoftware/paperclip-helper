@@ -23,7 +23,7 @@ src/
   release.mjs       watchdog 7 and `pch release`: holds Paperclip can't release
   workspace.mjs     watchdog 8, 9 and `pch workspace`: workspace links
   resume.mjs        watchdog 15: issues blocked while their agent was paused
-  limits.mjs        watchdog 16: Claude usage limits
+  limits.mjs        watchdog 16: usage limits (a recogniser per adapter)
   stages.mjs        watchdog 17: wiped review stages
   board-note.mjs    notes for the board (log, and WATCHDOG_NOTIFY_ISSUE)
   cost-sync.mjs     API-equivalent cost events
@@ -41,6 +41,7 @@ test/
   fake-paperclip.mjs   an in-memory Paperclip for the tests
   fake-github.mjs      an in-memory GitHub for the tests
   helpers.mjs          shared test set-up
+  fixtures/            messages the usage-limit recognisers tell apart, word for word from their source
   *.test.mjs
   compat/              the same code against a real Paperclip, one version at a time
 docs/paperclip-internals.md   the Paperclip API facts the helper relies on
