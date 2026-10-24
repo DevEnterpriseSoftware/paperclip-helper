@@ -1,6 +1,6 @@
 # The `pch` commands
 
-`pch <command>` runs a throwaway container next to the service (`docker compose run --rm helper <command>`). The exception is `pch update`, which runs on the host, because the container can't pull its own image.
+`pch <command>` runs a throwaway container next to the service (`docker compose run --rm helper <command>`). The exception is `pch update`, which runs on the host, because the container can't pull its own image. `pch` on its own prints the list of commands.
 
 | Command | What it does |
 |---|---|
@@ -21,6 +21,7 @@
 | `pch costs --audit [--days N]` | Checks the cost figures of the last N days (default 7): tokens, reported cost, what the tokens cost at list price, what cost sync posts, and duplicates. Changes nothing. See [cost sync](cost-sync.md#checking-the-figures). |
 | `pch models` | Every agent's adapter, model, effort and status. |
 | `pch set-model FROM TO [--apply]` | Moves every agent on model `FROM` to `TO`. It previews unless you pass `--apply`. |
+| `pch run` | Runs the service in the foreground, as its container does. It refuses to start while another helper is running on the same data directory (see [Troubleshooting](troubleshooting.md)). You don't need it with the installer's setup: the service already runs in its own container. |
 | `pch login`, `pch revoke` | Create the helper's key; revoke and delete it. |
 | `pch secret` | Prints a random webhook secret. |
 | `pch update` | Updates the helper to the latest release of its major version, and restarts it (see [Upgrading](install.md#upgrading)). It doesn't update Paperclip. |

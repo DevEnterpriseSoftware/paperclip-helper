@@ -3,7 +3,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { readJson } from "./store.mjs";
+import { readStatus, serviceLive } from "./instance.mjs";
 import { createGitHub, tokenSource } from "./github.mjs";
 import { companyAgents, companyPrefixes } from "./paperclip.mjs";
 import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, plural, signed } from "./util.mjs";
@@ -27,7 +27,7 @@ import { excerpt } from "./advice.mjs";
 
 export const USAGE = `Paperclip Helper: fixes what a self-hosted Paperclip doesn't recover from by itself.
 
-Usage: pch [command]   (no command: run every enabled component, as the container does)
+Usage: pch <command>
 
 What's going on
   status                     what the running helper is doing, and when its key expires
@@ -60,6 +60,8 @@ Costs
   costs --audit [--days N]   check the last N days' cost figures (default 7; changes nothing)
 
 Setup
+  run                        run the service in the foreground, as its container does
+                             (refuses while another helper runs on the same data directory)
   login                      create the helper's board API key (approve it in the browser)
   revoke                     revoke the key and delete it
   secret                     print a random webhook secret for GITHUB_WEBHOOK_SECRET
@@ -590,10 +592,6 @@ export async function costs(ctx, { sessions = false, audit = false, days = 7, gi
 
 // ---------------------------------------------------------------- status / health
 
-export function readStatus(config) {
-  return readJson(config.statusFile, null);
-}
-
 function ago(iso) {
   if (!iso) return "never";
   const s = Math.round((Date.now() - Date.parse(iso)) / 1000);
@@ -613,23 +611,22 @@ export async function paperclipBuild(ctx) {
   return [version, commit].filter(Boolean).join(", ") || null;
 }
 
-// The service writes its status every 30 s; one older than this means it has stopped.
-const HEARTBEAT_STALE_MS = 120_000;
-
 // A count worth showing, in words: "3 nudges", or nothing for zero.
 const counted = (n, one, many) => (n ? plural(n, one, many) : null);
 const since = (iso) => (iso ? `${iso.slice(0, 16).replace("T", " ")} UTC` : "?");
 
 export async function status(ctx) {
   const s = readStatus(ctx.config);
-  const stale = !s || Date.now() - Date.parse(s.heartbeatAt ?? 0) > HEARTBEAT_STALE_MS;
+  const stale = !serviceLive(s);
   if (!s) {
     out("The helper service has not written a status yet: is it running? (docker compose ps, docker compose logs)");
   } else {
     out(
-      stale
-        ? `Paperclip Helper ${s.version}: NOT RUNNING. Its last heartbeat was ${ago(s.heartbeatAt)} (started ${since(s.startedAt)}).`
-        : `Paperclip Helper ${s.version}: running since ${since(s.startedAt)}.`,
+      s.stoppedAt
+        ? `Paperclip Helper ${s.version}: NOT RUNNING. It stopped at ${since(s.stoppedAt)} (started ${since(s.startedAt)}).`
+        : stale
+          ? `Paperclip Helper ${s.version}: NOT RUNNING. Its last heartbeat was ${ago(s.heartbeatAt)} (started ${since(s.startedAt)}).`
+          : `Paperclip Helper ${s.version}: running since ${since(s.startedAt)}.`,
     );
     if (s.dryRun) out("DRY RUN: components log what they would do and change nothing.");
     const r = s.relay;
@@ -692,7 +689,7 @@ export async function status(ctx) {
 // Docker HEALTHCHECK: the service's heartbeat is fresh and the relay answers.
 export async function health(ctx) {
   const s = readStatus(ctx.config);
-  if (!s || Date.now() - Date.parse(s.heartbeatAt ?? 0) > HEARTBEAT_STALE_MS) throw new Error("no recent heartbeat from the service");
+  if (!serviceLive(s)) throw new Error(s?.stoppedAt ? "the service has stopped" : "no recent heartbeat from the service");
   if (s.relay?.on) {
     const host = ["0.0.0.0", "::", ""].includes(ctx.config.listenHost) ? "127.0.0.1" : ctx.config.listenHost;
     const res = await fetch(`http://${host.includes(":") ? `[${host}]` : host}:${ctx.config.listenPort}/healthz`, {

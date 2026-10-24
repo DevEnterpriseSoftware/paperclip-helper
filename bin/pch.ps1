@@ -10,8 +10,12 @@
 $ErrorActionPreference = 'Continue'
 $composeFile = Join-Path $PSScriptRoot 'compose.yml'
 
-if ($args.Count -eq 0 -or $args[0] -ne 'update') {
-  docker compose -f $composeFile run --rm helper @args
+# No command shows the help. The service runs in its own container (docker compose
+# up -d); starting it here as well would run a second copy beside it.
+$pchArgs = @(if ($args.Count -eq 0) { 'help' } else { $args })
+
+if ($pchArgs[0] -ne 'update') {
+  docker compose -f $composeFile run --rm helper @pchArgs
   exit $LASTEXITCODE
 }
 

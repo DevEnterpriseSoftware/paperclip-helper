@@ -9,7 +9,11 @@
 dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 1
 compose_file="$dir/compose.yml"
 
-if [ "${1:-}" != update ]; then
+# No command shows the help. The service runs in its own container (docker compose
+# up -d); starting it here as well would run a second copy beside it.
+[ $# -gt 0 ] || set -- help
+
+if [ "$1" != update ]; then
   exec docker compose -f "$compose_file" run --rm helper "$@"
 fi
 

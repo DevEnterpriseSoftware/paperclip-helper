@@ -37,6 +37,7 @@ src/
   usage.mjs         `pch usage`
   answer.mjs        `pch answer`
   store.mjs         small JSON state files, written atomically
+  instance.mjs      the service's heartbeat, and whether another helper is already running
   util.mjs          small shared helpers
   log.mjs           one JSON line per event, with secrets masked
 test/

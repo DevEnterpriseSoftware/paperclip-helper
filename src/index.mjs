@@ -17,8 +17,7 @@ import { createWatchdog } from "./watchdog.mjs";
 import { createCostSync } from "./cost-sync.mjs";
 import * as cmd from "./commands.mjs";
 import { parseCommandLine, SPECS } from "./args.mjs";
-
-const HEARTBEAT_MS = 30_000;
+import { HEARTBEAT_MS, otherInstance } from "./instance.mjs";
 
 // Set once the service starts: from then on, even a crash is a JSON log line.
 let serviceLog = null;
@@ -26,8 +25,10 @@ let serviceLog = null;
 async function runService(ctx) {
   const { config, log } = ctx;
   serviceLog = log;
+  let markStopped = null;
   const crash = (err) => {
     log.error("paperclip helper crashed", { error: err?.message ?? String(err), stack: err?.stack ?? null });
+    markStopped?.();
     process.exit(1);
   };
   process.on("uncaughtException", crash);
@@ -36,6 +37,15 @@ async function runService(ctx) {
   if (!ctx.readToken()) problems.push(`no board API key in ${config.tokenFile}: run \`pch login\` first`);
   if (problems.length) {
     for (const p of problems) log.error(`config: ${p}`);
+    process.exit(1);
+  }
+  const other = await otherInstance(config, { log });
+  if (other) {
+    log.error("another Paperclip Helper is already running on this data directory: see `pch status`", {
+      startedAt: other.startedAt ?? null,
+      heartbeatAt: other.heartbeatAt,
+      statusFile: config.statusFile,
+    });
     process.exit(1);
   }
   if (config.relayAuto && !config.relay) {
@@ -76,14 +86,18 @@ async function runService(ctx) {
     try {
       await relay.start();
     } catch (err) {
-      log.error(`relay could not listen on ${config.listenHost}:${config.listenPort}`, { error: err.message });
+      const why =
+        err.code === "EADDRINUSE"
+          ? ": something already listens there. `pch status` shows whether a helper is running; if not, another program has the port (or set RELAY_PORT)"
+          : "";
+      log.error(`relay could not listen on ${config.listenHost}:${config.listenPort}${why}`, { error: err.message });
       process.exit(1);
     }
   }
   watchdog?.start();
   costSync?.start();
 
-  const writeStatus = () => {
+  const writeStatus = (extra = {}) => {
     try {
       writeJson(config.statusFile, {
         version: VERSION,
@@ -96,12 +110,15 @@ async function runService(ctx) {
         relay: relay ? { on: true, ...relay.stats } : { on: false },
         watchdog: watchdog ? { on: true, ...watchdog.stats } : { on: false },
         costSync: costSync ? { on: true, ...costSync.stats } : { on: false },
+        ...extra,
       });
     } catch (err) {
       log.error("could not write the status file", { file: config.statusFile, error: err.message });
     }
   };
   writeStatus();
+  // So the next start, and `pch status`, know this one has gone without waiting out its heartbeat.
+  markStopped = () => writeStatus({ stoppedAt: new Date().toISOString() });
   const heartbeat = setInterval(writeStatus, HEARTBEAT_MS);
   const hourly = setInterval(refreshIdentity, 60 * 60 * 1000);
 
@@ -118,6 +135,7 @@ async function runService(ctx) {
     try {
       state.save({ force: true });
     } catch {}
+    markStopped();
     process.exit(0);
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));

@@ -8,6 +8,8 @@ Start with `pch status` and, for a stuck issue, `pch why ISSUE`.
 | `cannot reach Paperclip at http://127.0.0.1:3100` | From a container, `127.0.0.1` is the host only with `network_mode: host`. Check `PAPERCLIP_API`, or re-run the installer. |
 | `Paperclip rejected the helper's board key` | It expired or was revoked. Run `pch login`. |
 | `config: …` lines, and the container restarts | A setting is missing or invalid. The line names it. |
+| `another Paperclip Helper is already running on this data directory` | A second copy of the service (`pch run`, or a bare `pch` from an older `pch` script) found the first one's heartbeat in `data/status.json`, and stopped before doing anything, so agents aren't nudged and costs aren't posted twice. Nothing to fix: `pch status` shows the one that is running. A start right after a crash can wait up to 40 seconds while it checks that the old one's heartbeat has stopped. |
+| `relay could not listen on 127.0.0.1:3110: something already listens there` | Another program has the relay's port, or a helper with another data directory does. `pch status` shows whether this helper is running. Stop the other program, or set `RELAY_PORT` to a free port and point the webhook (or tunnel) at it. |
 | Deliveries show 401 in GitHub | The webhook secret doesn't match `GITHUB_WEBHOOK_SECRET`. |
 | A delivery shows **202** with `still working after 8s` | The relay was still looking for the PR's issues when GitHub's 10 seconds were nearly up, so it answered and carried on. The log's `relay: handled` (or `relay: failed`) line for that delivery id says what it did. A failed one can be redelivered. |
 | A delivery failed with `Task is paused` | Paperclip refuses comments on a paused task. Resume it, then **Redeliver** in GitHub. |
