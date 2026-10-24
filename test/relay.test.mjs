@@ -471,3 +471,54 @@ test("every message ends with one italic line naming the helper, and only one", 
   });
   assert.match(db.comments.at(-1).body, ends); // copied PR comment
 });
+
+// ---------------------------------------------------------------- failures that must not lose a decision
+
+test("Paperclip failing while the relay looks for the issue fails the delivery, so a Redeliver approves it", async (t) => {
+  const env = await relayEnv(t);
+  const { relay, db, fake } = env;
+  const { child } = seed(db);
+  const port = await relay.start();
+  t.after(() => relay.stop());
+  const payload = JSON.stringify({ action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  const deliver = () =>
+    fetch(`http://127.0.0.1:${port}/hooks/github`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-github-event": "pull_request", "x-github-delivery": "d-down", "x-hub-signature-256": sign(SECRET, payload) },
+      body: payload,
+    });
+  // Paperclip answers 503 to every issue read (twice: GETs are retried once).
+  fake.fail("GET", /^\/api\/issues\/ACM-1$/, 503, { times: 2 });
+  const failed = await deliver();
+  assert.equal(failed.status, 502, "not 'no Paperclip issue found'");
+  assert.equal(db.comments.length, 0);
+  assert.equal(child.status, "in_review");
+  // The delivery was forgotten on disk too.
+  assert.equal(createStateStore(env.ctx.config.stateFile).deliveries.has("d-down"), false);
+  const redelivered = await deliver();
+  assert.equal(redelivered.status, 200);
+  assert.equal(child.status, "done");
+});
+
+test("an issue that doesn't exist is still 'not found', not a failure", async (t) => {
+  const { relay } = await relayEnv(t);
+  const r = await relay.handle("pull_request", { action: "closed", pull_request: pr({ title: "ACM-99: gone", head: { ref: "x" }, body: "" }), repository: repo, sender: owner });
+  assert.equal(r.action, "none");
+  assert.match(r.reason, /no Paperclip issue found/);
+});
+
+test("a merge whose issue isn't waiting on you says so, and doesn't read as an approval", async (t) => {
+  const { relay, db } = await relayEnv(t);
+  const { child } = seed(db);
+  child.executionState = { status: "pending", currentStageType: "review", currentParticipant: { type: "agent", agentId: "a1" } };
+  await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  const [note] = db.comments;
+  assert.doesNotMatch(note.body, /^Approved:/);
+  assert.match(note.body, /^PR #8 merged into `main` by @owner/);
+  assert.match(note.body, /_Not recorded as a decision: it is in_progress with no stage waiting on you\._/);
+});
+
+test("an organisation webhook's ping, which names no repository, is answered", async (t) => {
+  const { relay } = await relayEnv(t);
+  assert.deepEqual(await relay.handle("ping", { zen: "Keep it logically awesome.", hook: { type: "Organization" } }), { pong: true, zen: "Keep it logically awesome." });
+});

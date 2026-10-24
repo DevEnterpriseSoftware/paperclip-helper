@@ -112,7 +112,8 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       const host = (req.headers.host ?? "").replace(/:\d+$/, "");
       if (!allowedHosts.includes(host)) return send(403, { error: GUARD });
     }
-    const failure = failures.find((f) => f.method === req.method && f.path.test(p) && f.times !== 0);
+    // A failure matches the path, or the path with its query (to fail one listing).
+    const failure = failures.find((f) => f.method === req.method && (f.path.test(p) || f.path.test(p + url.search)) && f.times !== 0);
     if (failure) {
       if (failure.times > 0) failure.times -= 1;
       if (failure.hang) return; // never answer

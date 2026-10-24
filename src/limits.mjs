@@ -298,7 +298,8 @@ const CODEX = {
 };
 
 export const RECOGNISERS = new Map([CLAUDE, CODEX].map((r) => [r.adapterType, r]));
-const labelOf = (adapterType) => RECOGNISERS.get(adapterType)?.label ?? adapterType ?? "agent";
+// "Claude", "Codex": the adapter as the board knows it.
+export const labelOf = (adapterType) => RECOGNISERS.get(adapterType)?.label ?? adapterType ?? "agent";
 
 // The account an agent's runs are billed to, for any adapter with a recogniser; null otherwise.
 export function accountOf(agent) {

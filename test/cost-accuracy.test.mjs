@@ -221,7 +221,8 @@ test("with idempotency keys, a post whose answer never came is posted again and 
     if (items.some((i) => i.heartbeatRunId === second.id)) e.db.hangAfterRecording = 1;
     return n;
   };
-  await assert.rejects(e.sync.tick());
+  await e.sync.tick(); // the company's pass stops there; the tick carries on
+  assert.ok(e.sync.stats.lastError);
   assert.equal(e.db.costEvents.length, 2, "both recorded");
   const state = JSON.parse(fs.readFileSync(e.ctx.config.costStateFile, "utf8"));
   assert.equal(state.idempotent, true);
@@ -273,7 +274,8 @@ test("a Paperclip that stops keeping keys is noticed, and lost posts aren't repe
     if (items.some((i) => i.heartbeatRunId === third.id)) e.db.hangAfterRecording = 1;
     return n;
   };
-  await assert.rejects(e.sync.tick());
+  await e.sync.tick(); // the company's pass stops there; the tick carries on
+  assert.ok(e.sync.stats.lastError);
   await e.sync.tick();
   assert.equal(e.db.costEvents.filter((ev) => ev.heartbeatRunId === third.id).length, 1, "not posted twice");
   assert.ok(e.posted().has(second.id));

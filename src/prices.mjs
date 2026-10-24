@@ -21,7 +21,7 @@
 // A model in the file replaces that model's whole built-in list, so include every
 // period you want priced.
 
-import { readJson } from "./store.mjs";
+import fs from "node:fs";
 
 export const BUILTIN_PRICES = {
   checked: "2026-10-24",
@@ -103,14 +103,17 @@ export function normalizeModel(model) {
 export function loadPrices(file, log) {
   const table = { models: { ...BUILTIN_PRICES.models }, aliases: { ...BUILTIN_PRICES.aliases } };
   if (!file) return table;
+  // Read here rather than with readJson: a malformed file must be reported and left
+  // where it is for you to fix, not renamed aside.
   let custom;
   try {
-    custom = readJson(file, null);
+    custom = JSON.parse(fs.readFileSync(file, "utf8"));
   } catch (err) {
-    log?.warn?.("cost sync: could not read the prices file", { file, error: err.message });
+    if (err.code === "ENOENT") return table;
+    log?.warn?.("cost sync: could not read the prices file; using the built-in prices", { file, error: err.message });
     return table;
   }
-  if (!custom) return table;
+  if (!custom || typeof custom !== "object") return table;
   for (const [model, entries] of Object.entries(custom.models ?? {})) {
     if (!Array.isArray(entries) || !entries.every(validEntry)) {
       log?.warn?.("cost sync: ignoring a malformed price", { file, model });

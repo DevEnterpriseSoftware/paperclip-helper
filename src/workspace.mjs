@@ -17,6 +17,8 @@
 // isolated workspace": clear the link, so the next run gets a fresh worktree.
 // `pch workspace`, `pch why` and the watchdog share this module.
 
+import { ACTIVE_RUN } from "./util.mjs";
+
 const UUID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
 // The run error Paperclip records when the linked workspace can't be restored
@@ -27,7 +29,6 @@ export const DEAD_LINK_ERROR = new RegExp(
 );
 
 const OPEN = (status) => status !== "done" && status !== "cancelled";
-const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
 
 // The change "New isolated workspace" in the issue's Workspace picker makes
 // (buildWorkspaceSelectionUpdate, ui/src/lib/issue-workspace-selection.ts),

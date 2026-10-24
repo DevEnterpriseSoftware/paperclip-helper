@@ -9,11 +9,11 @@
 // you when it is waiting on an agent, or the other way round.
 
 import { companyAgents, listIssues } from "./paperclip.mjs";
-import { approvalWaitingOn, mapLimit, ts } from "./util.mjs";
+import { approvalWaitingOn, CLOSED_STATUSES, mapLimit, ts } from "./util.mjs";
 import { cardText, pendingCards, QUESTION_STATUSES, strandedCard } from "./questions.mjs";
 import { readJson } from "./store.mjs";
 
-const CLOSED = new Set(["done", "cancelled"]);
+const CLOSED = CLOSED_STATUSES;
 const CONCURRENCY = 6;
 
 // Why one blocked issue is blocked, from Paperclip's blocker diagnostics, its

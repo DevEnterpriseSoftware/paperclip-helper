@@ -119,15 +119,18 @@ Recommendation: Paperclip's recovery parked this issue for a board decision: it 
 
 The recommendation names what is going on, gives the steps as commands you can paste, and says whether [the watchdog](watchdog.md) does it by itself or leaves it to you. It covers, in this order:
 
-- an assignee that is paused, terminated or awaiting approval;
+- an assignee the watchdog paused at a usage limit (until when), or one that is paused, terminated or awaiting approval (and whether the resume sweep restores its issues);
 - a run that is working, about to start, or has sat queued for more than ten minutes;
-- a review or approval waiting on you;
 - a link to a closed workspace, which fails every run at setup;
-- an execution hold, and an issue Paperclip's recovery parked;
+- a review Paperclip escalated to you after its review-round limit, or a review or approval waiting on you;
+- an execution hold;
+- a last run that hit its plan's usage limit (Claude or Codex, with the reset time);
+- a review blocked because its participant couldn't be woken, and any other issue Paperclip's recovery parked;
 - saved messages waiting behind an earlier run;
 - a question card the asker waits on: one Paperclip never delivered to the teammate it's addressed to (with the issue the watchdog routed it to), or one for you;
-- a blocked issue: waiting on open blockers, on a workspace clean-up, with every blocker done, blocked by an agent over another issue's workspace or with a note of its own, or an agent re-running every few minutes while it waits on you;
-- a dropped hand-off, runs Paperclip refused before they started, a failed run, and a run that finished without moving the issue on.
+- a blocked issue: waiting on open blockers, on a workspace clean-up, on a cancelled blocker (which Paperclip never counts as resolved), with every blocker done, blocked by an agent over another issue's workspace or with a note of its own, or an agent re-running every few minutes while it waits on you;
+- an issue in review with no review stage pending (and who removed its stages, when an agent's update did);
+- a dropped hand-off, runs Paperclip refused before they started, a run that failed (or only met a busy model, which Paperclip retries), a run that finished waiting on a CI run, and a run that finished without moving the issue on.
 
 It is a set of rules over what Paperclip reports, not a judgement: it quotes the agent's last note where the answer is in there, and it can be wrong about a case nobody has met yet.
 

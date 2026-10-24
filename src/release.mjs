@@ -13,10 +13,10 @@
 // hold, after you've looked; the watchdog only for one Paperclip can never
 // settle by itself.
 
+import { ACTIVE_RUN, TERMINAL_RUN } from "./util.mjs";
+
 export const RECONCILIATION_CAUSE = "legacy_execution_requires_reconciliation";
 export const RELEASE_OUTCOMES = ["mixed", "completed", "not_performed"];
-const TERMINAL_RUN = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
-const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
 
 // Whether a process with this id exists here. Only meaningful when the helper
 // runs on Paperclip's host; anywhere else it says nothing either way.

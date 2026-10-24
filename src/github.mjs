@@ -20,10 +20,11 @@
 import fs from "node:fs";
 
 export class GitHubError extends Error {
-  constructor(message, { status = 0, method, path } = {}) {
+  constructor(message, { status = 0, method, path, retryAfter = null } = {}) {
     super(message);
     this.name = "GitHubError";
     this.status = status;
+    this.retryAfter = retryAfter;
     this.method = method;
     this.path = path;
   }
@@ -62,7 +63,12 @@ function minutesSinceWritten(file) {
   }
 }
 
-export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {}) {
+// A read GitHub may answer on a second try: a dropped connection, a 5xx, or a
+// secondary rate limit that names a short wait (Retry-After, in seconds).
+const RETRY_WAIT_MS = 1_000;
+const MAX_RETRY_AFTER_SEC = 10;
+
+export function createGitHub({ config, log, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
   const base = config.githubApi;
   const timeoutMs = config.timeoutSec * 1000;
   const source = tokenSource(config);
@@ -71,7 +77,7 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
 
   function explain(method, path, res, data, text) {
     const detail = data && typeof data === "object" && data.message ? String(data.message) : String(text ?? "").slice(0, 300);
-    const meta = { status: res.status, method, path };
+    const meta = { status: res.status, method, path, retryAfter: res.headers.get("retry-after") };
     if (res.status === 401) {
       if (config.githubTokenFile) {
         const age = minutesSinceWritten(config.githubTokenFile);
@@ -82,12 +88,20 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
       }
       return new GitHubError(`GitHub rejected GITHUB_TOKEN (${detail}). It may have expired or been revoked: create a new one.`, meta);
     }
-    if (res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0") {
+    if ((res.status === 403 || res.status === 429) && (res.headers.get("x-ratelimit-remaining") === "0" || res.headers.get("retry-after"))) {
       return new GitHubError(`GitHub's rate limit for ${source} is used up (${detail}).`, meta);
     }
     if (res.status === 403 || res.status === 404) {
       const need = method === "GET" ? "read" : "read and write";
-      const scope = /\/actions\//.test(path) ? "Actions" : /^\/repos\/[^/]+\/[^/]+$/.test(path) ? "Metadata" : "Pull requests";
+      const scope = /\/actions\//.test(path)
+        ? "Actions"
+        : /\/check-runs|\/check-suites/.test(path)
+          ? "Checks"
+          : /\/branches\/|\/contents\//.test(path)
+            ? "Contents"
+            : /^\/repos\/[^/]+\/[^/]+$/.test(path)
+              ? "Metadata"
+              : "Pull requests";
       return new GitHubError(
         `${method} ${path} → ${res.status}: ${detail}. ${source} needs "${scope}: ${need}" on this repository.`,
         meta,
@@ -97,6 +111,29 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch } = {})
   }
 
   async function request(method, path, body) {
+    // Only reads are retried: a write that may have happened must not happen twice.
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await requestOnce(method, path, body);
+      } catch (err) {
+        const wait = retryWait(err);
+        if (method !== "GET" || attempt > 1 || wait === null) throw err;
+        log?.debug?.("github: retrying a read", { path, status: err.status ?? null, waitMs: wait });
+        await sleep(wait);
+      }
+    }
+  }
+
+  // How long to wait before retrying, or null when a retry won't help.
+  function retryWait(err) {
+    if (!err.status) return RETRY_WAIT_MS; // couldn't reach GitHub
+    if (err.status >= 500) return RETRY_WAIT_MS;
+    const after = Number(err.retryAfter);
+    if ((err.status === 403 || err.status === 429) && after > 0 && after <= MAX_RETRY_AFTER_SEC) return after * 1000;
+    return null;
+  }
+
+  async function requestOnce(method, path, body) {
     const headers = {
       accept: "application/vnd.github+json",
       authorization: `Bearer ${readToken(config)}`,

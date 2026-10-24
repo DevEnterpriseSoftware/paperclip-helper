@@ -13,7 +13,8 @@
 // pattern you know to be flaky is re-run first, a few times per run, and only
 // reported once an attempt passes or the re-runs are used up.
 
-import { ts } from "./util.mjs";
+import { listIssues } from "./paperclip.mjs";
+import { ACTIVE_RUN, asleep, mapLimit, ts } from "./util.mjs";
 
 // Runs are referred to by id (11 digits today) or by URL. A bare number needs at
 // least 9 digits and a word that says it's a run, so a PR or issue number never
@@ -128,4 +129,297 @@ export function ciMessage({ run, jobs, reruns = 0 }) {
         : "Please look at the failed jobs and continue: fix what your change broke, or say why it isn't yours.",
   );
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------- the check (watchdog.mjs runs it each tick)
+
+// Issues the CI-run check reads: an agent that waits on CI leaves its issue in
+// any of these. Only those touched in the last few days: an older wait is stale.
+const CI_STATUSES = "todo,in_progress,in_review,blocked";
+const CI_LOOKBACK_MS = 3 * 24 * 60 * 60_000;
+const DEFAULT_BRANCH_TTL_MS = 60 * 60_000; // a renamed default branch is picked up within the hour
+const CONCURRENCY = 4;
+
+// Check 11. From the watchdog: its records (keys from `record`), the GitHub client,
+// `agentFor` (an agent by id, cached for the tick), `nudge` (its once-per-key
+// comment that wakes the agent), `hasPendingWake` (a wake already on its way),
+// `candidate` (an issue the watchdog may act on) and `startedRuns`.
+export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns }) {
+  const { api, config, log } = ctx;
+  const now = () => ctx.now();
+  const stallMs = config.watchdogStallSec * 1000;
+  const ciScanAt = new Map(); // companyId → when the CI runs agents wait on were last looked at
+  const ciTexts = new Map(); // issueId → { companyId, updatedAt, refs } (the issue's updatedAt moves with every comment)
+  const ciRuns = new Map(); // "repo#id" → finished run (with jobs), for one scan: a run can be re-run at any time
+  const ciRepoOf = new Map(); // bare run id → the repository it was found in
+  const ciMissing = new Set(); // "repo#id" (repo "*" for a bare id) found in none of GITHUB_REPOS
+  const ciDefaultBranch = new Map(); // repo → { branch, at }: its default branch as GitHub last said
+  const ciRepoWarned = new Set(); // repos whose default branch GitHub didn't give, warned once until it does
+  const ciSilenced = new Map(); // CI record key → { companyId, reasons }: why a finished run isn't reported, as logged
+  const ciRefused = new Set(); // repos whose runs the GitHub token may not read, warned once until it can
+  const rerunPattern = (() => {
+    if (!config.watchdogCiRerunJobs) return null;
+    try {
+      return new RegExp(config.watchdogCiRerunJobs, "i");
+    } catch {
+      return null; // config.mjs reports it
+    }
+  })();
+
+
+
+  // The run behind a reference: { state: "missing" } (not in GITHUB_REPOS, or not
+  // found), { state: "unknown" } (GitHub didn't answer), { state: "running" }, or
+  // { state: "finished", repo, run, jobs } with the latest attempt's jobs. Read
+  // once per scan: a finished run can be re-run (by you, or an agent) at any time.
+  // Ids not found anywhere are remembered for the process.
+  async function lookupRun(ref) {
+    if (ciMissing.has(`${ref.repo ?? "*"}#${ref.id}`)) return { state: "missing" };
+    const repos = ref.repo ? [ref.repo] : ciRepoOf.has(ref.id) ? [ciRepoOf.get(ref.id)] : config.repos;
+    for (const repo of repos) {
+      if (config.repos.length && !config.repos.includes(repo)) continue;
+      const cached = ciRuns.get(`${repo}#${ref.id}`);
+      if (cached) return cached;
+      let run;
+      try {
+        run = await github.workflowRun(repo, ref.id);
+      } catch (err) {
+        if (err.status === 404) continue;
+        const refused = err.status === 401 || (err.status === 403 && !/rate limit/i.test(err.message));
+        if (refused && !ciRefused.has(repo)) {
+          // Without Actions: Read no run is ever reported: say so where it's seen.
+          ciRefused.add(repo);
+          log.warn("watchdog: GitHub refused to show a CI run; no run in this repository is reported until it does", { repo, run: ref.id, error: err.message });
+        } else {
+          log.debug("watchdog: couldn't read a CI run", { repo, run: ref.id, error: err.message });
+        }
+        return { state: "unknown" };
+      }
+      ciRefused.delete(repo);
+      ciRepoOf.set(ref.id, repo);
+      let found = { state: "running" };
+      if (run?.status === "completed") {
+        const jobs = run.conclusion === "success" || UNINFORMATIVE.has(run.conclusion) ? [] : await github.workflowJobs(repo, ref.id).catch(() => []);
+        found = { state: "finished", repo, run, jobs };
+      }
+      ciRuns.set(`${repo}#${ref.id}`, found);
+      return found;
+    }
+    ciMissing.add(`${ref.repo ?? "*"}#${ref.id}`);
+    return { state: "missing" };
+  }
+
+  // The repository's default branch, read from GitHub (never assumed) and kept
+  // for an hour. When GitHub doesn't answer, the last answer if there is one,
+  // else undefined: the caller waits for the next scan rather than guess. The
+  // failure is logged once per repository until GitHub answers again.
+  async function defaultBranch(repo) {
+    const cached = ciDefaultBranch.get(repo);
+    if (cached && now() - cached.at < DEFAULT_BRANCH_TTL_MS) return cached.branch;
+    try {
+      const branch = (await github.repository(repo))?.default_branch ?? null;
+      ciDefaultBranch.set(repo, { branch, at: now() });
+      ciRepoWarned.delete(repo);
+      return branch;
+    } catch (err) {
+      if (!ciRepoWarned.has(repo)) {
+        ciRepoWarned.add(repo);
+        log.warn(
+          cached
+            ? "watchdog: couldn't read a repository's default branch; using the one read earlier"
+            : "watchdog: couldn't read a repository's default branch; runs dispatched there wait until GitHub answers",
+          { repo, error: err.message, ...(cached ? { defaultBranch: cached.branch } : {}) },
+        );
+      }
+      return cached ? cached.branch : undefined;
+    }
+  }
+
+  // Has the run's branch moved on since? Its PR's head, or else the branch's.
+  // null when GitHub can't tell (a fork's branch, a deleted branch).
+  async function headMoved(repo, run) {
+    const prNumber = run.pull_requests?.[0]?.number;
+    if (prNumber) {
+      const pr = await github.pull(repo, prNumber).catch(() => null);
+      if (!pr) return null;
+      return pr.state !== "open" || Boolean(pr.head?.sha && pr.head.sha !== run.head_sha);
+    }
+    if (!run.head_branch) return null;
+    const branch = await github.branch(repo, run.head_branch).catch(() => null);
+    const sha = branch?.commit?.sha;
+    return sha ? sha !== run.head_sha : null;
+  }
+
+  // Re-runs the run's failed jobs when they are all known flaky, the run is still
+  // its PR's head, and it hasn't used its re-runs. True when it did.
+  async function rerunFlaky({ repo, run, jobs }, issue) {
+    if (!rerunPattern || run.conclusion === "success" || !onlyFlaky(jobs, rerunPattern)) return false;
+    const key = record.ciRerun(repo, run);
+    const prior = records.get(key);
+    if ((prior?.count ?? 0) >= config.watchdogCiRerunMax || records.has(record.ciRerunFail(repo, run))) return false;
+    // A newer push runs CI by itself; re-running an old head proves nothing.
+    if ((await headMoved(repo, run)) !== false) return false;
+    const extra = { issue: issue.identifier ?? issue.id, repo, run: run.id, attempt: run.run_attempt ?? 1, jobs: failedJobs(jobs).map((j) => j.name) };
+    if (config.dryRun) {
+      log("watchdog: would re-run a CI run's flaky jobs (dry run)", extra);
+      return false;
+    }
+    try {
+      await github.rerunFailedJobs(repo, run.id);
+    } catch (err) {
+      records.set(record.ciRerunFail(repo, run), { count: 1, at: now() });
+      state.touch();
+      log.warn("watchdog: GitHub refused to re-run a CI run's failed jobs; reporting it instead", { ...extra, error: err.message });
+      return false;
+    }
+    records.set(key, { count: (prior?.count ?? 0) + 1, at: now() });
+    state.touch();
+    stats.ciReruns += 1;
+    log("watchdog: re-ran a CI run's flaky failed jobs", { ...extra, rerun: (prior?.count ?? 0) + 1 });
+    return true;
+  }
+
+  async function checkCiRuns(companyId, agents) {
+    if (!github) return;
+    const last = ciScanAt.get(companyId);
+    if (last && now() - last < stallMs) return;
+    ciScanAt.set(companyId, now());
+    ciRuns.clear();
+    const issues = (await listIssues(api, companyId, CI_STATUSES)).filter(
+      (i) => candidate(i) && now() - ts(i.updatedAt) < CI_LOOKBACK_MS,
+    );
+    const live = new Set(issues.map((i) => i.id));
+    // Forget this company's issues that are no longer looked at (keys are per issue).
+    for (const [id, c] of ciTexts) if (c.companyId === companyId && !live.has(id)) ciTexts.delete(id);
+    for (const [k, v] of ciSilenced) if (v.companyId === companyId && !live.has(k.split(":")[1])) ciSilenced.delete(k);
+    await mapLimit(issues, CONCURRENCY, async (issue) => {
+      try {
+        await checkCiIssue(issue, agents, companyId);
+      } catch (err) {
+        log.warn("watchdog: CI run check failed", { issue: issue.identifier ?? issue.id, error: err.message });
+      }
+    });
+  }
+
+  async function checkCiIssue(issue, agents, companyId) {
+    const assignee = issue.assigneeAgentId;
+    let cached = ciTexts.get(issue.id);
+    let full = null;
+    if (!cached || cached.updatedAt !== issue.updatedAt || cached.assignee !== assignee) {
+      // The agent's latest comment, and its monitor's notes: what it said it waits on.
+      const comments = await api.request("GET", `/api/issues/${issue.id}/comments?order=desc&limit=10`).catch(() => null);
+      if (!Array.isArray(comments)) return;
+      full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+      const said = waitingOn(comments, assignee, full?.executionState?.monitor);
+      cached = { companyId, updatedAt: issue.updatedAt, assignee, refs: runRefs(said.text), saidAt: said.saidAt };
+      ciTexts.set(issue.id, cached);
+    }
+    if (!cached.refs.length) return;
+    const agent = await agentFor(assignee, agents).catch(() => null);
+    if (!agent || asleep(agent)) return;
+    // Newest run first: the one the agent waits on. While it runs, the older ones don't matter.
+    let found = null;
+    for (const ref of cached.refs) {
+      const r = await lookupRun(ref);
+      if (r.state === "missing") continue;
+      if (r.state !== "finished") return;
+      found = r;
+      break;
+    }
+    if (!found) return;
+    const { run } = found;
+    const key = record.ciRun(issue, run);
+    if ((records.get(key)?.count ?? 0) > 0 || dryRunSeen.has(key)) return; // reported (a paused task leaves a count of 0)
+    // Why a finished run isn't reported (yet), at debug level, once per run attempt
+    // and reason: LOG_LEVEL=debug shows why an agent wasn't told.
+    const silent = (reason, extra = {}) => {
+      const seen = ciSilenced.get(key) ?? { companyId, reasons: new Set() };
+      ciSilenced.set(key, seen);
+      if (seen.reasons.has(reason)) return;
+      seen.reasons.add(reason);
+      log.debug("watchdog: a finished CI run an agent waits on isn't reported", {
+        issue: issue.identifier ?? issue.id, repo: found.repo, run: run.id, attempt: run.run_attempt ?? 1, reason, ...extra,
+      });
+    };
+    // A run dispatched on the default branch is a verdict the agent asked for: it
+    // is reported on any conclusion, never re-run, and still counts once the
+    // branch has moved on. Only dispatched runs ask GitHub for the default branch;
+    // while GitHub doesn't say, such a run waits for the next scan, never re-run.
+    let dispatchedOnDefault = false;
+    if (run.event === "workflow_dispatch" && run.head_branch) {
+      const branch = await defaultBranch(found.repo);
+      if (branch === undefined) return silent("the repository's default branch is unknown");
+      dispatchedOnDefault = run.head_branch === branch;
+    }
+    // Cancelled by a newer push, skipped, waiting on approval.
+    if (!dispatchedOnDefault && UNINFORMATIVE.has(run.conclusion)) return silent(`its conclusion, ${run.conclusion}, says nothing about the change`);
+    const finishedAt = ts(run.updated_at);
+    // Give the agent's own monitor, or the agent, the stall window to notice.
+    if (!finishedAt || now() - finishedAt < stallMs) return silent("finished less than the stall window ago");
+    // The agent wrote about the run after it finished: it watched it within its own run.
+    if (cached.saidAt && ts(cached.saidAt) >= finishedAt) return silent("the agent commented after it finished");
+    const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => null);
+    if (!Array.isArray(runs)) return;
+    if (runs.some((r) => ACTIVE_RUN.has(r.status))) return silent("a run on the issue is in progress");
+    // The agent has run on the issue since the run finished: it has seen the result.
+    if (startedRuns(runs).some((r) => r.agentId === assignee && ts(r.startedAt ?? r.createdAt) >= finishedAt)) {
+      return silent("the agent has run on the issue since it finished");
+    }
+    full ??= await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+    if (!full || full.assigneeAgentId !== assignee) return;
+    const monitor = full.executionState?.monitor;
+    const monitorDue = monitorPending(monitor, now());
+    // A monitor still due that watches this very run would only wake the agent again
+    // to find it finished: report now, and clear the monitor in the same step. One
+    // that watches something else is left to fire. (Paperclip redacts a monitor's
+    // externalRef, so only its notes can name the run.)
+    if (monitorDue && !watchesOnly(monitor, run)) return silent("the agent's Paperclip monitor will still fire", { nextCheckAt: monitor.nextCheckAt });
+    // A monitor Paperclip shows without the policy that holds it can't be cleared: leave it to fire.
+    if (monitorDue && !full.executionPolicy?.monitor) return silent("the agent's monitor can't be cleared");
+    // A wake still waiting gets the stall window to start a run. One older than
+    // that may never be delivered (a monitor's own wake can sit deferred for
+    // hours), and the comment's wake joins any that is: report anyway.
+    if (await hasPendingWake(full, runs, agents, { freshWithin: stallMs })) return silent("a wake for the agent is waiting to start");
+    if (!dispatchedOnDefault && (await rerunFlaky(found, issue))) return;
+    // Pushed since: that push's own run is what counts now.
+    if (!dispatchedOnDefault && (await headMoved(found.repo, run)) === true) return silent("its branch or pull request has moved on");
+    const reruns = records.get(record.ciRerun(found.repo, run))?.count ?? 0;
+    // The policy is replaced whole: read it again now, so nothing changed meanwhile is overwritten.
+    let clearMonitor;
+    if (monitorDue) {
+      const fresh = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+      const freshMonitor = fresh?.executionState?.monitor;
+      if (!fresh || (monitorPending(freshMonitor, now()) && (!watchesOnly(freshMonitor, run) || !fresh.executionPolicy?.monitor))) {
+        return silent("the agent's monitor changed while the report was prepared");
+      }
+      if (monitorPending(freshMonitor, now())) clearMonitor = withoutMonitor(fresh.executionPolicy);
+    }
+    const posted = await nudge(
+      full,
+      key,
+      agent,
+      ciMessage({ run, jobs: found.jobs, reruns }),
+      { reason: "CI run finished", repo: found.repo, run: run.id, conclusion: run.conclusion },
+      clearMonitor !== undefined
+        ? { patch: { executionPolicy: clearMonitor }, patchNote: "\n\nYour Paperclip monitor for this run was cleared: it would only have woken you to find the run finished." }
+        : {},
+    );
+    if (posted) stats.ciReports += 1;
+  }
+
+  // The issue's execution policy without its monitor (Paperclip replaces the policy
+  // whole and clears the monitor when it's gone); undefined when there's no policy.
+  function withoutMonitor(policy) {
+    if (!policy?.monitor) return undefined;
+    const { monitor: _cleared, ...rest } = policy;
+    return rest;
+  }
+
+  // Does the monitor watch this run and nothing else? Every run its notes name is it.
+  function watchesOnly(monitor, run) {
+    const refs = runRefs(monitor?.notes);
+    return refs.length > 0 && refs.every((r) => String(r.id) === String(run.id));
+  }
+
+  return { check: checkCiRuns };
 }

@@ -235,7 +235,7 @@ With `WATCHDOG_USAGE_LIMIT_PAUSE` on (`WATCHDOG_LIMIT_PAUSE` before 1.12, still 
 - **A limit:** the ChatGPT plan's usage limit, *"You’ve hit your usage limit. … Try again at 3:45 PM."* (the same wording for the 5-hour and the weekly limit, whatever the plan's upgrade advice in the middle); the API's quota and billing errors (*"Quota exceeded. Check your plan and billing details."*, the API's own *"You exceeded your current quota…"*, `insufficient_quota`, `credit_balance_exhausted`, the organisation and project spend limits); and a workspace out of credits or at its spend cap. One model's own limit, *"You’ve hit your usage limit for <model>. Switch to another model now, or try again at …"*, pauses only the agent that hit it: agents on other models keep working.
 - **Transient:** *"Selected model is at capacity. Please try a different model."* and *"We’re currently experiencing high demand…"*. Nothing is paused.
 - **Neither:** a plan that doesn't include Codex (*"To use Codex with your ChatGPT plan, upgrade to Plus…"*), a rate limit after Codex's own retries, any other failure.
-- **Reset:** *"try again at 3:45 PM"* (later the same day: Codex leaves the date out only then) or *"try again at Oct 13th, 2026 3:45 PM"*. Codex writes it in the local time of the machine it runs on, which is Paperclip's, without naming the zone: the watchdog reads it in `WATCHDOG_LIMIT_TIME_ZONE`, or the helper's own time zone when that is empty. Set it when the two differ (Paperclip in a container on UTC, say): otherwise the agents are resumed early or late by the difference. A time without a date that has already passed, read in that zone, can only be a zone mismatch, so it counts as no reset (an hour) rather than the same time tomorrow. *"Try again later."* and the quota and billing errors give no reset.
+- **Reset:** *"try again at 3:45 PM"* (later the same day: Codex leaves the date out only then) or *"try again at Oct 13th, 2026 3:45 PM"*. Codex writes it in local time without naming the zone: the watchdog reads it in `WATCHDOG_LIMIT_TIME_ZONE`, which the installers set to the time zone of the machine they run on (the helper's own container is on UTC, the zone it falls back to when the setting is empty). Set it yourself if Paperclip runs somewhere with another time zone: otherwise the agents are resumed early or late by the difference. A time without a date that has already passed, read in that zone, can only be a zone mismatch, so it counts as no reset (an hour) rather than the same time tomorrow. *"Try again later."* and the quota and billing errors give no reset.
 - **Who shares it,** in the order Paperclip's adapter picks credentials: the same `OPENAI_API_KEY` secret; else the same Codex login, that is the same `CODEX_HOME` (a secret, or a path Paperclip shows); else neither set (the machine's shared Codex login, which Paperclip seeds its managed homes from). An agent whose key or `CODEX_HOME` is typed in as plain text (Paperclip redacts both), with `OPENAI_BASE_URL` or `CODEX_API_KEY`, or with a managed AI connection is its own group, paused only when it fails itself. Agents that each have their own Codex home are each their own account.
 
 For a limit:
@@ -265,6 +265,8 @@ Some checks tell the board about something it should know: a usage limit that pa
 ## Limits
 
 With `DRY_RUN=true` the watchdog logs what it would do, once per situation, and records nothing, so turning dry run off leaves everything still to do.
+
+Each check runs on its own: if one fails (Paperclip refused a listing, say), the log names it, `pch status` shows it as the last error, and the other checks still run that tick.
 
 Each nudge mentions the assignee and says what stalled. Each situation gets at most `WATCHDOG_MAX_NUDGES` comments or presses, spaced by the stall window. The counts are kept in `data/state.json`, so a restart doesn't repeat them.
 
@@ -303,7 +305,7 @@ These look similar in Paperclip, and `pch why ISSUE` tells them apart:
 | `WATCHDOG_RESUME_SETTLE_MIN` | `10` | Minutes after a resume before the agent's blocked issues are touched (by 15 or 6). `0`: at once. |
 | `WATCHDOG_USAGE_LIMIT_PAUSE` | `true` | Pause the agents on a plan that hits its usage limit (Claude and Codex), each once idle, and resume them at the reset (16 above). `WATCHDOG_LIMIT_PAUSE`, its name before 1.12, is still read when this one isn't set. |
 | `WATCHDOG_LIMIT_RESUME_GRACE_MIN` | `5` | Minutes after the reset before they are resumed. |
-| `WATCHDOG_LIMIT_TIME_ZONE` | the helper's | The time zone Codex writes its reset times in: that of the machine Paperclip runs on (an IANA name, e.g. `Europe/London`). |
+| `WATCHDOG_LIMIT_TIME_ZONE` | the installing machine's | The time zone Codex writes its reset times in (an IANA name, e.g. `Europe/London`). The installers set it to the time zone of the machine they run on; empty, the helper's own (UTC in its container). |
 | `WATCHDOG_STAGES_WIPE` | `true` | Reopen a done issue whose own PR is still open, and tell the board about issues whose review stages an update removed (17 above). The open-PR part needs a GitHub token. |
 | `WATCHDOG_NOTIFY_ISSUE` | none | An issue (`ACM-12`) for the [notes for the board](#notes-for-the-board) in its company. Choose one assigned to a person or to nobody: a board comment wakes the assignee. Without it, the notes are only in the log. |
 

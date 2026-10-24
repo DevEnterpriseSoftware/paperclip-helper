@@ -8,14 +8,11 @@ import { createGitHub, tokenSource } from "./github.mjs";
 import { companyAgents, companyPrefixes } from "./paperclip.mjs";
 import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, plural, signed } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
-import { advise, excerpt, llmPrompt } from "./advice.mjs";
 import { blocked as blockedReport } from "./blocked.mjs";
-import { pendingCards } from "./questions.mjs";
 import { holdFacts, releaseHold, releaseProblems, RELEASE_OUTCOMES, unprovable } from "./release.mjs";
 import {
   clearLink,
   clearProblems,
-  deadLinkWorkspaceId,
   describeLink,
   ENABLE_SETTING_HINT,
   isolatedWorkspacesEnabled,
@@ -25,40 +22,52 @@ import {
 import { closeWorkspace, lastFailedOperation, survey } from "./worktrees.mjs";
 import { readUsage, render, summarize, usageOptions } from "./usage.mjs";
 import { answerFor, findCard } from "./answer.mjs";
+export { why } from "./why.mjs";
+import { excerpt } from "./advice.mjs";
 
-export const USAGE = `Paperclip Helper
+export const USAGE = `Paperclip Helper: fixes what a self-hosted Paperclip doesn't recover from by itself.
 
-  pch                          run every enabled component (what the container does)
-  pch status                   what the running helper is doing, and when the key expires
-  pch check [ISSUE]            who the key belongs to; with an issue, what a merge would do to it
-  pch why ISSUE [--prompt]     why nobody is working on an issue, and what to do about it (--prompt: as an LLM prompt)
-  pch blocked                  why each blocked issue is blocked, what the chains wait on, and every question card waiting
-  pch approve ISSUE [comment]  approve an issue whose approval is waiting on you
-  pch changes ISSUE comment    request changes (the comment becomes the brief)
-  pch comment ISSUE text       comment as you (wakes the assignee)
-  pch answer ISSUE CARD text   answer a question card (CARD: its id, or the start of it)
-  pch release ISSUE [--apply] [--outcome=mixed|completed|not_performed]
-                               release an execution hold whose run can't prove it stopped (preview without --apply)
-  pch workspace ISSUE [--apply]  give an issue linked to a closed (or another issue's) workspace its own new one
-                               (preview without --apply; with a closed workspace, also the other open issues linked to it)
-  pch worktrees [--apply] [--min-days=N] [--include-untracked] [--include-unmerged]
-                               close the workspaces of finished issues so Paperclip removes their worktrees
-                               (preview without --apply; issues finished at least N days ago, default 1)
-  pch usage [--days N] [--agent NAME]
-                               where the tokens go: per agent runs, tokens, cost, what woke it, and what to look at
-  pch costs                    preview what cost sync would post (changes nothing)
-  pch costs --sessions         check whether resumed sessions report cumulative costs
-  pch costs --audit [--days N] check the cost figures of the last N days (default 7): tokens, reported cost,
-                               what the tokens cost at list price, what is synced, duplicates (changes nothing)
-  pch models                   every agent's adapter, model and effort
-  pch set-model FROM TO [--apply]   move every agent on model FROM to TO (preview without --apply)
-  pch login                    create the helper's board API key (approve it in the browser)
-  pch revoke                   revoke the key and delete it
-  pch secret                   print a random webhook secret for GITHUB_WEBHOOK_SECRET
-  pch update                   update the helper to the latest release of its major version
-  pch version                  print the version
+Usage: pch [command]   (no command: run every enabled component, as the container does)
 
-Settings come from .env; see https://github.com/DevEnterpriseSoftware/paperclip-helper`;
+What's going on
+  status                     what the running helper is doing, and when its key expires
+  why ISSUE [--prompt]       why nobody is working on an issue, and what to do about it
+                             (--prompt: the same as a prompt for an LLM chat)
+  blocked                    what every blocked issue waits on, and every question card waiting
+  usage [--days N] [--agent NAME]
+                             where the tokens go: runs, tokens and cost per agent, and what woke it
+  check [ISSUE]              who the key belongs to; with an issue, what a merge would do to it
+
+Decide and unblock
+  approve ISSUE [comment]    approve an issue whose approval is waiting on you
+  changes ISSUE comment      request changes (the comment becomes the brief)
+  comment ISSUE text         comment as you (wakes the assignee)
+  answer ISSUE CARD text     answer a question card (CARD: its id, or the start of it)
+  release ISSUE [--apply] [--outcome=mixed|completed|not_performed]
+                             release an execution hold whose run can't prove it stopped
+  workspace ISSUE [--apply]  give an issue linked to a closed (or another issue's) workspace its own
+
+Housekeeping
+  worktrees [--apply] [--min-days=N] [--include-untracked] [--include-unmerged]
+                             close finished issues' workspaces, so Paperclip removes their worktrees
+  models                     every agent's adapter, model and effort
+  set-model FROM TO [--apply]
+                             move every agent on model FROM to TO
+
+Costs
+  costs                      what cost sync would post (changes nothing)
+  costs --sessions           whether resumed sessions report cumulative costs
+  costs --audit [--days N]   check the last N days' cost figures (default 7; changes nothing)
+
+Setup
+  login                      create the helper's board API key (approve it in the browser)
+  revoke                     revoke the key and delete it
+  secret                     print a random webhook secret for GITHUB_WEBHOOK_SECRET
+  update                     update to the latest release of this major version
+  version                    print the version
+
+Commands with --apply only preview without it. Settings come from .env:
+https://github.com/DevEnterpriseSoftware/paperclip-helper`;
 
 // Lines go to the console, or to `sink` while a command collects its own output.
 let sink = null;
@@ -129,11 +138,12 @@ function expiryNote(key) {
   if (!key) return "";
   if (!key.expiresAt) return `key "${key.name}", no expiry`;
   const days = Math.floor((Date.parse(key.expiresAt) - Date.now()) / 86_400_000);
+  if (days < 0) return `key "${key.name}", expired ${key.expiresAt.slice(0, 10)}: get a new one with \`pch login\``;
   const warn = days < 30 ? `: renew it soon with \`pch login\`` : "";
-  return `key "${key.name}", expires ${key.expiresAt.slice(0, 10)} (in ${days} days${warn})`;
+  return `key "${key.name}", expires ${key.expiresAt.slice(0, 10)} (in ${plural(days, "day")}${warn})`;
 }
 
-// ---------------------------------------------------------------- check / why
+// ---------------------------------------------------------------- check
 
 export async function check(ctx, identifier) {
   const { api } = ctx;
@@ -170,212 +180,6 @@ export async function check(ctx, identifier) {
   );
 }
 
-// A blocker counts as "finalizing" until the latest operation on its execution
-// workspace is a successful workspace_finalize. Show the last few operations.
-async function showWorkspaceOps(api, identifier) {
-  const issue = await api.request("GET", `/api/issues/${encodeURIComponent(identifier)}`).catch(() => null);
-  const wsId = issue?.executionWorkspaceId;
-  if (!wsId) {
-    out("    (no execution workspace on the issue)");
-    return;
-  }
-  const ops = await api.request("GET", `/api/execution-workspaces/${wsId}/workspace-operations`).catch((e) => {
-    out(`    workspace operations unavailable: ${e.message}`);
-    return [];
-  });
-  const sorted = (Array.isArray(ops) ? ops : []).sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
-  out(`    workspace ${wsId}: last ${Math.min(6, sorted.length)} of ${sorted.length} operations`);
-  for (const op of sorted.slice(-6)) {
-    const who = op.issueId === issue.id ? identifier : op.issueId ? `issue ${op.issueId.slice(0, 8)}` : "unattributed";
-    out(
-      `    ${op.startedAt}  ${String(op.phase).padEnd(20)} ${String(op.status).padEnd(10)} ${who}` +
-        `${op.heartbeatRunId ? `  run ${op.heartbeatRunId.slice(0, 8)}` : ""}${op.finishedAt ? "" : "  (not finished)"}`,
-    );
-    if (op.status === "failed") {
-      const excerpt = [op.stderrExcerpt, op.stdoutExcerpt].filter(Boolean).join("\n").trim();
-      const note =
-        op.metadata && typeof op.metadata === "object"
-          ? ["errorMessage", "error", "reason", "failureReason", "message"].map((k) => op.metadata[k]).find((v) => typeof v === "string")
-          : null;
-      if (op.exitCode != null) out(`      exit code ${op.exitCode}`);
-      if (note) out(`      ${note}`);
-      for (const line of excerpt.split("\n").slice(-12)) if (line.trim()) out(`      | ${line}`);
-    }
-  }
-}
-
-// Paperclip's wake and blocker diagnostics for one issue, in plain lines.
-// Then a recommendation: what is going on, what to do, and whether the watchdog
-// does it by itself. With --prompt, the same as a prompt for an LLM chat.
-export async function why(ctx, identifier, { prompt = false } = {}) {
-  if (!identifier || identifier.startsWith("--")) throw new Error("usage: why <ISSUE-ID> [--prompt]");
-  const report = [];
-  sink = report;
-  let facts;
-  try {
-    facts = await whyReport(ctx, identifier);
-  } finally {
-    sink = null;
-  }
-  const advice = advise(facts);
-  if (prompt) {
-    out(llmPrompt({ identifier, report: report.join("\n"), advice, lastComments: facts.lastComments }));
-    return;
-  }
-  for (const line of report) out(line);
-  if (facts.lastComment) out(`Last comment: ${facts.lastComment.author ?? "someone"}: ${excerpt(facts.lastComment.body)}`);
-  out("");
-  out(`Recommendation: ${advice.what}`);
-  advice.steps.forEach((step, i) => out(`  ${i + 1}. ${step}`));
-  if (advice.watchdog === "auto" && advice.autoNote) {
-    out(`  ${advice.autoNote}`);
-  } else if (advice.watchdog === "auto") {
-    out(`  The watchdog does this by itself once the issue has been quiet for ${ctx.config.watchdogStallSec}s. Do it by hand only if you don't want to wait.`);
-  } else if (advice.watchdog === "manual") {
-    out("  The watchdog leaves this one to you.");
-  }
-  out(`  Not what you see? \`pch why ${identifier} --prompt\` prints all of this as a prompt for an LLM chat.`);
-}
-
-async function whyReport(ctx, identifier) {
-  const { api } = ctx;
-  const id = encodeURIComponent(identifier);
-  const [wakes, blockers] = await Promise.all([
-    api.request("GET", `/api/issues/${id}/diagnostics/wakes`),
-    api.request("GET", `/api/issues/${id}/diagnostics/blockers`).catch(() => null),
-  ]);
-  const issue = wakes?.issue ?? {};
-  out(`${identifier}: ${issue.status ?? "?"} ${issue.title ? `— ${issue.title}` : ""}`);
-  if (wakes?.diagnosis) out(`Diagnosis: ${wakes.diagnosis}`);
-  if (wakes?.likelyReason && wakes.likelyReason !== wakes.diagnosis) out(`Likely reason: ${wakes.likelyReason}`);
-  if (blockers?.diagnosis && blockers.diagnosis !== wakes?.diagnosis) out(`Blocker diagnosis: ${blockers.diagnosis}`);
-  const r = blockers?.readiness;
-  if (r) {
-    const linked = (blockers?.blockers ?? []).length;
-    out(
-      `Blockers: ${!linked ? "none linked" : r.allBlockersDone ? "all done" : `${r.unresolvedBlockerCount} unresolved`}` +
-        `${r.pendingFinalizeBlockerCount ? `, ${r.pendingFinalizeBlockerCount} waiting on workspace finalization` : ""}` +
-        `; dependency ready: ${r.isDependencyReady ? "yes" : "no"}`,
-    );
-  }
-  for (const b of blockers?.blockers ?? []) {
-    out(`  ${b.identifier ?? b.id}: ${b.status}${b.isPendingFinalize ? " (finalizing)" : ""}`);
-    if (b.isPendingFinalize) await showWorkspaceOps(api, b.identifier ?? b.id);
-  }
-  const names = new Map();
-  const nameOf = async (agentId) => {
-    if (!agentId) return null;
-    if (!names.has(agentId)) {
-      const agent = await api.request("GET", `/api/agents/${agentId}`).catch(() => null);
-      names.set(agentId, agent?.name ?? agentId.slice(0, 8));
-    }
-    return names.get(agentId);
-  };
-  // Wakes are listed for every agent, so say whose each one is: a wake deferred
-  // for the previous owner says nothing about the assignee.
-  const full = await api.request("GET", `/api/issues/${id}`).catch(() => null);
-  const assignee = await nameOf(full?.assigneeAgentId);
-  if (assignee) out(`Assignee: ${assignee}`);
-  // A link to a closed workspace fails every run at setup; one to another
-  // issue's live workspace puts this issue's commits on that issue's branch.
-  const link = full ? await linkFacts(api, identifier, { issue: full }).catch(() => null) : null;
-  const linkLine = link ? describeLink(link) : null;
-  if (linkLine) out(`Workspace: ${linkLine}`);
-  const hold = full?.executionBlocker;
-  if (hold) {
-    // Paperclip's recovery is holding the issue: new runs are refused until it's released.
-    out(`Execution hold: ${hold.cause ?? "unknown cause"}${hold.runId ? `, source run ${String(hold.runId).slice(0, 8)}` : ""}`);
-    if (hold.nextAction) out(`  Next action: ${hold.nextAction}`);
-  }
-  const recent = (wakes?.events ?? []).filter((e) => e.kind === "wake_request").slice(0, 5).reverse();
-  if (recent.length) {
-    out("Latest wake requests:");
-    for (const e of recent) {
-      const who = await nameOf(e.agentId);
-      out(`  ${e.requestedAt}  ${who ? `${who}  ` : ""}${e.reason ?? e.source}  → ${e.status}${e.failureClass ? ` (${e.failureClass})` : ""}`);
-    }
-  }
-  // Runs, with their environment lease: a cancelled run whose lease was never
-  // released keeps every later wake deferred.
-  const runs = await api.request("GET", `/api/issues/${id}/runs`).catch(() => []);
-  const latestRuns = (Array.isArray(runs) ? runs : []).slice(0, 4).reverse();
-  if (latestRuns.length) {
-    for (const r of latestRuns) await nameOf(r.agentId);
-    out("Latest runs:");
-    for (const r of latestRuns) {
-      const l = r.environmentLease;
-      const lease = l
-        ? `  lease ${l.status}${l.releasedAt ? "" : " (not released)"}${l.cleanupStatus && l.cleanupStatus !== "succeeded" ? `, cleanup ${l.cleanupStatus}` : ""}`
-        : "";
-      out(`  ${r.createdAt}  ${names.get(r.agentId) ?? "?"}  ${r.status}${r.errorCode ? ` (${r.errorCode})` : ""}${lease}`);
-    }
-  }
-
-  // What Paperclip's recovery decided, the saved messages, and the latest notes:
-  // the rest of what a recommendation needs.
-  const [parked, queue, comments, me] = await Promise.all([
-    api.request("GET", `/api/issues/${id}/recovery-actions`).catch(() => null),
-    api.request("GET", `/api/issues/${id}/queued-comments`).catch(() => null),
-    api.request("GET", `/api/issues/${id}/comments?order=desc&limit=3`).catch(() => []),
-    ctx.identity().catch(() => null),
-  ]);
-  const recovery = parked?.active ?? null;
-  // Pending question cards, and where the watchdog routed any of them.
-  const cards = full?.id ? await pendingCards(api, full.id).catch(() => []) : [];
-  const routedRecords = cards.length ? readJson(ctx.config.stateFile, {})?.nudges ?? {} : {};
-  const routed = {};
-  for (const c of cards) {
-    if (routedRecords[`question:${c.id}`]?.relay) routed[c.id] = routedRecords[`question:${c.id}`].relay;
-    const [from, to] = [await nameOf(c.createdByAgentId), c.addresseeAgentId ? await nameOf(c.addresseeAgentId) : null];
-    const toWhom = to ?? (c.addresseeUserId ? (c.addresseeUserId === me?.userId ? "you" : "a board user") : "anyone");
-    out(`Question card: ${from ?? "?"} → ${toWhom}, ${c.kind}, asked ${c.createdAt}${routed[c.id] ? `, routed to ${routed[c.id]}` : ""}`);
-  }
-  if (recovery) {
-    out(`Recovery: ${recovery.kind ?? recovery.cause ?? "unknown"}, waiting on ${recovery.ownerType ?? "?"} since ${recovery.createdAt ?? "?"}`);
-    if (recovery.nextAction) out(`  Next action: ${recovery.nextAction}`);
-  }
-  if (queue?.queueId && queue.entries?.length) {
-    out(`Saved messages: ${queue.entries.length} ${queue.state ?? "waiting"}${queue.executionWait?.message ? ` ("${queue.executionWait.message}")` : ""}`);
-  }
-  const lastComments = [];
-  for (const c of Array.isArray(comments) ? comments : []) {
-    const author = (await nameOf(c.authorAgentId)) ?? (c.authorUserId ? (c.authorUserId === me?.userId ? "you" : "a board user") : null);
-    lastComments.push({ author, body: c.body ?? "", createdAt: c.createdAt ?? null });
-  }
-  const assigneeAgent = full?.assigneeAgentId ? await api.request("GET", `/api/agents/${full.assigneeAgentId}`).catch(() => null) : null;
-  // The run list withholds error text; the run itself has it. Only a setup
-  // failure can be the dead workspace link.
-  const runList = Array.isArray(runs) ? runs : [];
-  const lastSetupFailure = runList.find((r) => r.agentId === full?.assigneeAgentId && r.status !== "cancelled");
-  let deadLinkRun = null;
-  if (lastSetupFailure?.status === "failed" && lastSetupFailure.errorCode === "setup_failed") {
-    const runId = lastSetupFailure.runId ?? lastSetupFailure.id;
-    const detail = await api.request("GET", `/api/heartbeat-runs/${runId}`).catch(() => null);
-    const wsId = deadLinkWorkspaceId(detail?.error);
-    if (wsId) deadLinkRun = { runId, workspaceId: wsId };
-  }
-  return {
-    identifier,
-    issue: full ?? { status: issue.status },
-    me: me?.userId ?? null,
-    assignee: assigneeAgent ? { name: assigneeAgent.name, status: assigneeAgent.status } : assignee ? { name: assignee, status: null } : null,
-    nameOf: (agentId) => names.get(agentId) ?? null,
-    blockers,
-    wakes: (wakes?.events ?? []).filter((e) => e.kind === "wake_request"),
-    runs: runList,
-    link,
-    deadLinkRun,
-    recovery,
-    queue,
-    cards,
-    routed,
-    lastComment: lastComments[0] ?? null,
-    lastComments,
-    config: ctx.config,
-    now: ctx.now(),
-  };
-}
-
 // ---------------------------------------------------------------- blocked
 
 export async function blocked(ctx) {
@@ -390,7 +194,7 @@ export async function blocked(ctx) {
 // otherwise) and delivers the saved messages.
 export async function release(ctx, identifier, flags = []) {
   if (!identifier || identifier.startsWith("--")) {
-    throw new Error("usage: release <ISSUE-ID> [--apply] [--outcome=mixed|completed|not_performed]");
+    throw new Error("usage: pch release ISSUE [--apply] [--outcome=mixed|completed|not_performed]");
   }
   const apply = flags.includes("--apply");
   const outcomeFlag = flags.find((f) => f.startsWith("--outcome="));
@@ -454,7 +258,7 @@ export async function release(ctx, identifier, flags = []) {
 // isolated workspace" in its Workspace picker. With a closed workspace, the other
 // open issues still linked to it are fixed too: they'd fail the same way.
 export async function workspace(ctx, identifier, flags = []) {
-  if (!identifier || identifier.startsWith("--")) throw new Error("usage: workspace <ISSUE-ID> [--apply]");
+  if (!identifier || identifier.startsWith("--")) throw new Error("usage: pch workspace ISSUE [--apply]");
   const { api } = ctx;
   const apply = flags.includes("--apply");
   const facts = await linkFacts(api, identifier);
@@ -549,7 +353,7 @@ export async function worktrees(ctx, flags = []) {
   const { api } = ctx;
   const unknown = flags.filter((f) => !WORKTREE_FLAGS.includes(f) && !f.startsWith("--min-days="));
   if (unknown.length) {
-    throw new Error(`unknown option ${unknown[0]}. usage: worktrees [--apply] [--min-days=N] [--include-untracked] [--include-unmerged]`);
+    throw new Error(`unknown option ${unknown[0]}. usage: pch worktrees [--apply] [--min-days=N] [--include-untracked] [--include-unmerged]`);
   }
   const apply = flags.includes("--apply");
   const minFlag = flags.find((f) => f.startsWith("--min-days="));
@@ -672,7 +476,7 @@ export async function worktrees(ctx, flags = []) {
 
 // approve / changes: the same decision the relay records on a merge or review.
 export async function decide(ctx, kind, identifier, text) {
-  if (!identifier) throw new Error(`usage: ${kind} <ISSUE-ID> ${kind === "approve" ? "[comment]" : "<comment>"}`);
+  if (!identifier) throw new Error(`usage: pch ${kind} ISSUE ${kind === "approve" ? "[comment]" : "comment"}`);
   if (kind === "changes" && !text) throw new Error("changes needs a comment: it becomes the engineer's brief");
   const comment = text || "Approved.";
   const issue = await ctx.api.request("GET", `/api/issues/${encodeURIComponent(identifier)}`);
@@ -701,7 +505,7 @@ export async function answer(ctx, identifier, cardRef, text) {
 }
 
 export async function comment(ctx, identifier, text) {
-  if (!identifier || !text) throw new Error("usage: comment <ISSUE-ID> <text>");
+  if (!identifier || !text) throw new Error("usage: pch comment ISSUE text");
   await ctx.api.request("POST", `/api/issues/${encodeURIComponent(identifier)}/comments`, { body: signed(text, COMMAND_SIGNATURE) });
   out(`${identifier}: comment added.`);
 }
@@ -730,7 +534,7 @@ export async function models(ctx) {
 // PATCH merges into adapterConfig, so only the model changes: effort, engine,
 // env and everything else stay as they are. Preview unless --apply is given.
 export async function setModel(ctx, from, to, flags = []) {
-  if (!from || !to) throw new Error("usage: set-model <from-model> <to-model> [--apply]");
+  if (!from || !to) throw new Error("usage: pch set-model FROM TO [--apply]");
   const apply = flags.includes("--apply");
   const targets = (await listAgents(ctx)).filter((a) => a.adapterConfig?.model === from);
   if (!targets.length) {
@@ -789,7 +593,7 @@ export async function costs(ctx, args = []) {
     const i = args.findIndex((a) => a === "--days" || a.startsWith("--days="));
     const value = i < 0 ? "7" : args[i].includes("=") ? args[i].split("=")[1] : args[i + 1];
     const days = Number(value);
-    if (!(days > 0)) throw new Error("usage: costs --audit [--days N]");
+    if (!(days > 0)) throw new Error("usage: pch costs --audit [--days N]");
     return sync.audit({ days, print: out });
   }
   if (!ctx.config.costSync) out("(COST_SYNC is off: this is what it would post if you turned it on.)\n");
@@ -821,45 +625,68 @@ export async function paperclipBuild(ctx) {
   return [version, commit].filter(Boolean).join(", ") || null;
 }
 
+// The service writes its status every 30 s; one older than this means it has stopped.
+const HEARTBEAT_STALE_MS = 120_000;
+
+// A count worth showing, in words: "3 nudges", or nothing for zero.
+const counted = (n, one, many) => (n ? plural(n, one, many) : null);
+const since = (iso) => (iso ? `${iso.slice(0, 16).replace("T", " ")} UTC` : "?");
+
 export async function status(ctx) {
   const s = readStatus(ctx.config);
-  const stale = !s || Date.now() - Date.parse(s.heartbeatAt ?? 0) > 120_000;
+  const stale = !s || Date.now() - Date.parse(s.heartbeatAt ?? 0) > HEARTBEAT_STALE_MS;
   if (!s) {
     out("The helper service has not written a status yet: is it running? (docker compose ps, docker compose logs)");
   } else {
-    out(`Paperclip Helper ${s.version}, running since ${s.startedAt}${stale ? `  (NOT RUNNING: last heartbeat ${ago(s.heartbeatAt)})` : ""}`);
+    out(
+      stale
+        ? `Paperclip Helper ${s.version}: NOT RUNNING. Its last heartbeat was ${ago(s.heartbeatAt)} (started ${since(s.startedAt)}).`
+        : `Paperclip Helper ${s.version}: running since ${since(s.startedAt)}.`,
+    );
     if (s.dryRun) out("DRY RUN: components log what they would do and change nothing.");
     const r = s.relay;
-    out(r?.on ? `Relay: on, ${r.handled} deliveries handled, ${r.failed} failed, last ${ago(r.lastEventAt)}${r.lastError ? `; last error: ${r.lastError}` : ""}` : "Relay: off");
+    out(r?.on ? `Relay: on. ${plural(r.handled, "delivery", "deliveries")} handled, ${r.failed} failed, the last ${ago(r.lastEventAt)}.` : "Relay: off.");
+    if (r?.lastError) out(`  Last error: ${r.lastError}`);
     const k = r?.on ? r.conflicts : null;
-    if (k) out(`  Merge conflicts: ${k.sentBack} PRs sent back since start, last look ${ago(k.lastSweepAt)}${k.lastError ? `; last error: ${k.lastError}` : ""}`);
+    if (k) out(`  Merge conflicts: ${plural(k.sentBack, "PR")} sent back, last look ${ago(k.lastSweepAt)}.${k.lastError ? ` Last error: ${k.lastError}` : ""}`);
     const q = r?.on ? r.mergeQueue : null;
-    if (q) out(`  Merge queue: ${q.dropped} drops handled since start, ${q.sentBack} sent back, ${q.noted} told to the board${q.requeued ? `, ${q.requeued} queued again` : ""}${q.lastError ? `; last error: ${q.lastError}` : ""}`);
+    if (q) {
+      const parts = [plural(q.dropped, "drop") + " handled", `${q.sentBack} sent back`, `${q.noted} told to you`, counted(q.requeued, "queued again", "queued again")];
+      out(`  Merge queue: ${parts.filter(Boolean).join(", ")}.${q.lastError ? ` Last error: ${q.lastError}` : ""}`);
+    }
     const w = s.watchdog;
-    out(
-      w?.on
-        ? `Watchdog: on, last check ${ago(w.lastTickAt)} (${w.lastTickMs ?? "?"} ms), ${w.nudges} nudges and ${w.heals} repairs since start` +
-            `${w.stuck ? `; ${w.stuck} issues stuck behind a deferred wake (see the log)` : ""}` +
-            `${w.retries ? `; ${w.retries} deferred wakes retried` : ""}` +
-            `${w.deadLinks ? `; ${w.deadLinks} links to a closed workspace cleared` : ""}` +
-            `${w.questions ? `; ${w.questions} undelivered question cards routed` : ""}` +
-            `${w.ciReports ? `; ${w.ciReports} finished CI runs reported` : ""}` +
-            `${w.ciReruns ? `; ${w.ciReruns} flaky CI runs re-run` : ""}` +
-            `${w.returned ? `; ${w.returned} issues returned to their agent` : ""}` +
-            `${w.resumed ? `; ${w.resumed} issues restored after their agent was resumed` : ""}` +
-            `${w.limitPauses ? `; ${w.limitPauses} agents paused at a usage limit, ${w.limitResumes} resumed` : ""}` +
-            `${w.reopened ? `; ${w.reopened} done issues with an open PR reopened` : ""}` +
-            `${w.wipes ? `; ${w.wipes} wiped review stages reported` : ""}${w.lastError ? `; last error: ${w.lastError}` : ""}`
-        : "Watchdog: off",
-    );
+    if (w?.on) {
+      out(`Watchdog: on. Last check ${ago(w.lastTickAt)}${w.lastTickMs != null ? ` (${w.lastTickMs} ms)` : ""}.`);
+      const done = [
+        counted(w.nudges, "nudge"),
+        counted(w.heals, "blocker repaired", "blockers repaired"),
+        counted(w.retries, "deferred wake retried", "deferred wakes retried"),
+        counted(w.releases, "hold released", "holds released"),
+        counted(w.deadLinks, "link to a closed workspace cleared", "links to a closed workspace cleared"),
+        counted(w.questions, "undelivered question card routed", "undelivered question cards routed"),
+        counted(w.ciReports, "finished CI run reported", "finished CI runs reported"),
+        counted(w.ciReruns, "flaky CI run re-run", "flaky CI runs re-run"),
+        counted(w.returned, "issue returned to its agent", "issues returned to their agent"),
+        counted(w.resumed, "issue restored after a resume", "issues restored after a resume"),
+        w.limitPauses ? `${plural(w.limitPauses, "agent")} paused at a usage limit (${w.limitResumes} resumed)` : null,
+        counted(w.reopened, "done issue with an open PR reopened", "done issues with an open PR reopened"),
+        counted(w.wipes, "wiped review stage reported", "wiped review stages reported"),
+      ].filter(Boolean);
+      out(`  Since start: ${done.length ? done.join(", ") : "nothing needed doing"}.`);
+      if (w.stuck) out(`  ${plural(w.stuck, "issue")} stuck behind a deferred wake: see the log.`);
+      if (w.lastError) out(`  Last error: ${w.lastError}`);
+    } else {
+      out("Watchdog: off.");
+    }
     const c = s.costSync;
     out(
       c?.on
-        ? `Cost sync: on, last run ${ago(c.lastTickAt)}, ${c.posted} runs ($${((c.postedCents ?? 0) / 100).toFixed(2)}) posted since start${c.lastError ? `; last error: ${c.lastError}` : ""}`
-        : "Cost sync: off",
+        ? `Cost sync: on. Last run ${ago(c.lastTickAt)}; ${plural(c.posted ?? 0, "run")} ($${((c.postedCents ?? 0) / 100).toFixed(2)}) posted since start.`
+        : "Cost sync: off.",
     );
+    if (c?.lastError) out(`  Last error: ${c.lastError}`);
     const unpriced = Object.entries(c?.unpriced ?? {});
-    if (unpriced.length) out(`  Not priced: ${unpriced.map(([m, n]) => `${m} (${n} runs)`).join(", ")}; see COST_PRICES_FILE / CODEX_DEFAULT_MODEL.`);
+    if (unpriced.length) out(`  Not priced: ${unpriced.map(([m, n]) => `${m} (${plural(n, "run")})`).join(", ")}; see COST_PRICES_FILE and CODEX_DEFAULT_MODEL.`);
   }
   // Live checks, from this container.
   try {
@@ -877,7 +704,7 @@ export async function status(ctx) {
 // Docker HEALTHCHECK: the service's heartbeat is fresh and the relay answers.
 export async function health(ctx) {
   const s = readStatus(ctx.config);
-  if (!s || Date.now() - Date.parse(s.heartbeatAt ?? 0) > 90_000) throw new Error("no recent heartbeat from the service");
+  if (!s || Date.now() - Date.parse(s.heartbeatAt ?? 0) > HEARTBEAT_STALE_MS) throw new Error("no recent heartbeat from the service");
   if (s.relay?.on) {
     const host = ["0.0.0.0", "::", ""].includes(ctx.config.listenHost) ? "127.0.0.1" : ctx.config.listenHost;
     const res = await fetch(`http://${host.includes(":") ? `[${host}]` : host}:${ctx.config.listenPort}/healthz`, {

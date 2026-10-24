@@ -19,7 +19,7 @@
 
 // Ends every comment the helper writes on a PR, so the relay doesn't copy its
 // own comments back to Paperclip when GitHub delivers them as webhooks.
-import { signed } from "./util.mjs";
+import { CLOSED_STATUSES, prLabel, signed } from "./util.mjs";
 
 export const HELPER_MARK = "<!-- paperclip-helper -->";
 
@@ -28,14 +28,13 @@ const MERGEABLE_TRIES = 5;
 const MERGEABLE_WAIT_MS = 3000;
 // After a merge, give GitHub a moment to notice the base branch moved.
 const AFTER_MERGE_WAIT_MS = 5000;
-const CLOSED = new Set(["done", "cancelled"]);
+const CLOSED = CLOSED_STATUSES;
 
 export function createConflictSweep({ ctx, state, github, identifiersOf, resolveTarget, decide, sleep }) {
   const { config, log } = ctx;
   const wait = sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const records = state.conflicts;
   const stats = { sweeps: 0, sentBack: 0, lastSweepAt: null, lastError: null };
-  const prLabel = (pr) => `PR #${pr.number}`;
 
   // The PR in full once GitHub knows whether it merges; null if it never said.
   async function settled(repo, number) {

@@ -18,14 +18,15 @@
 //
 // Posted events count toward budgets and can't be deleted, so idempotency is
 // careful: a run is recorded as "in flight" before its post and as synced after.
-// A run whose post had an unknown outcome is never posted again.
+// A post with an unknown outcome is posted again with the same idempotency key
+// while Paperclip honours keys (2026.10 and later), and never again otherwise.
 
-import { every, UUID } from "./util.mjs";
+import fs from "node:fs";
+import { every, TERMINAL_RUN, UUID } from "./util.mjs";
 import { estimateUsd, loadPrices, normalizeModel, priceFor, splitTokens } from "./prices.mjs";
 import { readJson, writeJson } from "./store.mjs";
 import { companyAgents } from "./paperclip.mjs";
 
-const TERMINAL_RUN = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
 const RUN_WINDOW = 1000; // Paperclip returns at most this many runs, newest first
 const PROVIDER_OF = { claude_local: "anthropic", codex_local: "openai" };
 const unknown = (v) => !v || v === "unknown";
@@ -36,6 +37,10 @@ const RAISE_MARGIN = 0.1;
 const CODEX_FAST_MODELS = new Set(["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]);
 // A run whose post keeps ending with an unknown outcome is given up after this many retries.
 const MAX_INFLIGHT_RETRIES = 5;
+// A refusal of the board key itself: every later request would fail the same way.
+const stopsPass = (err) => err?.status === 401 || err?.status === 403 || err?.status === 429;
+// Paperclip's activity log returns at most this many entries per request.
+const ACTIVITY_WINDOW = 500;
 // Rejections that are about the event itself, so posting it again won't help.
 const FINAL_REJECTIONS = new Set([400, 404, 422]);
 // Cost events carry this key plus the run id, so Paperclip records each run once
@@ -68,8 +73,9 @@ export function claudeCost({ reported = null, floor = null }) {
   return { usd: floor, basis: "token floor" };
 }
 
-// Paperclip stored whole cents until 2026.10 (it now takes fractions), and a run
-// on a cheap model often costs a fraction of one. Each run's exact cost is added to what's carried for the
+// Paperclip stored whole cents until 2026.10 (it now takes fractions; whole cents
+// work on every version), and a run on a cheap model often costs a fraction of
+// one. Each run's exact cost is added to what's carried for the
 // same agent, provider, biller and model; whole cents are posted and the rest
 // waits for the next run, so totals stay within a cent of the exact sum.
 const carryKey = (post) => [post.agentId, post.provider, post.biller, post.model].join("|");
@@ -110,15 +116,67 @@ export function createCostSync(ctx) {
     return Date.parse(floor) > Date.parse(since) ? floor : since;
   }
 
-  // Did this user post cost events to the company before? Used when the state
-  // file is missing, so a lost data directory doesn't post everything twice.
-  async function postedBefore(companyId, userId) {
-    const rows = await api.request("GET", `/api/companies/${companyId}/activity?entityType=cost_event&limit=500`);
+  // This user's cost posts to the company in Paperclip's activity log (the latest
+  // 500, newest first): { rows, runs: Map runId → when posted, full }. Used when the
+  // state file is missing, so a lost data directory doesn't post everything twice.
+  async function earlierPosts(companyId, userId) {
+    const rows = await api.request("GET", `/api/companies/${companyId}/activity?entityType=cost_event&limit=${ACTIVITY_WINDOW}`);
     const list = Array.isArray(rows) ? rows : Array.isArray(rows?.items) ? rows.items : [];
-    return list.some((a) => a?.action === "cost.reported" && a?.actorType === "user" && a?.actorId === userId);
+    const mine = list.filter((a) => a?.action === "cost.reported" && a?.actorType === "user" && a?.actorId === userId);
+    const runs = new Map();
+    for (const a of mine) {
+      const id = a.runId ?? a.details?.heartbeatRunId;
+      if (id && !runs.has(id)) runs.set(id, a.createdAt ?? null);
+    }
+    return { rows: mine, runs, full: list.length >= ACTIVITY_WINDOW };
   }
 
-  const prices = () => loadPrices(config.costPricesFile, log);
+  // No state file (lost, or corrupt) and no floor yet: count the runs this user
+  // already posted, as the activity log names them, as synced. Older posts may lie
+  // beyond the log's window, so with a full window nothing older than its oldest
+  // entry is synced; when the log doesn't name the runs, or can't be read, only
+  // runs that finish from now on. Whatever COST_SYNC_SINCE says: the installer sets
+  // it, so it doesn't mean the earlier posts were deliberately given up.
+  async function recoverState(cs, companyId, userId) {
+    let earlier = null;
+    try {
+      earlier = await earlierPosts(companyId, userId);
+    } catch (err) {
+      log.warn("cost sync: could not check for earlier cost posts", { company: companyId, error: err.message });
+    }
+    if (earlier && !earlier.rows.length) return; // never posted here: sync everything
+    const where = { company: companyId, stateFile: config.costStateFile };
+    if (!earlier || earlier.runs.size < earlier.rows.length) {
+      // Can't tell which runs were posted: only runs that finish from now on.
+      cs.floor = new Date().toISOString();
+      log.warn("cost sync: no state file, and earlier cost posts by you can't be matched to their runs; syncing only runs that finish from now on, so nothing is posted twice", where);
+      return;
+    }
+    for (const [id, at] of earlier.runs) cs.synced[id] = at ?? new Date().toISOString();
+    if (earlier.full) {
+      // Posts older than the log's window can't be seen: nothing older than its oldest entry.
+      const oldest = Math.min(...earlier.rows.map((a) => Date.parse(a.createdAt ?? "")).filter(Number.isFinite));
+      cs.floor = new Date(Number.isFinite(oldest) ? oldest : Date.now()).toISOString();
+    }
+    log.warn(
+      `cost sync: no state file; the ${earlier.runs.size} runs Paperclip's activity log shows you posted count as synced` +
+        (cs.floor ? `, and runs that finished before ${cs.floor} are left alone` : ""),
+      where,
+    );
+  }
+
+
+  // The price table, read again only when the prices file changes (so a malformed
+  // entry is reported once, not every pass).
+  let priceCache = null;
+  const prices = () => {
+    let stamp = "none";
+    try {
+      stamp = String(fs.statSync(config.costPricesFile).mtimeMs);
+    } catch {}
+    if (priceCache?.stamp !== stamp) priceCache = { stamp, table: loadPrices(config.costPricesFile, log) };
+    return priceCache.table;
+  };
 
   // Whether a Codex run used fast mode (twice the price), from the run's own
   // record rather than the agent's current setting: the ACP engine stores
@@ -356,7 +414,7 @@ export function createCostSync(ctx) {
           log.warn("cost sync: Paperclip already has a cost event for this run; not posting another", { run: runId });
           return false;
         }
-        if (err.status >= 400 && err.status < 500 && body.issueId && attempt === 1) {
+        if ((err.status === 404 || err.status === 422) && body.issueId && attempt === 1) {
           const { issueId: _gone, ...rest } = body; // the issue may be gone: post without it
           body = rest;
           if (state.inflight[runId]) state.inflight[runId].body = body;
@@ -412,7 +470,13 @@ export function createCostSync(ctx) {
         log.warn("cost sync: a post kept ending with an unknown outcome; giving that run up", { run: runId });
         continue;
       }
-      if (await send(state, entry.companyId, runId, entry.body, entry.carry, entry.finishedAt)) posted(entry.body.costCents);
+      try {
+        if (await send(state, entry.companyId, runId, entry.body, entry.carry, entry.finishedAt)) posted(entry.body.costCents);
+      } catch (err) {
+        // send() kept the entry for the next pass and said why; only a refusal of the
+        // key itself (revoked, rate limited) is worth stopping the pass for.
+        if (stopsPass(err)) throw err;
+      }
     }
   }
 
@@ -432,54 +496,46 @@ export function createCostSync(ctx) {
         cents += c;
       });
       for (const companyId of companyIds) {
-        const cs = companyState(state, companyId);
-        if (fresh && !config.costSyncSince && !cs.floor) {
-          let before = true;
-          try {
-            before = await postedBefore(companyId, userId);
-          } catch (err) {
-            log.warn("cost sync: could not check for earlier cost posts", { company: companyId, error: err.message });
+        try {
+          const cs = companyState(state, companyId);
+          if (fresh && !cs.floor) await recoverState(cs, companyId, userId);
+          const { items, list } = await scan(companyId, state, table, Date.now());
+          // Oldest first, so carried fractions follow the order the runs finished.
+          items.sort((a, b) => (Date.parse(a.run.finishedAt) || 0) - (Date.parse(b.run.finishedAt) || 0));
+          for (const item of items) {
+            if (item.unpriced && !warnedModels.has(item.unpriced)) {
+              warnedModels.add(item.unpriced);
+              log.warn(`cost sync: ${item.skip}; those runs are left unsynced`, { model: item.unpriced, pricesFile: config.costPricesFile });
+            }
+            if (item.unpriced) unpriced[item.unpriced] = (unpriced[item.unpriced] ?? 0) + 1;
+            if (item.skip) {
+              if (item.final) cs.synced[item.run.id] = item.run.finishedAt;
+              continue;
+            }
+            if (assignCents(state, item) === 0) {
+              // Less than a cent so far: carry it, and count the run as synced.
+              state.carry[item.carry.key] = item.carry.rest;
+              cs.synced[item.run.id] = item.run.finishedAt;
+              continue;
+            }
+            if (config.dryRun) {
+              log("cost sync: would post (dry run)", { run: item.run.id, agent: item.agent?.name, costCents: item.post.costCents, basis: item.basis });
+              state.carry[item.carry.key] = item.carry.rest; // in memory only: dry runs save nothing
+              continue;
+            }
+            if (await post(state, companyId, item)) {
+              posted += 1;
+              cents += item.post.costCents;
+            }
           }
-          if (before) {
-            cs.floor = new Date().toISOString();
-            log.warn(
-              "cost sync: no state file, but earlier cost events by you exist (or couldn't be checked); " +
-                "syncing only runs that finish from now on, so nothing is posted twice. " +
-                "Set COST_SYNC_SINCE to sync from an earlier date.",
-              { company: companyId, stateFile: config.costStateFile },
-            );
-          }
+          advanceFloor(state, companyId, list);
+        } catch (err) {
+          // One company's failure (a timeout, a scan Paperclip refused) leaves the others to sync.
+          if (stopsPass(err)) throw err;
+          complete = false;
+          stats.lastError = err.message;
+          log.warn("cost sync: a company's pass stopped; the next pass picks it up again", { company: companyId, error: err.message });
         }
-        const { items, list } = await scan(companyId, state, table, Date.now());
-        // Oldest first, so carried fractions follow the order the runs finished.
-        items.sort((a, b) => (Date.parse(a.run.finishedAt) || 0) - (Date.parse(b.run.finishedAt) || 0));
-        for (const item of items) {
-          if (item.unpriced && !warnedModels.has(item.unpriced)) {
-            warnedModels.add(item.unpriced);
-            log.warn(`cost sync: ${item.skip}; those runs are left unsynced`, { model: item.unpriced, pricesFile: config.costPricesFile });
-          }
-          if (item.unpriced) unpriced[item.unpriced] = (unpriced[item.unpriced] ?? 0) + 1;
-          if (item.skip) {
-            if (item.final) cs.synced[item.run.id] = item.run.finishedAt;
-            continue;
-          }
-          if (assignCents(state, item) === 0) {
-            // Less than a cent so far: carry it, and count the run as synced.
-            state.carry[item.carry.key] = item.carry.rest;
-            cs.synced[item.run.id] = item.run.finishedAt;
-            continue;
-          }
-          if (config.dryRun) {
-            log("cost sync: would post (dry run)", { run: item.run.id, agent: item.agent?.name, costCents: item.post.costCents, basis: item.basis });
-            state.carry[item.carry.key] = item.carry.rest; // in memory only: dry runs save nothing
-            continue;
-          }
-          if (await post(state, companyId, item)) {
-            posted += 1;
-            cents += item.post.costCents;
-          }
-        }
-        advanceFloor(state, companyId, list);
       }
     } catch (err) {
       complete = false;
@@ -536,9 +592,11 @@ export function createCostSync(ctx) {
       const reasons = new Map();
       for (const i of skipped) reasons.set(i.skip, (reasons.get(i.skip) ?? 0) + 1);
       for (const [reason, n] of reasons) if (reason !== "settling" && reason !== "not finished") print(`  not synced: ${n} runs, ${reason}`);
-      if (fresh && !config.costSyncSince) {
-        const before = await postedBefore(companyId, userId).catch(() => true);
-        if (before) print("  Earlier cost events by you exist and there's no state file: only new runs will be synced (see COST_SYNC_SINCE).");
+      if (fresh) {
+        const earlier = await earlierPosts(companyId, userId).catch(() => null);
+        if (!earlier || earlier.rows.length) {
+          print("  There's no state file, but you have posted cost events here before: the runs Paperclip's activity log shows you posted won't be posted again.");
+        }
       }
       await budgetImpact(companyId, postable, print);
       total += sub;
@@ -739,10 +797,7 @@ export function createCostSync(ctx) {
 
       // Duplicates among this user's own cost posts (Paperclip's activity log keeps
       // the latest 500 per request).
-      const acts = await api.request("GET", `/api/companies/${companyId}/activity?entityType=cost_event&limit=500`).catch(() => null);
-      const rows = (Array.isArray(acts) ? acts : Array.isArray(acts?.items) ? acts.items : []).filter(
-        (r) => r?.action === "cost.reported" && r?.actorType === "user" && r?.actorId === userId,
-      );
+      const rows = (await earlierPosts(companyId, userId).catch(() => null))?.rows ?? [];
       const perRun = new Map();
       for (const r of rows) {
         const id = r.runId ?? r.details?.heartbeatRunId;

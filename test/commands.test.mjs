@@ -70,8 +70,8 @@ test("comment posts the text as a comment, and needs both an issue and text", as
   const env = await setup();
   t.after(env.close);
   env.db.issues.push({ id: uuid(), identifier: "ACM-4", companyId: ids.company, status: "todo" });
-  await assert.rejects(cmd.comment(env.ctx, "ACM-4", ""), /usage: comment/);
-  await assert.rejects(cmd.comment(env.ctx, undefined, "hi"), /usage: comment/);
+  await assert.rejects(cmd.comment(env.ctx, "ACM-4", ""), /usage: pch comment/);
+  await assert.rejects(cmd.comment(env.ctx, undefined, "hi"), /usage: pch comment/);
   assert.equal(env.db.comments.length, 0);
   const lines = await captureOutput(() => cmd.comment(env.ctx, "acm-4", "Please rebase first."));
   assert.deepEqual(env.db.comments.map((c) => [c.identifier, c.body, c.via]), [["ACM-4", "Please rebase first.\n\n_Sent with Paperclip Helper (`pch`)._", "comment"]]);
@@ -133,8 +133,10 @@ test("status and health read the service's status file", async (t) => {
   const ok = await captureOutput(() => cmd.health(env.ctx));
   assert.deepEqual(ok, ["ok"]);
   const lines = (await captureOutput(() => cmd.status(env.ctx))).join("\n");
-  assert.match(lines, /Watchdog: on, .*3 nudges and 1 repairs/);
-  assert.match(lines, /Cost sync: on, .*5 runs \(\$12\.34\)/);
+  assert.match(lines, /^Paperclip Helper 1\.0\.0: running since /m);
+  assert.match(lines, /^Watchdog: on\. Last check /m);
+  assert.match(lines, /^  Since start: 3 nudges, 1 blocker repaired\.$/m);
+  assert.match(lines, /^Cost sync: on\. .*5 runs \(\$12\.34\) posted since start/m);
   assert.match(lines, /Not priced: gpt-9 \(2 runs\)/);
   assert.match(lines, /as Operator; key "paperclip-helper", no expiry/);
   // A Paperclip that reports no version or commit adds nothing to the line.
@@ -261,7 +263,7 @@ test("release refuses a still-running run, a bad outcome, and an issue without a
   env.db.issueRuns[issue.id][0].status = "running";
   await assert.rejects(cmd.release(env.ctx, "ACM-52", ["--apply"]), /Not releasing: the run is still running/);
   await assert.rejects(cmd.release(env.ctx, "ACM-52", ["--outcome=maybe"]), /--outcome must be one of/);
-  await assert.rejects(cmd.release(env.ctx, undefined), /usage: release/);
+  await assert.rejects(cmd.release(env.ctx, undefined), /usage: pch release/);
   assert.equal(env.db.resolutions, undefined);
 
   issue.executionBlocker = null;

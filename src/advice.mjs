@@ -12,10 +12,11 @@
 // rule mirrors a situation in watchdog.mjs or one the watchdog deliberately
 // leaves to the board, so keep the two in step.
 
-import { approvalWaitingOn, ts } from "./util.mjs";
+import { ACTIVE_RUN, approvalWaitingOn, ts } from "./util.mjs";
 import { cardText, strandedCard } from "./questions.mjs";
+import { escalatedReview } from "./board-held.mjs";
+import { PARTICIPANT_RECOVERY_CAUSE } from "./resume.mjs";
 
-const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
 const ASLEEP = new Set(["paused", "terminated", "pending_approval"]);
 const QUEUED_TOO_LONG_MS = 10 * 60_000;
 const LOOP_WINDOW_MS = 45 * 60_000;
@@ -47,6 +48,11 @@ export function advise(facts) {
     deadLinkRun = null, // { runId, workspaceId }: the assignee's last run failed restoring a linked workspace
     cards = [], // the issue's pending question cards (questions.mjs)
     routed = {}, // card id → the issue the watchdog routed it to
+    limitPause = null, // the watchdog paused the assignee at a usage limit: { label, what, resetAt, resumeAt } (labels)
+    lastFailure = null, // the assignee's latest run failed on its provider: { kind: "limit" | "transient", label, what, resetAt }
+    participant = null, // the agent a pending review stage waits on: { name, status }
+    stagesWipedBy = null, // in review with no stage: who removed its stages (watchdog 17), when the activity log shows it
+    ciRun = null, // the CI run the assignee's latest comments say it waits on: "repo#id" or the bare id
     config = {},
     now = Date.now(),
   } = facts;
@@ -74,12 +80,28 @@ export function advise(facts) {
       watchdog: "manual",
     };
   }
+  const sweep = config.watchdog !== false && config.watchdogResumeSweep !== false;
+  if (assignee?.status === "paused" && limitPause) {
+    return {
+      what:
+        `The watchdog paused ${who} because its ${limitPause.label} ${limitPause.what} was reached` +
+        `${limitPause.resetAt ? `; it resets ${limitPause.resetAt}` : ""}. It resumes ${who} at ${limitPause.resumeAt}.`,
+      steps: [
+        "Nothing to do but wait: every run before the reset would fail the same way.",
+        `To resume ${who} sooner (the limit was raised, say), resume it in Paperclip; its issues blocked during the pause are restored after that too.`,
+      ],
+      watchdog: "auto",
+      autoNote: "The watchdog resumes exactly the agents it paused, a few minutes after the reset, and then restores the issues Paperclip blocked meanwhile.",
+    };
+  }
   if (ASLEEP.has(assignee?.status)) {
     return {
       what: `${who} is ${assignee.status.replace("_", " ")}, so Paperclip won't run it.`,
       steps: [
         `Resume ${who} in Paperclip (or approve it, or reassign the issue).`,
-        `If nothing starts a few minutes later: ${comment(`${who}, please continue this issue.`)}`,
+        sweep
+          ? `Once ${who} is resumed, the watchdog restores the issues Paperclip blocked during the pause and wakes them; others wait for you.`
+          : `If nothing starts a few minutes later: ${comment(`${who}, please continue this issue.`)}`,
       ],
       watchdog: "manual",
     };
@@ -143,6 +165,21 @@ export function advise(facts) {
     };
   }
 
+  if (escalatedReview(issue, me)) {
+    const rounds = issue.executionState?.changesRequestedCount;
+    const back = config.watchdog !== false && config.watchdogReturnEscalatedReviews === true;
+    return {
+      what:
+        `Paperclip handed this review to you after ${rounds ? `${rounds} agent change requests` : "the agents' change requests"} in a row on its review stage ` +
+        "(its review-round limit, maxReviewRounds), instead of back to the implementer.",
+      steps: [
+        `Decide it: pch approve ${identifier} "<note>"   or   pch changes ${identifier} "<what to change>"   (changes go back to the implementer, and give the agents more rounds)`,
+        "To let the agents settle more reviews themselves, raise maxReviewRounds in the execution policy.",
+      ],
+      watchdog: back ? "auto" : "manual",
+      autoNote: `The watchdog returns it to the implementer with the reviewer's latest request (WATCHDOG_RETURN_ESCALATED_REVIEWS), at most ${config.watchdogMaxNudges ?? 2} times per issue.`,
+    };
+  }
   if (approvalWaitingOn(issue, me)) {
     const stage = issue.executionState?.currentStageType ?? "decision";
     return {
@@ -183,6 +220,38 @@ export function advise(facts) {
         "A hold from a run that was still doing something clears on its own within minutes; one that stays needs that message.",
       ],
       watchdog: "manual",
+    };
+  }
+
+  // A run that hit its plan's usage limit: every run before the reset fails the same way.
+  if (lastFailure?.kind === "limit") {
+    const pauseOn = config.watchdog !== false && config.watchdogLimitPause !== false;
+    return {
+      what: `${who}'s last run hit its ${lastFailure.label} ${lastFailure.what}${lastFailure.resetAt ? `, which resets ${lastFailure.resetAt}` : ""}. Every run before then fails the same way.`,
+      steps: [
+        "Wait for the reset (or raise the plan's limit); nothing on the issue helps before then.",
+        `After the reset: ${comment(`${who}, the usage limit has reset. Please continue this issue.`)}`,
+      ],
+      watchdog: pauseOn ? "auto" : "manual",
+      autoNote:
+        "The watchdog pauses the agents on that account as each goes idle, so Paperclip stops retrying them, resumes them a few minutes after the reset, " +
+        "and then restores the issues Paperclip blocked meanwhile.",
+    };
+  }
+
+  if (recovery?.cause === PARTICIPANT_RECOVERY_CAUSE) {
+    const reviewer = participant?.name ?? "the reviewer";
+    const asleep = ASLEEP.has(participant?.status);
+    return {
+      what:
+        `Paperclip's recovery blocked this review because it couldn't wake ${reviewer}, the agent its pending review stage waits on` +
+        `${asleep ? ` (${reviewer} is ${participant.status.replace("_", " ")})` : ""}.${note}`,
+      steps: [
+        ...(asleep ? [`Resume ${reviewer} in Paperclip.`] : []),
+        `${asleep ? "Then set" : "Set"} the issue's status back to In review: Paperclip re-pends the stage and wakes ${reviewer}.`,
+      ],
+      watchdog: asleep && sweep ? "auto" : "manual",
+      autoNote: `Once ${reviewer} is resumed and the resume has settled, the watchdog puts the issue back in review by itself, if Paperclip blocked it while ${reviewer} was paused.`,
     };
   }
 
@@ -263,6 +332,8 @@ export function advise(facts) {
   if (issue.status === "blocked") {
     const finalizing = linked.filter((b) => b.isPendingFinalize);
     const open = linked.filter((b) => b.status !== "done" && b.status !== "cancelled");
+    // Paperclip never counts a cancelled blocker as resolved: the issue stays blocked.
+    const cancelled = linked.filter((b) => b.status === "cancelled");
     if (open.length) {
       return {
         what: `It is waiting on ${open.map((b) => `${b.identifier ?? b.id} (${b.status})`).join(", ")}.`,
@@ -279,6 +350,18 @@ export function advise(facts) {
           "If it is still running, wait: Paperclip unblocks the issue when it succeeds.",
         ],
         watchdog: config.watchdogHealFailedFinalize === false ? "manual" : auto,
+      };
+    }
+    if (cancelled.length) {
+      const names = cancelled.map((b) => b.identifier ?? b.id).join(", ");
+      return {
+        what: `It is blocked by ${names}, which ${cancelled.length === 1 ? "was" : "were"} cancelled. Paperclip never counts a cancelled blocker as resolved, so the issue stays blocked.`,
+        steps: [
+          `If the work landed elsewhere or isn't needed: remove ${names} from "Blocked by" (and link what replaced it). That releases the issue.`,
+          "If it is still needed: say so on the issue and create a replacement to block on.",
+        ],
+        watchdog: config.watchdog === false || config.watchdogCancelledBlockers === false ? "manual" : "auto",
+        autoNote: `The watchdog tells ${who} once, quoting why the blocker was cancelled, so it can remove or replace the blocker itself.`,
       };
     }
     if (linked.length) {
@@ -325,6 +408,20 @@ export function advise(facts) {
     };
   }
 
+  // In review with no stage pending: nothing will wake a reviewer.
+  if (issue.status === "in_review" && issue.executionState?.status !== "pending") {
+    return {
+      what:
+        "It is in review, but no review stage is pending, so no reviewer is woken: it waits for someone to move it." +
+        (stagesWipedBy ? ` Its review stages were removed by ${stagesWipedBy} (an update that sent executionPolicy.stages: [], a Paperclip bug).` : ""),
+      steps: [
+        "If it needs a review: restore the stages in its execution policy, then set it back to In review.",
+        "If it doesn't: merge its PR (the relay closes an issue whose stages were removed) or set it to done.",
+      ],
+      watchdog: "manual",
+    };
+  }
+
   const worked = runs.filter((r) => !refused(r));
   const latest = worked[0] ?? null;
   const quietFor = runs[0] ? mins(now - (ts(runs[0].finishedAt) || ts(runs[0].createdAt))) : null;
@@ -354,6 +451,13 @@ export function advise(facts) {
       watchdog: "manual",
     };
   }
+  if (latest && latest.status === "failed" && lastFailure?.kind === "transient" && mine(latest)) {
+    return {
+      what: `${who}'s last run failed on ${lastFailure.label}'s capacity ${quietFor} ago (the model was busy, not a usage limit).`,
+      steps: [`Paperclip retries it by itself. If no retry comes: ${comment(`${who}, please retry this issue.`)}`],
+      watchdog: null,
+    };
+  }
   if (latest && ["failed", "timed_out"].includes(latest.status)) {
     return {
       what: `${who}'s last run ${latest.status === "failed" ? "failed" : "timed out"}${latest.errorCode ? ` (${latest.errorCode})` : ""} ${quietFor} ago.`,
@@ -362,6 +466,18 @@ export function advise(facts) {
         `Once the cause is fixed: ${comment(`${who}, please retry this issue.`)}`,
       ],
       watchdog: "manual",
+    };
+  }
+  if (latest && latest.status === "succeeded" && ciRun) {
+    const reports = config.watchdog !== false && config.watchdogCiRuns !== false && Boolean(config.githubToken || config.githubTokenFile);
+    return {
+      what: `${who}'s last run finished ${quietFor} ago, waiting on CI run ${ciRun}.${note}`,
+      steps: [
+        "Wait for the run to finish.",
+        `If it has finished and ${who} hasn't heard: ${comment(`${who}, CI run ${ciRun} has finished. Please check its result and continue.`)}`,
+      ],
+      watchdog: reports ? "auto" : "manual",
+      autoNote: `Once the run has finished and ${who} hasn't run since, the watchdog comments with its result and the failed jobs, which wakes ${who} (needs a GitHub token with Actions: Read).`,
     };
   }
   if (latest && latest.status === "succeeded") {
@@ -395,7 +511,9 @@ export function llmPrompt({ identifier, report, advice, lastComments = [] }) {
     "as a Paperclip UI step or a `pch` command, and (3) what you would need to see if you can't tell.",
     "Things worth knowing: a comment from me (a board user) wakes the issue's assignee; a wake marked",
     "`deferred_issue_execution` is parked behind an earlier run; a run cancelled with `issue_reassigned` was",
-    "cut off by a hand-off; `execution_reconciliation_required` means Paperclip refused the run before it started.",
+    "cut off by a hand-off; `execution_reconciliation_required` means Paperclip refused the run before it started;",
+    "a run cancelled with `agent_paused` was stopped by a pause; Paperclip never counts a cancelled blocker as resolved;",
+    "and a run that failed on a usage limit fails again on every retry until the limit resets.",
     "",
     "## pch why",
     report,

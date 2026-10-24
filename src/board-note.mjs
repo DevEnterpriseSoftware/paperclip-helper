@@ -3,7 +3,9 @@
 // when that issue is in the same company (a board comment wakes the issue's
 // assignee, so it should be assigned to a person or to nobody).
 
-export async function noteToBoard({ api, config, log }, companyId, text, { source = "watchdog", signature = "_Paperclip Helper watchdog._", ...logExtra } = {}) {
+import { WATCHDOG_SIGNATURE } from "./util.mjs";
+
+export async function noteToBoard({ api, config, log }, companyId, text, { source = "watchdog", signature = WATCHDOG_SIGNATURE, ...logExtra } = {}) {
   log.warn(`${source}: a note for the board`, { text, ...logExtra });
   const ref = config.watchdogNotifyIssue;
   if (!ref || config.dryRun) return false;

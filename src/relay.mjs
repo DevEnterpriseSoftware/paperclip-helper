@@ -46,7 +46,7 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
-import { approvalWaitingOn, DECISION_STATUS, every, RELAYED_SIGNATURE, signed, ts } from "./util.mjs";
+import { approvalWaitingOn, DECISION_STATUS, every, prLabel, RELAYED_SIGNATURE, signed, ts } from "./util.mjs";
 import { createGitHub } from "./github.mjs";
 import { createConflictSweep, HELPER_MARK } from "./conflicts.mjs";
 import { createMergeQueueHandler, QUEUE_BOT } from "./merge-queue.mjs";
@@ -86,7 +86,6 @@ function stripCommand(text) {
   return (text ?? "").trim().replace(/^\/(changes|approve)\b\s*/i, "");
 }
 
-const prLabel = (pr) => `PR #${pr.number}`;
 
 // Whether a work product is this PR. Agents create PR work products themselves,
 // in no fixed shape, so accept the PR's URL, metadata.repo ("owner/repo") plus
@@ -178,11 +177,18 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       seen.set(key, issue);
       return true;
     };
-    const get = (ref) => api.request("GET", `/api/issues/${encodeURIComponent(ref)}`).catch(() => null);
+    // Only "no such issue" (or not one this key may see) means not found. Anything
+    // else (Paperclip down, a revoked key) fails the delivery, so GitHub's Redeliver
+    // can try again, rather than losing the decision as "no issue found".
+    const missing = (fallback) => (err) => {
+      if (err?.status === 404 || err?.status === 403) return fallback;
+      throw err;
+    };
+    const get = (ref) => api.request("GET", `/api/issues/${encodeURIComponent(ref)}`).catch(missing(null));
     const subtasks = async (issue) => {
       const rows = await api
         .request("GET", `/api/companies/${issue.companyId}/issues?parentId=${issue.id}&limit=100`)
-        .catch(() => []);
+        .catch(missing([]));
       const out = [];
       for (const row of Array.isArray(rows) ? rows : []) {
         // List rows carry executionState: null, so read any subtask in review in full.
@@ -243,7 +249,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
     if (waiting.length === 0) return { issue: first, waiting: false };
     if (waiting.length === 1) return found(waiting[0]);
     for (const issue of waiting) {
-      const products = await api.request("GET", `/api/issues/${issue.id}/work-products`).catch(() => []);
+      const products = await api.request("GET", `/api/issues/${issue.id}/work-products`).catch(missing([]));
       if ((Array.isArray(products) ? products : []).some((wp) => isWorkProductOf(wp, pr))) return found(issue);
     }
     // Several wait on you and none records this PR: don't guess which to decide.
@@ -382,8 +388,10 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       return { identifier, action: "done", reason: "its review stages were wiped" };
     }
     if (!waiting) {
-      // Not your turn: keep the information, change nothing.
-      const result = await addComment(identifier, comment);
+      // Not your turn: keep the information, change nothing, and say so: a merge's
+      // "Approved:" would read as a decision that wasn't recorded.
+      const state = stageType ? `its ${stageType} stage doesn't wait on you` : `it is ${issue.status} with no stage waiting on you`;
+      const result = await addComment(identifier, `${comment.replace(/^Approved: /, "")}\n\n_Not recorded as a decision: ${state}._`);
       return { ...result, reason: "decision is not waiting on you", status: issue.status, stageType };
     }
     if (ambiguous) {
@@ -512,11 +520,12 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
 
   // `meta.delivery`: the delivery id, for work that finishes after the webhook is answered.
   async function handle(event, payload, meta = {}) {
+    // A ping first: an organisation webhook's has no repository.
+    if (event === "ping") return { pong: true, zen: payload?.zen ?? null };
     const repo = payload?.repository?.full_name?.toLowerCase();
     if (config.repos.length && !config.repos.includes(repo)) {
       return { ignored: `repository ${repo} is not in GITHUB_REPOS` };
     }
-    if (event === "ping") return { pong: true, zen: payload?.zen ?? null };
     await ctx.identity(); // loads the issue prefixes
     const prefixes = ctx.prefixes();
     const sender = payload?.sender?.login?.toLowerCase();
@@ -537,7 +546,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
       }
       if (payload.action === "enqueued") {
         mergeQueue?.enqueued(repo, payload);
-        return { ignored: "pull_request.enqueued (noted who queued it)" };
+        return { ignored: mergeQueue ? "pull_request.enqueued (noted who queued it)" : "pull_request.enqueued" };
       }
       if (payload.action === "dequeued") {
         if (!mergeQueue) return { ignored: "pull_request.dequeued (RELAY_MERGE_QUEUE is off, or no GitHub token)" };
@@ -551,7 +560,14 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
           .then((result) => log("relay: merge-queue drop", { repo, pr: number, reason: payload.reason ?? null, result }))
           .catch((err) => {
             mergeQueue.stats.lastError = err.message;
-            if (meta.delivery) deliveries.delete(meta.delivery);
+            if (meta.delivery) {
+              // receive() saved the delivery already: forget it on disk too, so a restart doesn't refuse the Redeliver.
+              deliveries.delete(meta.delivery);
+              state.touch();
+              try {
+                state.save();
+              } catch {}
+            }
             throw new Error(`${repo}#${number}: ${err.message}`);
           });
         inBackground(work, "relay: merge-queue drop failed");
@@ -590,7 +606,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
         return { ignored: "GitHub approval (merge to approve in Paperclip)" };
       }
       const kind = state === "changes_requested" ? "changes" : command(review.body);
-      const asked = command(review.body) ? `Your \`/${kind}\`` : "Your Request changes";
+      const asked = command(review.body) ? `Your \`/${command(review.body)}\`` : "Your Request changes";
       const identifiers = findIdentifiers(pr, prefixes);
       if (!identifiers.length) {
         const ignored = { ignored: `${prLabel(pr)} names no ${prefixLabel()} issue` };
@@ -661,7 +677,7 @@ export function createRelay(ctx, state, { github, sleep } = {}) {
     }
     if (delivery && deliveries.has(delivery)) return send(res, 200, { duplicate: delivery });
     if (delivery) {
-      deliveries.set(delivery, { at: Date.now() });
+      deliveries.set(delivery, { at: ctx.now() });
       state.touch();
     }
     try {

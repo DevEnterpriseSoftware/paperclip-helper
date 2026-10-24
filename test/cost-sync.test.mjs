@@ -240,11 +240,13 @@ test("without idempotency keys, a 5xx is retried next time; a timeout is not", a
   const path = `/api/companies/${ids.company}/cost-events`;
 
   env.fake.fail("POST", path, 503);
-  await assert.rejects(env.sync.tick());
+  await env.sync.tick(); // the company's pass stops there; the tick carries on
+  assert.ok(env.sync.stats.lastError);
   assert.equal(env.db.costEvents.length, 0);
 
   env.fake.fail("POST", path, 0, { hang: true });
-  await assert.rejects(env.sync.tick());
+  await env.sync.tick(); // the company's pass stops there; the tick carries on
+  assert.ok(env.sync.stats.lastError);
   const hung = env.fake.requests.filter((r) => r.method === "POST").at(-1).body.heartbeatRunId;
 
   await env.sync.tick();
@@ -341,4 +343,54 @@ test("the preview lists agents and warns about budget hard stops", async (t) => 
   assert.match(text, /not synced: 1 runs, model unknown/);
   assert.match(text, /WARNING: this reaches the hard stop/);
   assert.equal(env.db.costEvents.length, 0);
+});
+
+// ---------------------------------------------------------------- a lost state file, refused posts
+
+test("no state file: the runs your earlier posts name are counted as synced, the rest posted, whatever COST_SYNC_SINCE says", async (t) => {
+  // The installer writes COST_SYNC_SINCE; it must not turn the recovery off.
+  const env = await syncEnv(t, { COST_SYNC_SINCE: "2020-01-01T00:00:00Z" });
+  env.db.activity.push({ action: "cost.reported", actorType: "user", actorId: ids.user, entityType: "cost_event", runId: env.runs.claude.id, createdAt: minutesAgo(20) });
+  await env.sync.tick();
+  const posted = byRun(env.db);
+  assert.equal(posted.has(env.runs.claude.id), false, "already posted before the state was lost");
+  assert.ok(posted.has(env.runs.codex.id), "never posted: synced now");
+  assert.ok(env.logs.some((l) => l.level === "warn" && /no state file; the 1 runs Paperclip's activity log shows you posted count as synced/.test(l.msg)));
+});
+
+test("no state file and a full activity window: nothing older than its oldest entry is synced", async (t) => {
+  const env = await syncEnv(t);
+  // 500 posts by you, the oldest 25 minutes ago: the runs that finished 30 minutes ago may be among older posts.
+  for (let i = 0; i < 500; i++) {
+    env.db.activity.push({ action: "cost.reported", actorType: "user", actorId: ids.user, entityType: "cost_event", runId: uuid(), createdAt: minutesAgo(25 - i / 100) });
+  }
+  const fresh = env.db.heartbeatRuns.find((r) => r.id === env.runs.claude.id);
+  const late = { ...fresh, id: uuid(), finishedAt: minutesAgo(10), createdAt: minutesAgo(12) };
+  env.db.heartbeatRuns.push(late);
+  await env.sync.tick();
+  const posted = byRun(env.db);
+  assert.deepEqual([...posted.keys()], [late.id]);
+});
+
+test("a cost event Paperclip refuses outright (422) is skipped once and never posted again", async (t) => {
+  const env = await syncEnv(t);
+  const path = `/api/companies/${ids.company}/cost-events`;
+  // Twice: the first refusal is retried without the issue, in case the issue is gone.
+  env.fake.fail("POST", path, 422, { times: 2, body: { error: "costCents must be positive" } });
+  await env.sync.tick();
+  const state = JSON.parse(fs.readFileSync(env.ctx.config.costStateFile, "utf8"));
+  const skipped = Object.entries(state.skipped).filter(([, why]) => /rejected/.test(why));
+  assert.equal(skipped.length, 1);
+  const [runId] = skipped[0];
+  assert.equal(state.inflight[runId], undefined);
+  await env.sync.tick();
+  assert.equal(env.db.costEvents.filter((e) => e.heartbeatRunId === runId).length, 0);
+});
+
+test("a 429 doesn't drop the issue from the event when the retry goes through", async (t) => {
+  const env = await syncEnv(t);
+  env.fake.fail("POST", `/api/companies/${ids.company}/cost-events`, 429);
+  await assert.rejects(env.sync.tick(), /429|injected/);
+  await env.sync.tick();
+  assert.ok([...byRun(env.db).values()].every((e) => e.issueId === env.issue.id));
 });

@@ -27,20 +27,13 @@ export function writeJson(file, value) {
   fs.renameSync(tmp, file);
 }
 
-export function fileExists(file) {
-  try {
-    fs.accessSync(file);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // A bounded map of key → timestamp-ish records, kept in memory and saved on demand.
-// Oldest entries (by insertion) are dropped beyond `max`.
+// Oldest entries (by insertion) are dropped beyond `max`, except those `keep(key,
+// value)` says to keep, unless nothing else is left to drop.
 export class BoundedMap {
-  constructor(entries = [], max = 1000) {
+  constructor(entries = [], max = 1000, keep = null) {
     this.max = max;
+    this.keep = keep;
     this.map = new Map(entries);
     this.trim();
   }
@@ -59,7 +52,17 @@ export class BoundedMap {
     return this.map.delete(key);
   }
   trim() {
-    while (this.map.size > this.max) this.map.delete(this.map.keys().next().value);
+    if (this.map.size <= this.max) return;
+    let excess = this.map.size - this.max;
+    if (this.keep) {
+      for (const [key, value] of this.map) {
+        if (!excess) return;
+        if (this.keep(key, value)) continue;
+        this.map.delete(key);
+        excess -= 1;
+      }
+    }
+    while (excess-- > 0) this.map.delete(this.map.keys().next().value);
   }
   get size() {
     return this.map.size;
@@ -72,10 +75,16 @@ export class BoundedMap {
 // The helper's own state: relay deliveries, watchdog nudges and the PRs sent back
 // for merge conflicts, so a restart neither re-processes a delivery, re-nudges
 // an issue nor sends a PR back twice.
+// Watchdog records that stand for something still going on, not a count of what was
+// done: forgetting one would route a card again, miss an agent's resume, or leave
+// agents paused at a usage limit. Kept past the cap.
+const LIVE_RECORD = /^(agent-paused|agent-resumed|limit):/;
+const keepRecord = (key, value) => LIVE_RECORD.test(key) || (key.startsWith("question:") && value?.relayId && !value.settled);
+
 export function createStateStore(file, { now = () => Date.now() } = {}) {
   const raw = readJson(file, {}) ?? {};
   const deliveries = new BoundedMap(Object.entries(raw.deliveries ?? {}), 1000);
-  const nudges = new BoundedMap(Object.entries(raw.nudges ?? {}), 2000);
+  const nudges = new BoundedMap(Object.entries(raw.nudges ?? {}), 2000, keepRecord);
   const conflicts = new BoundedMap(Object.entries(raw.conflicts ?? {}), 500);
   const queue = new BoundedMap(Object.entries(raw.queue ?? {}), 500); // merge-queue drops and who queued each PR
   let dirty = false;

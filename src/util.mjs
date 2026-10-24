@@ -23,12 +23,26 @@ export const DECISION_STATUS = { approve: "done", changes: "in_progress" };
 export const SIGNATURE = "_Sent automatically by Paperclip Helper._";
 export const RELAYED_SIGNATURE = "_Relayed from GitHub by Paperclip Helper._";
 export const COMMAND_SIGNATURE = "_Sent with Paperclip Helper (`pch`)._";
+export const WATCHDOG_SIGNATURE = "_Paperclip Helper watchdog._";
 const SIGNED = /(^|\n)_[^_\n]*Paperclip Helper[^_\n]*_$/;
 
 export function signed(text, signature = SIGNATURE) {
   const body = String(text ?? "").trimEnd();
   return SIGNED.test(body) ? body : `${body}\n\n${signature}`;
 }
+
+// A paused task tree refuses a board user's comment, alone or with a PATCH, with
+// 409 "Task is paused" (assertBoardCommentNotPaused). Nothing to do until it resumes.
+export const pausedRefusal = (err) => err?.status === 409 && /paused/i.test(err?.message ?? "");
+
+// Run statuses that hold an issue's execution: queued, waiting to retry, or going.
+export const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
+// Run statuses that are over, one way or another.
+export const TERMINAL_RUN = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
+// Issue statuses that are finished: nothing more happens on them.
+export const CLOSED_STATUSES = new Set(["done", "cancelled"]);
+// How a pull request is named in notes and comments.
+export const prLabel = (pr) => `PR #${pr.number}`;
 
 export function ts(value) {
   const t = value ? Date.parse(value) : NaN;

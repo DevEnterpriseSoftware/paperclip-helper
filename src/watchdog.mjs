@@ -170,13 +170,13 @@
 // by the stall window. Their counts are kept in the state file across restarts.
 
 import { companyAgents, listIssues } from "./paperclip.mjs";
-import { agentMention, approvalWaitingOn, asleep, every, mapLimit, ts } from "./util.mjs";
+import { ACTIVE_RUN, agentMention, asleep, every, mapLimit, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 import { holdFacts, releaseHold, releaseProblems, unprovable } from "./release.mjs";
 import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
 import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue, strandedCard } from "./questions.mjs";
 import { createGitHub } from "./github.mjs";
-import { ciMessage, failedJobs, monitorPending, onlyFlaky, runRefs, UNINFORMATIVE, waitingOn } from "./ci-runs.mjs";
-import { answeredCards, answerText, escalatedReview, quote, reviewStage } from "./board-held.mjs";
+import { createCiRunsCheck } from "./ci-runs.mjs";
+import { createBoardHeldCheck, quote } from "./board-held.mjs";
 import { createLimitCheck, localZone, RECOGNISERS } from "./limits.mjs";
 import { createStagesCheck } from "./stages.mjs";
 import { findIdentifiers } from "./identifiers.mjs";
@@ -190,14 +190,13 @@ const OPEN_STATUSES = "backlog,todo,in_progress,in_review,blocked";
 // Statuses where a comment restarts the assignee without overriding a decision:
 // a blocked issue may be blocked for a reason, and one in review waits on a reviewer.
 const RESTARTABLE = new Set(["todo", "in_progress"]);
-const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
 const PENDING_WAKE = new Set(["queued", "claimed", "deferred_issue_execution"]);
 const CONCURRENCY = 4;
 // A run that failed on the model provider: a usage limit, or the transient family Paperclip files
 // some limits under (it took Claude's "You've hit your org's monthly spend limit" for transient).
 const PROVIDER_FAILURE = /^(provider_quota|[a-z]+_transient_upstream|transient_upstream)$/;
 const PROVIDER_FAILURE_HOLD_MS = 6 * 60 * 60_000;
-const PARKED_BUDGET_RESET_MS = 24 * 60 * 60_000;
+const DAY_MS = 24 * 60 * 60_000;
 // A long-lived record is touched this often, so the state file (which forgets records
 // untouched for a week) keeps it.
 const RECORD_REFRESH_MS = 24 * 60 * 60_000;
@@ -208,9 +207,6 @@ const latestRun = (runs) =>
 // own PR on every issue the watchdog nudges.
 const HANDOFF_BUG = "paperclipai/paperclip#13880";
 
-// A paused task tree refuses a board user's comment, alone or with a PATCH, with
-// 409 "Task is paused" (assertBoardCommentNotPaused). Nothing to do until it resumes.
-const pausedRefusal = (err) => err?.status === 409 && /paused/i.test(err.message);
 
 // What the watchdog has done about each situation, as keys of one map persisted
 // in the state file (state.nudges): { count, at } per key. The key formats are
@@ -248,17 +244,7 @@ const record = {
   resumeRestore: (issue, commentId) => `resume-restore:${issue.id}:${commentId ?? "?"}`, // the one restore of an issue after a pause's recovery block
 };
 
-// Issues the CI-run check reads: an agent that waits on CI leaves its issue in
-// any of these. Only those touched in the last few days: an older wait is stale.
-const CI_STATUSES = "todo,in_progress,in_review,blocked";
-const CI_LOOKBACK_MS = 3 * 24 * 60 * 60_000;
-const DEFAULT_BRANCH_TTL_MS = 60 * 60_000; // a renamed default branch is picked up within the hour
-// Issues waiting on your review (12, 13) are looked at once per stall window.
-const BOARD_STATUSES = "in_review";
-// How long after you answer an agent's card the watchdog waits before returning
-// the issue: time for you to approve it, or send it back yourself.
-const ANSWER_WAIT_MS = 30 * 60_000;
-// 15. A resumed agent's issues are looked for for at most this long after the resume.
+// 15. A resumed agent's issues are looked at for at most this long after the resume.
 const RESUME_SWEEP_MS = 24 * 60 * 60_000;
 // Clock slack between the helper and Paperclip when comparing a comment's time with a pause.
 const CLOCK_SLACK_MS = 5_000;
@@ -280,16 +266,6 @@ export function createWatchdog(ctx, state, deps = {}) {
   const liveWorkspaces = new Map(); // workspaceId → when it was last seen live
   const dryRunSeen = new Set(); // dead links and cards a dry run already logged, this process only
   const questionScanAt = new Map(); // companyId → when its cards were last looked at
-  const ciScanAt = new Map(); // companyId → when the CI runs agents wait on were last looked at
-  const boardScanAt = new Map(); // companyId → when issues waiting on your review were last looked at
-  const ciTexts = new Map(); // issueId → { companyId, updatedAt, refs } (the issue's updatedAt moves with every comment)
-  const ciRuns = new Map(); // "repo#id" → finished run (with jobs), for one scan: a run can be re-run at any time
-  const ciRepoOf = new Map(); // bare run id → the repository it was found in
-  const ciMissing = new Set(); // "repo#id" (repo "*" for a bare id) found in none of GITHUB_REPOS
-  const ciDefaultBranch = new Map(); // repo → { branch, at }: its default branch as GitHub last said
-  const ciRepoWarned = new Set(); // repos whose default branch GitHub didn't give, warned once until it does
-  const ciSilenced = new Map(); // CI record key → { companyId, reasons }: why a finished run isn't reported, as logged
-  const ciRefused = new Set(); // repos whose runs the GitHub token may not read, warned once until it can
   const seenStatus = new Map(); // agentId → its status at this process's previous tick
   const startupRead = new Set(); // companies whose agents' pauses and resumes were read at start-up
   let previousTickAt = null; // when this process's previous tick started
@@ -298,14 +274,6 @@ export function createWatchdog(ctx, state, deps = {}) {
   const hasGitHubToken = Boolean(config.githubToken || config.githubTokenFile);
   const github = deps.github ?? (hasGitHubToken ? createGitHub({ config, log }) : null);
   const stagesCheck = createStagesCheck({ ctx, records, state, stats, dryRunSeen, github, identifiersOf: (pr) => findIdentifiers(pr, ctx.prefixes()) });
-  const rerunPattern = (() => {
-    if (!config.watchdogCiRerunJobs) return null;
-    try {
-      return new RegExp(config.watchdogCiRerunJobs, "i");
-    } catch {
-      return null; // config.mjs reports it
-    }
-  })();
   const now = () => ctx.now();
   const limits = createLimitCheck({ api, config, log, records, state, now, stats, dryRunSeen });
 
@@ -392,13 +360,17 @@ export function createWatchdog(ctx, state, deps = {}) {
       }
       return;
     }
-    if (!config.dryRun && before && !(await before())) return; // not this tick
-    records.set(key, { count: count + 1, at: now() });
-    state.touch();
     if (config.dryRun) {
-      log("watchdog: would retry the deferred wake (dry run)", { issue: who, queueId: queue.queueId });
+      // A dry run records nothing, so it uses up no retries: logged once per key.
+      if (!dryRunSeen.has(key)) {
+        dryRunSeen.add(key);
+        log("watchdog: would retry the deferred wake (dry run)", { issue: who, queueId: queue.queueId });
+      }
       return;
     }
+    if (before && !(await before())) return; // not this tick
+    records.set(key, { count: count + 1, at: now() });
+    state.touch();
     try {
       await api.request("POST", `/api/issues/${issue.id}/queued-comments/interrupt`, {
         queueId: queue.queueId,
@@ -460,6 +432,8 @@ export function createWatchdog(ctx, state, deps = {}) {
     const who = issue.identifier ?? issue.id;
     const key = record.release(issue, hold.runId);
     if (records.has(key)) {
+      // Paperclip refused the release: it was reported then, and is left to you.
+      if (records.get(key).failed) return true;
       // Released once already and held again for the same run: that's for the board.
       const reported = record.releaseReported(issue, hold.runId);
       if (now() - records.get(key).at >= stallMs && !records.has(reported)) {
@@ -493,22 +467,29 @@ export function createWatchdog(ctx, state, deps = {}) {
       }
       return true;
     }
-    records.set(key, { count: 1, at: now() });
-    state.touch();
     const saved = facts.queue?.entries?.length ?? 0;
     if (config.dryRun) {
-      log("watchdog: would release a hold Paperclip can't release by itself (dry run)", { issue: who, sourceRun: hold.runId, saved });
+      // Recorded only in memory: with dry run off, the release still happens.
+      if (!dryRunSeen.has(key)) {
+        dryRunSeen.add(key);
+        log("watchdog: would release a hold Paperclip can't release by itself (dry run)", { issue: who, sourceRun: hold.runId, saved });
+      }
       return true;
     }
+    records.set(key, { count: 1, at: now() });
+    state.touch();
     let result;
     try {
       result = await releaseHold(api, facts, {
         note:
           "Released by Paperclip Helper's watchdog: the held run stopped without a record Paperclip could verify, " +
           "so Paperclip could never release this hold by itself.",
+        signature: `\n\n${WATCHDOG_SIGNATURE}`,
       });
     } catch (err) {
-      log.warn("watchdog: couldn't release a hold Paperclip can't release by itself", {
+      records.set(key, { count: 1, at: now(), failed: true });
+      state.touch();
+      log.warn("watchdog: couldn't release a hold Paperclip can't release by itself; left to you", {
         issue: who,
         sourceRun: hold.runId,
         error: err.message,
@@ -606,7 +587,7 @@ export function createWatchdog(ctx, state, deps = {}) {
     // makes a new action, and a budget keyed on it never runs out. It starts again after a day.
     const key = record.parked(issue);
     const prior = records.get(key);
-    if (prior && now() - prior.at > PARKED_BUDGET_RESET_MS) records.delete(key);
+    if (prior && now() - prior.at > DAY_MS) records.delete(key);
     await nudge(
       issue,
       key,
@@ -762,7 +743,7 @@ export function createWatchdog(ctx, state, deps = {}) {
       `${names} from "Blocked by". The failed clean-up may have left this workspace without ${one ? "its" : "their"} latest ` +
       `changes: pull the branch before you continue.` +
       (keep.length ? "" : " Nothing else blocks this issue, so it is back in todo. Please continue it.") +
-      `\n\n_Paperclip Helper watchdog._`;
+      `\n\n${WATCHDOG_SIGNATURE}`;
     const patch = { blockedByIssueIds: keep, comment, ...(keep.length ? {} : { status: "todo" }) };
     const who = issue.identifier ?? issue.id;
     if (config.dryRun) {
@@ -940,7 +921,7 @@ export function createWatchdog(ctx, state, deps = {}) {
     if ((await isolatedWorkspacesEnabled(api)) === false) {
       const key = record.deadLinkOff();
       const prior = records.get(key);
-      if (!prior || now() - prior.at > PARKED_BUDGET_RESET_MS) {
+      if (!prior || now() - prior.at > DAY_MS) {
         records.set(key, { count: 1, at: now() });
         state.touch();
         log.warn(
@@ -1058,7 +1039,7 @@ export function createWatchdog(ctx, state, deps = {}) {
   // touched in the last day are read in full: that is where an agent leaves one.
   async function checkScheduledWorkspaces(companyId, agents) {
     const issues = (await listIssues(api, companyId, "todo")).filter(
-      (i) => candidate(i) && now() - ts(i.updatedAt) < PARKED_BUDGET_RESET_MS,
+      (i) => candidate(i) && now() - ts(i.updatedAt) < DAY_MS,
     );
     await mapLimit(issues, CONCURRENCY, async (issue) => {
       try {
@@ -1201,7 +1182,7 @@ export function createWatchdog(ctx, state, deps = {}) {
       try {
         await api.request("PATCH", `/api/issues/${r.relayId}`, {
           status: "done",
-          comment: `The card on ${r.source} is no longer waiting (answered, withdrawn or expired), so this issue is closed.\n\n_Sent automatically by Paperclip Helper's watchdog._`,
+          comment: `The card on ${r.source} is no longer waiting (answered, withdrawn or expired), so this issue is closed.\n\n${WATCHDOG_SIGNATURE}`,
         });
       } catch (err) {
         if (!pausedRefusal(err)) throw err;
@@ -1258,419 +1239,11 @@ export function createWatchdog(ctx, state, deps = {}) {
   // The issue's runs, without those Paperclip cancelled before they started.
   const startedRuns = (runs) => (Array.isArray(runs) ? runs : []).filter((r) => !refused(r) && !neverStarted(r));
 
-  // The run behind a reference: { state: "missing" } (not in GITHUB_REPOS, or not
-  // found), { state: "unknown" } (GitHub didn't answer), { state: "running" }, or
-  // { state: "finished", repo, run, jobs } with the latest attempt's jobs. Read
-  // once per scan: a finished run can be re-run (by you, or an agent) at any time.
-  // Ids not found anywhere are remembered for the process.
-  async function lookupRun(ref) {
-    if (ciMissing.has(`${ref.repo ?? "*"}#${ref.id}`)) return { state: "missing" };
-    const repos = ref.repo ? [ref.repo] : ciRepoOf.has(ref.id) ? [ciRepoOf.get(ref.id)] : config.repos;
-    for (const repo of repos) {
-      if (config.repos.length && !config.repos.includes(repo)) continue;
-      const cached = ciRuns.get(`${repo}#${ref.id}`);
-      if (cached) return cached;
-      let run;
-      try {
-        run = await github.workflowRun(repo, ref.id);
-      } catch (err) {
-        if (err.status === 404) continue;
-        const refused = err.status === 401 || (err.status === 403 && !/rate limit/i.test(err.message));
-        if (refused && !ciRefused.has(repo)) {
-          // Without Actions: Read no run is ever reported: say so where it's seen.
-          ciRefused.add(repo);
-          log.warn("watchdog: GitHub refused to show a CI run; no run in this repository is reported until it does", { repo, run: ref.id, error: err.message });
-        } else {
-          log.debug("watchdog: couldn't read a CI run", { repo, run: ref.id, error: err.message });
-        }
-        return { state: "unknown" };
-      }
-      ciRefused.delete(repo);
-      ciRepoOf.set(ref.id, repo);
-      let found = { state: "running" };
-      if (run?.status === "completed") {
-        const jobs = run.conclusion === "success" || UNINFORMATIVE.has(run.conclusion) ? [] : await github.workflowJobs(repo, ref.id).catch(() => []);
-        found = { state: "finished", repo, run, jobs };
-      }
-      ciRuns.set(`${repo}#${ref.id}`, found);
-      return found;
-    }
-    ciMissing.add(`${ref.repo ?? "*"}#${ref.id}`);
-    return { state: "missing" };
-  }
-
-  // The repository's default branch, read from GitHub (never assumed) and kept
-  // for an hour. When GitHub doesn't answer, the last answer if there is one,
-  // else undefined: the caller waits for the next scan rather than guess. The
-  // failure is logged once per repository until GitHub answers again.
-  async function defaultBranch(repo) {
-    const cached = ciDefaultBranch.get(repo);
-    if (cached && now() - cached.at < DEFAULT_BRANCH_TTL_MS) return cached.branch;
-    try {
-      const branch = (await github.repository(repo))?.default_branch ?? null;
-      ciDefaultBranch.set(repo, { branch, at: now() });
-      ciRepoWarned.delete(repo);
-      return branch;
-    } catch (err) {
-      if (!ciRepoWarned.has(repo)) {
-        ciRepoWarned.add(repo);
-        log.warn(
-          cached
-            ? "watchdog: couldn't read a repository's default branch; using the one read earlier"
-            : "watchdog: couldn't read a repository's default branch; runs dispatched there wait until GitHub answers",
-          { repo, error: err.message, ...(cached ? { defaultBranch: cached.branch } : {}) },
-        );
-      }
-      return cached ? cached.branch : undefined;
-    }
-  }
-
-  // Has the run's branch moved on since? Its PR's head, or else the branch's.
-  // null when GitHub can't tell (a fork's branch, a deleted branch).
-  async function headMoved(repo, run) {
-    const prNumber = run.pull_requests?.[0]?.number;
-    if (prNumber) {
-      const pr = await github.pull(repo, prNumber).catch(() => null);
-      if (!pr) return null;
-      return pr.state !== "open" || Boolean(pr.head?.sha && pr.head.sha !== run.head_sha);
-    }
-    if (!run.head_branch) return null;
-    const branch = await github.branch(repo, run.head_branch).catch(() => null);
-    const sha = branch?.commit?.sha;
-    return sha ? sha !== run.head_sha : null;
-  }
-
-  // Re-runs the run's failed jobs when they are all known flaky, the run is still
-  // its PR's head, and it hasn't used its re-runs. True when it did.
-  async function rerunFlaky({ repo, run, jobs }, issue) {
-    if (!rerunPattern || run.conclusion === "success" || !onlyFlaky(jobs, rerunPattern)) return false;
-    const key = record.ciRerun(repo, run);
-    const prior = records.get(key);
-    if ((prior?.count ?? 0) >= config.watchdogCiRerunMax || records.has(record.ciRerunFail(repo, run))) return false;
-    // A newer push runs CI by itself; re-running an old head proves nothing.
-    if ((await headMoved(repo, run)) !== false) return false;
-    const extra = { issue: issue.identifier ?? issue.id, repo, run: run.id, attempt: run.run_attempt ?? 1, jobs: failedJobs(jobs).map((j) => j.name) };
-    if (config.dryRun) {
-      log("watchdog: would re-run a CI run's flaky jobs (dry run)", extra);
-      return false;
-    }
-    try {
-      await github.rerunFailedJobs(repo, run.id);
-    } catch (err) {
-      records.set(record.ciRerunFail(repo, run), { count: 1, at: now() });
-      state.touch();
-      log.warn("watchdog: GitHub refused to re-run a CI run's failed jobs; reporting it instead", { ...extra, error: err.message });
-      return false;
-    }
-    records.set(key, { count: (prior?.count ?? 0) + 1, at: now() });
-    state.touch();
-    stats.ciReruns += 1;
-    log("watchdog: re-ran a CI run's flaky failed jobs", { ...extra, rerun: (prior?.count ?? 0) + 1 });
-    return true;
-  }
-
-  async function checkCiRuns(companyId, agents) {
-    if (!github) return;
-    const last = ciScanAt.get(companyId);
-    if (last && now() - last < stallMs) return;
-    ciScanAt.set(companyId, now());
-    ciRuns.clear();
-    const issues = (await listIssues(api, companyId, CI_STATUSES)).filter(
-      (i) => candidate(i) && now() - ts(i.updatedAt) < CI_LOOKBACK_MS,
-    );
-    const live = new Set(issues.map((i) => i.id));
-    // Forget this company's issues that are no longer looked at (keys are per issue).
-    for (const [id, c] of ciTexts) if (c.companyId === companyId && !live.has(id)) ciTexts.delete(id);
-    for (const [k, v] of ciSilenced) if (v.companyId === companyId && !live.has(k.split(":")[1])) ciSilenced.delete(k);
-    await mapLimit(issues, CONCURRENCY, async (issue) => {
-      try {
-        await checkCiIssue(issue, agents, companyId);
-      } catch (err) {
-        log.warn("watchdog: CI run check failed", { issue: issue.identifier ?? issue.id, error: err.message });
-      }
-    });
-  }
-
-  async function checkCiIssue(issue, agents, companyId) {
-    const assignee = issue.assigneeAgentId;
-    let cached = ciTexts.get(issue.id);
-    let full = null;
-    if (!cached || cached.updatedAt !== issue.updatedAt || cached.assignee !== assignee) {
-      // The agent's latest comment, and its monitor's notes: what it said it waits on.
-      const comments = await api.request("GET", `/api/issues/${issue.id}/comments?order=desc&limit=10`).catch(() => null);
-      if (!Array.isArray(comments)) return;
-      full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
-      const said = waitingOn(comments, assignee, full?.executionState?.monitor);
-      cached = { companyId, updatedAt: issue.updatedAt, assignee, refs: runRefs(said.text), saidAt: said.saidAt };
-      ciTexts.set(issue.id, cached);
-    }
-    if (!cached.refs.length) return;
-    const agent = await agentFor(assignee, agents).catch(() => null);
-    if (!agent || asleep(agent)) return;
-    // Newest run first: the one the agent waits on. While it runs, the older ones don't matter.
-    let found = null;
-    for (const ref of cached.refs) {
-      const r = await lookupRun(ref);
-      if (r.state === "missing") continue;
-      if (r.state !== "finished") return;
-      found = r;
-      break;
-    }
-    if (!found) return;
-    const { run } = found;
-    const key = record.ciRun(issue, run);
-    if ((records.get(key)?.count ?? 0) > 0 || dryRunSeen.has(key)) return; // reported (a paused task leaves a count of 0)
-    // Why a finished run isn't reported (yet), at debug level, once per run attempt
-    // and reason: LOG_LEVEL=debug shows why an agent wasn't told.
-    const silent = (reason, extra = {}) => {
-      const seen = ciSilenced.get(key) ?? { companyId, reasons: new Set() };
-      ciSilenced.set(key, seen);
-      if (seen.reasons.has(reason)) return;
-      seen.reasons.add(reason);
-      log.debug("watchdog: a finished CI run an agent waits on isn't reported", {
-        issue: issue.identifier ?? issue.id, repo: found.repo, run: run.id, attempt: run.run_attempt ?? 1, reason, ...extra,
-      });
-    };
-    // A run dispatched on the default branch is a verdict the agent asked for: it
-    // is reported on any conclusion, never re-run, and still counts once the
-    // branch has moved on. Only dispatched runs ask GitHub for the default branch;
-    // while GitHub doesn't say, such a run waits for the next scan, never re-run.
-    let dispatchedOnDefault = false;
-    if (run.event === "workflow_dispatch" && run.head_branch) {
-      const branch = await defaultBranch(found.repo);
-      if (branch === undefined) return silent("the repository's default branch is unknown");
-      dispatchedOnDefault = run.head_branch === branch;
-    }
-    // Cancelled by a newer push, skipped, waiting on approval.
-    if (!dispatchedOnDefault && UNINFORMATIVE.has(run.conclusion)) return silent(`its conclusion, ${run.conclusion}, says nothing about the change`);
-    const finishedAt = ts(run.updated_at);
-    // Give the agent's own monitor, or the agent, the stall window to notice.
-    if (!finishedAt || now() - finishedAt < stallMs) return silent("finished less than the stall window ago");
-    // The agent wrote about the run after it finished: it watched it within its own run.
-    if (cached.saidAt && ts(cached.saidAt) >= finishedAt) return silent("the agent commented after it finished");
-    const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => null);
-    if (!Array.isArray(runs)) return;
-    if (runs.some((r) => ACTIVE_RUN.has(r.status))) return silent("a run on the issue is in progress");
-    // The agent has run on the issue since the run finished: it has seen the result.
-    if (startedRuns(runs).some((r) => r.agentId === assignee && ts(r.startedAt ?? r.createdAt) >= finishedAt)) {
-      return silent("the agent has run on the issue since it finished");
-    }
-    full ??= await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
-    if (!full || full.assigneeAgentId !== assignee) return;
-    const monitor = full.executionState?.monitor;
-    const monitorDue = monitorPending(monitor, now());
-    // A monitor still due that watches this very run would only wake the agent again
-    // to find it finished: report now, and clear the monitor in the same step. One
-    // that watches something else is left to fire. (Paperclip redacts a monitor's
-    // externalRef, so only its notes can name the run.)
-    if (monitorDue && !watchesOnly(monitor, run)) return silent("the agent's Paperclip monitor will still fire", { nextCheckAt: monitor.nextCheckAt });
-    // A monitor Paperclip shows without the policy that holds it can't be cleared: leave it to fire.
-    if (monitorDue && !full.executionPolicy?.monitor) return silent("the agent's monitor can't be cleared");
-    // A wake still waiting gets the stall window to start a run. One older than
-    // that may never be delivered (a monitor's own wake can sit deferred for
-    // hours), and the comment's wake joins any that is: report anyway.
-    if (await hasPendingWake(full, runs, agents, { freshWithin: stallMs })) return silent("a wake for the agent is waiting to start");
-    if (!dispatchedOnDefault && (await rerunFlaky(found, issue))) return;
-    // Pushed since: that push's own run is what counts now.
-    if (!dispatchedOnDefault && (await headMoved(found.repo, run)) === true) return silent("its branch or pull request has moved on");
-    const reruns = records.get(record.ciRerun(found.repo, run))?.count ?? 0;
-    // The policy is replaced whole: read it again now, so nothing changed meanwhile is overwritten.
-    let clearMonitor;
-    if (monitorDue) {
-      const fresh = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
-      const freshMonitor = fresh?.executionState?.monitor;
-      if (!fresh || (monitorPending(freshMonitor, now()) && (!watchesOnly(freshMonitor, run) || !fresh.executionPolicy?.monitor))) {
-        return silent("the agent's monitor changed while the report was prepared");
-      }
-      if (monitorPending(freshMonitor, now())) clearMonitor = withoutMonitor(fresh.executionPolicy);
-    }
-    const posted = await nudge(
-      full,
-      key,
-      agent,
-      ciMessage({ run, jobs: found.jobs, reruns }),
-      { reason: "CI run finished", repo: found.repo, run: run.id, conclusion: run.conclusion },
-      clearMonitor !== undefined
-        ? { patch: { executionPolicy: clearMonitor }, patchNote: "\n\nYour Paperclip monitor for this run was cleared: it would only have woken you to find the run finished." }
-        : {},
-    );
-    if (posted) stats.ciReports += 1;
-  }
-
-  // The issue's execution policy without its monitor (Paperclip replaces the policy
-  // whole and clears the monitor when it's gone); undefined when there's no policy.
-  function withoutMonitor(policy) {
-    if (!policy?.monitor) return undefined;
-    const { monitor, ...rest } = policy;
-    return rest;
-  }
-
-  // Does the monitor watch this run and nothing else? Every run its notes name is it.
-  function watchesOnly(monitor, run) {
-    const refs = runRefs(monitor?.notes);
-    return refs.length > 0 && refs.every((r) => String(r.id) === String(run.id));
-  }
+  const ciRunsCheck = createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns });
 
   // ---------------------------------------------------------------- 12, 13. issues waiting on your review
 
-  // Returns the issue to its implementer as your "changes requested" decision:
-  // status in_progress with the comment, in one PATCH (Paperclip's rule). Once
-  // per key; a paused task or a refused decision is logged and tried no more.
-  async function returnToAgent(issue, key, agent, message, logExtra) {
-    if (records.has(key)) return false;
-    const who = issue.identifier ?? issue.id;
-    const comment = `${agentMention(agent)} ${message}\n\n_Paperclip Helper watchdog._`;
-    if (config.dryRun) {
-      if (dryRunSeen.has(key)) return false;
-      dryRunSeen.add(key);
-      log("watchdog: would return the issue to its agent (dry run)", { issue: who, agent: agent.name, ...logExtra });
-      return false;
-    }
-    // Several requests have passed since the issue was read. If you decided in the
-    // meantime (approved it, say), in_progress would reopen it: read it again.
-    const { userId } = await ctx.identity();
-    const now_ = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
-    if (
-      !now_ ||
-      !approvalWaitingOn(now_, userId) ||
-      (now_.executionState?.lastDecisionId ?? null) !== (issue.executionState?.lastDecisionId ?? null) ||
-      now_.executionState?.returnAssignee?.agentId !== agent.id
-    ) {
-      log.debug("watchdog: the issue changed before it could be returned; looked at again next time", { issue: who });
-      return false;
-    }
-    try {
-      await api.request("PATCH", `/api/issues/${issue.id}`, { status: "in_progress", comment });
-    } catch (err) {
-      if (pausedRefusal(err)) {
-        log.debug("watchdog: the issue is paused; return postponed", { issue: who });
-        return false;
-      }
-      records.set(key, { count: 1, at: now(), failed: true });
-      state.touch();
-      log.warn("watchdog: Paperclip refused to return the issue to its agent; left to you", { issue: who, ...logExtra, error: err.message });
-      return false;
-    }
-    records.set(key, { count: 1, at: now() });
-    state.touch();
-    stats.returned += 1;
-    log("watchdog: returned the issue to its agent", { issue: who, agent: agent.name, ...logExtra });
-    return true;
-  }
-
-  async function checkWaitingOnYou(companyId, agents) {
-    if (!config.watchdogDeliverAnswers && !config.watchdogReturnEscalatedReviews) return;
-    const last = boardScanAt.get(companyId);
-    if (last && now() - last < stallMs) return;
-    boardScanAt.set(companyId, now());
-    const { userId } = await ctx.identity();
-    if (!userId) return;
-    const issues = (await listIssues(api, companyId, BOARD_STATUSES)).filter(
-      (i) => i.assigneeUserId === userId && !i.assigneeAgentId && !i.executionRunId && !i.checkoutRunId && quiet(i),
-    );
-    await mapLimit(issues, CONCURRENCY, async (row) => {
-      try {
-        const issue = await api.request("GET", `/api/issues/${row.id}`).catch(() => null);
-        if (!issue || !approvalWaitingOn(issue, userId)) return;
-        const back = issue.executionState?.returnAssignee;
-        if (back?.type !== "agent" || !back.agentId) return;
-        const agent = await agentFor(back.agentId, agents).catch(() => null);
-        // Returning it to an agent Paperclip can't invoke only parks it.
-        if (!agent || asleep(agent)) return;
-        const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => null);
-        if (!Array.isArray(runs) || runs.some((r) => ACTIVE_RUN.has(r.status))) return;
-        const cards = await api.request("GET", `/api/issues/${issue.id}/interactions`).catch(() => []);
-        // An escalated review is only ever returned by 13: returning it as you for an
-        // answer would reset Paperclip's round count behind WATCHDOG_RETURN_ESCALATED_REVIEWS.
-        if (escalatedReview(issue, userId)) {
-          if (config.watchdogReturnEscalatedReviews) await returnEscalated(issue, agent, cards, runs, agents);
-          return;
-        }
-        if (config.watchdogDeliverAnswers) await deliverAnswer(issue, agent, cards, runs);
-      } catch (err) {
-        log.warn("watchdog: check of an issue waiting on your review failed", { issue: row.identifier ?? row.id, error: err.message });
-      }
-    });
-  }
-
-  // 12. The agent's card, answered by a person, with no run of the agent since.
-  async function deliverAnswer(issue, agent, cards, runs) {
-    const answered = answeredCards(cards, agent.id).sort((a, b) => ts(b.resolvedAt) - ts(a.resolvedAt));
-    const card = answered[0];
-    if (!card) return false;
-    const answeredAt = ts(card.resolvedAt);
-    // Give you time to decide yourself after answering (approve, or send it back with a note).
-    if (now() - answeredAt < Math.max(stallMs, ANSWER_WAIT_MS)) return true;
-    // A run of the agent that started after the answer, or was still going when it
-    // came, has seen it (Paperclip hands a running agent the answer).
-    if (startedRuns(runs).some((r) => r.agentId === agent.id && (ACTIVE_RUN.has(r.status) || ts(r.finishedAt) >= answeredAt || ts(r.startedAt ?? r.createdAt) >= answeredAt))) return false;
-    const key = record.answer(card);
-    if (records.has(key)) return false;
-    const what = cardText(card, 300);
-    return returnToAgent(
-      issue,
-      key,
-      agent,
-      `your card on this issue${what ? ` ("${what}")` : ""} was answered, but the answer reached no one: the issue was ` +
-        `waiting on the board's review, so Paperclip woke no agent. The answer:\n\n${quote(answerText(card))}\n\n` +
-        `The watchdog has returned the issue to you. Act on the answer (check what it reports), then hand the issue back for ` +
-        `review; if nothing needs to change, say so and resubmit as it is.`,
-      { reason: "answered card", card: card.id },
-    );
-  }
-
-  // 13. A review Paperclip escalated to you after the agents used up their rounds.
-  async function returnEscalated(issue, agent, cards, runs, agents) {
-    const decisionId = issue.executionState?.lastDecisionId ?? null;
-    const seen = record.escalatedSeen(issue, decisionId);
-    if (records.has(seen)) return;
-    const who = issue.identifier ?? issue.id;
-    // Waiting on a person for something else (a card addressed to one): that comes first.
-    const waitingOnPerson = (Array.isArray(cards) ? cards : []).some((c) => c?.status === "pending" && (c.addresseeUserId || !c.addresseeAgentId));
-    if (waitingOnPerson) return;
-    const comments = await api.request("GET", `/api/issues/${issue.id}/comments?order=desc&limit=20`).catch(() => null);
-    if (!Array.isArray(comments)) return;
-    // The reviewer's request: the latest comment by one of the stage's reviewers, or
-    // else by any agent other than the implementer.
-    const reviewers = new Set((reviewStage(issue)?.participants ?? []).filter((p) => p?.type === "agent").map((p) => p.agentId));
-    const request =
-      comments.find((c) => c?.authorAgentId && reviewers.has(c.authorAgentId)) ??
-      comments.find((c) => c?.authorAgentId && c.authorAgentId !== agent.id);
-    if (!request) return;
-    // The implementer has run since that request: it isn't waiting to hear it.
-    if (startedRuns(runs).some((r) => r.agentId === agent.id && ts(r.startedAt ?? r.createdAt) > ts(request.createdAt))) return;
-    const budget = record.escalated(issue);
-    const used = records.get(budget)?.count ?? 0;
-    records.set(seen, { count: 1, at: now() });
-    state.touch();
-    if (used >= config.watchdogMaxNudges) {
-      log.warn("watchdog: a review Paperclip escalated to you again; the watchdog's returns are used up, so it's yours", {
-        issue: who,
-        rounds: issue.executionState?.changesRequestedCount ?? null,
-        hint: "Approve, request changes yourself, or raise maxReviewRounds in the issue's execution policy.",
-      });
-      return;
-    }
-    const reviewer = await agentFor(request.authorAgentId, agents).catch(() => null);
-    const rounds = issue.executionState?.changesRequestedCount ?? null;
-    const done = await returnToAgent(
-      issue,
-      `${budget}:${used + 1}`,
-      agent,
-      `${reviewer?.name ?? "The reviewer"} requested changes again, and after ${rounds ?? "several"} rounds Paperclip handed the ` +
-        `review to the board instead of back to you (its review-round limit). The watchdog returns it to you with the latest ` +
-        `request:\n\n${quote(request.body)}\n\nPlease address it and resubmit. If you think the request is wrong, or it needs ` +
-        `a decision from the board, say so in a comment instead of resubmitting unchanged.`,
-      { reason: "escalated review", rounds, reviewer: reviewer?.name ?? null },
-    );
-    if (done) {
-      records.set(budget, { count: used + 1, at: now() });
-      state.touch();
-    } else {
-      records.delete(seen); // not returned (dry run, paused): look again next time
-      state.touch();
-    }
-  }
+  const boardHeld = createBoardHeldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, quiet, startedRuns });
 
   // ---------------------------------------------------------------- 15. issues blocked during a pause
 
@@ -1700,6 +1273,7 @@ export function createWatchdog(ctx, state, deps = {}) {
         const gone = await agentGone(agentId);
         if (gone === true) {
           records.delete(key); // terminated or deleted: nothing to restore
+          sweepHeld.delete(agentId);
           state.touch();
         }
         if (!gone || gone === true) continue; // can't tell: look again next tick
@@ -1707,6 +1281,7 @@ export function createWatchdog(ctx, state, deps = {}) {
       }
       if (agent.status === "terminated") {
         records.delete(key);
+        sweepHeld.delete(agentId);
         state.touch();
         continue;
       }
@@ -1714,6 +1289,7 @@ export function createWatchdog(ctx, state, deps = {}) {
         if (!paused) {
           // Paused again before its issues were all restored: the next resume covers both pauses.
           records.delete(key);
+          sweepHeld.delete(agentId);
           records.set(record.agentPaused(agentId), { count: 1, at: now(), since: r.since, companyId });
           state.touch();
         } else if (now() - (r.at ?? 0) > RECORD_REFRESH_MS) {
@@ -1984,9 +1560,9 @@ export function createWatchdog(ctx, state, deps = {}) {
     }
     const comment = participant
       ? `${agentMention(agent)} was resumed: back to review, so the pending review stage goes on (the recovery block came from the pause).` +
-        `\n\n_Paperclip Helper watchdog._`
+        `\n\n${WATCHDOG_SIGNATURE}`
       : `${agentMention(agent)} was resumed: retrying the original owner (the recovery block came from the pause).` +
-        `\n\n_Paperclip Helper watchdog._`;
+        `\n\n${WATCHDOG_SIGNATURE}`;
     try {
       // Status and comment in one request: a board user's comment wakes the assignee,
       // and so does the move out of blocked.
@@ -2010,8 +1586,19 @@ export function createWatchdog(ctx, state, deps = {}) {
 
   async function tick() {
     const started = now();
-    const { companyIds = [] } = await ctx.identity();
+    let failure = null;
+    // One check failing (a listing Paperclip refused, say) skips only that check for
+    // that company: the others still run, and the tick says what failed.
+    const run = async (name, companyId, fn) => {
+      try {
+        await fn();
+      } catch (err) {
+        failure ??= `${name}: ${err.message}`;
+        log.warn("watchdog: a check failed this tick", { check: name, company: companyId, error: err.message });
+      }
+    };
     try {
+      const { companyIds = [] } = await ctx.identity();
       startSlots();
       for (const companyId of companyIds) {
         let listed = true;
@@ -2022,20 +1609,22 @@ export function createWatchdog(ctx, state, deps = {}) {
         const agents = new Map(list.map((a) => [a.id, a]));
         // Without the agents' statuses a pause or resume can't be told: wait for the next tick.
         // Pauses for a usage limit first, then resumes, which the resume sweep then sees.
-        if (config.watchdogLimitPause && listed) await limits.check(companyId, agents);
-        if ((config.watchdogResumeSweep || config.watchdogResumeSettleMin) && listed) await checkResumes(companyId, agents, started);
-        if (config.watchdogClearDeadLinks) {
-          await checkDeadLinks(companyId, agents);
-          await checkScheduledWorkspaces(companyId, agents);
+        if (config.watchdogLimitPause && listed) await run("usage limits", companyId, () => limits.check(companyId, agents));
+        if ((config.watchdogResumeSweep || config.watchdogResumeSettleMin) && listed) {
+          await run("resume sweep", companyId, () => checkResumes(companyId, agents, started));
         }
-        await checkBlocked(companyId, agents);
-        await checkHandOffs(companyId, agents);
-        if (config.watchdogRouteQuestions) await checkQuestions(companyId, agents);
-        await checkWaitingOnYou(companyId, agents);
-        if (config.watchdogCiRuns) await checkCiRuns(companyId, agents);
-        if (config.watchdogStagesWipe) await stagesCheck.check(companyId, agents);
+        if (config.watchdogClearDeadLinks) {
+          await run("dead links", companyId, () => checkDeadLinks(companyId, agents));
+          await run("scheduled workspaces", companyId, () => checkScheduledWorkspaces(companyId, agents));
+        }
+        await run("blocked issues", companyId, () => checkBlocked(companyId, agents));
+        await run("hand-offs", companyId, () => checkHandOffs(companyId, agents));
+        if (config.watchdogRouteQuestions) await run("question cards", companyId, () => checkQuestions(companyId, agents));
+        await run("waiting on you", companyId, () => boardHeld.check(companyId, agents));
+        if (config.watchdogCiRuns) await run("CI runs", companyId, () => ciRunsCheck.check(companyId, agents));
+        if (config.watchdogStagesWipe) await run("review stages", companyId, () => stagesCheck.check(companyId, agents));
       }
-      stats.lastError = null;
+      stats.lastError = failure;
     } catch (err) {
       stats.lastError = err.message;
       throw err;

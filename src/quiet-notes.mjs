@@ -11,8 +11,9 @@ const MAX_LINES = 200;
 
 // Appends one line to the issue's notes document, creating it if needed. Anything
 // a person added to it is kept; a document of that name the relay didn't start is
-// left alone (an error, so the relay comments instead). Paperclip refuses an update whose baseRevisionId
-// isn't the latest (409): read and try once more. A locked document isn't retried.
+// left alone (an error, so the relay comments instead). Paperclip refuses an update
+// whose baseRevisionId isn't the latest (409): read and try once more. A locked
+// document isn't retried.
 export async function appendNote(api, issueRef, line, { now = Date.now() } = {}) {
   const path = `/api/issues/${encodeURIComponent(issueRef)}/documents/${NOTES_KEY}`;
   const stamp = new Date(now).toISOString().slice(0, 16).replace("T", " ");
@@ -40,12 +41,15 @@ export async function appendNote(api, issueRef, line, { now = Date.now() } = {})
   }
 }
 
-// The body with the entry added at the end, dropping the oldest entries past MAX_LINES.
-function withEntry(body, entry) {
+// The relay's own lines: "- 2026-10-24 09:15 UTC: …". Anything else is a person's, and kept.
+const ENTRY = /^- \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC: /;
+
+// The body with the entry added at the end, dropping the relay's oldest entries past MAX_LINES.
+export function withEntry(body, entry) {
   const lines = String(body).trimEnd().split("\n");
   lines.push(entry);
-  let extra = lines.filter((l) => l.startsWith("- ")).length - MAX_LINES;
-  const kept = lines.filter((l) => !(extra > 0 && l.startsWith("- ") && extra-- > 0));
+  let extra = lines.filter((l) => ENTRY.test(l)).length - MAX_LINES;
+  const kept = lines.filter((l) => !(extra > 0 && ENTRY.test(l) && extra-- > 0));
   return `${kept.join("\n")}\n`;
 }
 

@@ -24,8 +24,8 @@ Each event has zero tokens (the run's own event counted them), the run's id, pro
 - **The amounts count toward budgets.** A company or agent budget with a hard stop pauses work once the synced amounts reach it. `pch costs` shows each budget before and after.
 - **Cost events can't be deleted** through Paperclip's API. The helper records every run it posts in `data/cost-synced.json`, and never posts a run twice, even across crashes.
   - Paperclip 2026.10 and later also record each idempotency key once. While the latest post shows that, a post whose answer was lost is posted again with the same key on the next pass (up to 5 times) rather than given up, and a lost state file can't cause double posts; on an older Paperclip such a run is never posted again.
-  - If `data/` is lost, it checks Paperclip's activity log for earlier posts. If it finds any, it syncs only runs that finish from then on.
-- **Paperclip stores whole cents,** and a run on a cheap model can cost a fraction of one. Fractions are carried per agent and model until they add up to a cent, so totals stay within a cent of the exact sum.
+  - If `data/` is lost (or its state file is unreadable), it reads your earlier cost posts from Paperclip's activity log and counts the runs they name as synced. The log shows the latest 500 posts, so when it is full, runs that finished before its oldest entry are left alone; when the posts don't name their runs, or the log can't be read, only runs that finish from then on are synced. This holds whatever `COST_SYNC_SINCE` says.
+- **It posts whole cents,** which every Paperclip version stores (2026.10 and later take fractions too), and a run on a cheap model can cost a fraction of one. Fractions are carried per agent and model until they add up to a cent, so totals stay within a cent of the exact sum.
 - Only the most recent 1,000 runs per company are visible to it. Runs that were stopped before recording any usage can't be synced.
 - The figures are estimates of API list price, not what you pay.
 

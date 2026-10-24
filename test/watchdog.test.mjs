@@ -833,3 +833,60 @@ test("a hold that comes back after the release is reported once, not released ag
   assert.equal(env.db.resolutions.length, 1);
   assert.equal(env.logs.filter((l) => l.msg === "watchdog: a hold the watchdog released is back; it needs a board decision").length, 1);
 });
+
+// ---------------------------------------------------------------- dry runs record nothing; one failure stops one check
+
+test("a dry run doesn't use up the one release of a hold: the real run still releases it", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue } = unprovableHold(env);
+  const dry = createWatchdog(env.makeCtx({ DRY_RUN: "true" }), env.state);
+  await dry.tick();
+  await dry.tick();
+  assert.equal(env.db.resolutions, undefined);
+  assert.equal(env.logs.filter((l) => l.msg.startsWith("watchdog: would release a hold")).length, 1, "logged once");
+  env.state.save({ force: true });
+
+  const real = createWatchdog(env.ctx, createStateStore(env.ctx.config.stateFile));
+  await real.tick();
+  assert.equal(env.db.resolutions.length, 1);
+  assert.equal(issue.executionBlocker, null);
+  assert.equal(env.logs.filter((l) => /a hold the watchdog released is back/.test(l.msg)).length, 0);
+});
+
+test("a release Paperclip refuses is reported once and left to you, never called 'back'", async (t) => {
+  let clock = Date.now();
+  const env = await watchdogEnv(t, {}, () => clock);
+  const { issue } = unprovableHold(env);
+  env.fake.fail("POST", `/api/issues/${issue.id}/recovery-actions/resolve`, 500, { times: -1 });
+  await env.watchdog.tick();
+  clock += 10 * 60_000;
+  await env.watchdog.tick();
+  assert.equal(env.logs.filter((l) => /couldn't release a hold/.test(l.msg)).length, 1);
+  assert.equal(env.logs.filter((l) => /a hold the watchdog released is back/.test(l.msg)).length, 0);
+  assert.equal(env.watchdog.stats.releases, 0);
+});
+
+test("a dry run doesn't spend a deferred wake's retries", async (t) => {
+  const env = await watchdogEnv(t, { WATCHDOG_RETRY_DEFERRED: "true" });
+  stuckWithQueue(env);
+  const dry = createWatchdog(env.makeCtx({ WATCHDOG_RETRY_DEFERRED: "true", DRY_RUN: "true" }), env.state);
+  await dry.tick();
+  await dry.tick();
+  assert.equal(env.db.interrupts.length, 0);
+  assert.equal(env.logs.filter((l) => l.msg === "watchdog: would retry the deferred wake (dry run)").length, 1);
+  assert.equal([...env.state.nudges.entries()].filter(([k]) => k.startsWith("retry:")).length, 0, "nothing recorded");
+  await env.watchdog.tick();
+  assert.equal(env.db.interrupts.length, 1, "the real run has its full budget");
+});
+
+test("one check failing (a listing Paperclip refuses) leaves the other checks to run, and the tick says what failed", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue, reviewer } = droppedHandOff(env.db);
+  env.fake.fail("GET", /\/issues\?status=blocked/, 500, { times: -1 });
+  await env.watchdog.tick();
+  const nudge = env.db.comments.find((c) => c.issueId === issue.id);
+  assert.ok(nudge, "the hand-off check still ran");
+  assert.ok(nudge.body.startsWith(`[@Reviewer](agent://${reviewer.id})`));
+  assert.match(env.watchdog.stats.lastError, /^blocked issues: /);
+  assert.equal(env.logs.filter((l) => l.msg === "watchdog: a check failed this tick" && l.check === "blocked issues").length, 1);
+});

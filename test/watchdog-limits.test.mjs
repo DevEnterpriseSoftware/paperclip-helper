@@ -607,3 +607,19 @@ test("a Codex reset time that has already passed in the configured zone is a gue
   await env.watchdog.tick();
   assert.equal(a.status, "idle");
 });
+
+test("an agent Paperclip has since paused for its budget is not resumed at the reset", async (t) => {
+  const env = await limitEnv(t);
+  const engineer = claude(env.db, "Engineer");
+  failedRun(env.db, engineer, { at: T0 - 2 * MIN });
+  await env.watchdog.tick();
+  assert.equal(engineer.status, "paused");
+  // Same pause time, but Paperclip now holds it for its budget.
+  engineer.pauseReason = "budget";
+  env.clock.at = Date.parse("2026-10-12T15:06:00Z");
+  await env.watchdog.tick();
+  assert.equal(engineer.status, "paused");
+  assert.deepEqual(lifecycle(env, "resume"), []);
+  const [, record] = [...env.state.nudges.entries()].find(([k]) => k.startsWith("limit:"));
+  assert.deepEqual(record.paused, {}, "left to you, and forgotten");
+});

@@ -26,12 +26,12 @@ export function loadConfig(env = process.env) {
     problems.push(`${name}=${value} is not true or false`);
     return fallback;
   };
-  const num = (name, fallback, { min = 0 } = {}) => {
+  const num = (name, fallback, { min = 0, max = Infinity } = {}) => {
     const raw = get(name);
     if (raw === "") return fallback;
     const value = Number(raw);
-    if (!Number.isFinite(value) || value < min) {
-      problems.push(`${name}=${raw} must be a number of at least ${min}`);
+    if (!Number.isFinite(value) || value < min || value > max) {
+      problems.push(`${name}=${raw} must be a number ${max < Infinity ? `from ${min} to ${max}` : `of at least ${min}`}`);
       return fallback;
     }
     return value;
@@ -133,7 +133,7 @@ export function loadConfig(env = process.env) {
     relay,
     relayAuto,
     listenHost: get("RELAY_HOST", "127.0.0.1"),
-    listenPort: num("RELAY_PORT", 3110, { min: 0 }),
+    listenPort: num("RELAY_PORT", 3110, { min: 0, max: 65535 }),
     webhookPath,
     secret: get("GITHUB_WEBHOOK_SECRET"),
     ownerLogin: get("GITHUB_OWNER_LOGIN").toLowerCase(),

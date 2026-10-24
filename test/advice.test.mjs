@@ -141,3 +141,100 @@ test("advice: a hold whose run can't prove it stopped points at pch release", ()
   const other = advise(base({ issue: { status: "todo", assigneeAgentId: A, executionBlocker: { cause: "execution_owner_active" } } }));
   assert.match(other.steps.join("\n"), /press Interrupt/);
 });
+
+// ---------------------------------------------------------------- rules for the fixes since 1.8
+
+test("advice: an agent the watchdog paused at a usage limit waits for the reset; one you paused gets the resume sweep", () => {
+  const limited = advise(base({
+    assignee: { name: "Carla", status: "paused" },
+    limitPause: { label: "Codex", what: "usage limit", resetAt: "Mon 12 Oct, 15:45 (Europe/London)", resumeAt: "Mon 12 Oct, 15:50 (Europe/London)" },
+  }));
+  assert.match(limited.what, /^The watchdog paused Carla because its Codex usage limit was reached; it resets Mon 12 Oct, 15:45 \(Europe\/London\)\. It resumes Carla at Mon 12 Oct, 15:50/);
+  assert.equal(limited.watchdog, "auto");
+
+  const yours = advise(base({ assignee: { name: "Carla", status: "paused" }, config: { watchdog: true } }));
+  assert.match(yours.steps[1], /the watchdog restores the issues Paperclip blocked during the pause/);
+  const noSweep = advise(base({ assignee: { name: "Carla", status: "paused" }, config: { watchdog: true, watchdogResumeSweep: false } }));
+  assert.match(noSweep.steps[1], /^If nothing starts/);
+});
+
+test("advice: a run that hit its usage limit, and one that only met a busy model", () => {
+  const limit = advise(base({ runs: [run(A, "failed", 5, { errorCode: "provider_quota" })], lastFailure: { kind: "limit", label: "Claude", what: "usage limit", resetAt: "Mon 12 Oct, 16:00 (Europe/London)" } }));
+  assert.match(limit.what, /Carla's last run hit its Claude usage limit, which resets Mon 12 Oct, 16:00/);
+  assert.equal(limit.watchdog, "auto");
+  assert.equal(advise(base({ runs: [run(A, "failed", 5)], lastFailure: { kind: "limit", label: "Claude", what: "usage limit" }, config: { watchdogLimitPause: false } })).watchdog, "manual");
+  // Even when Paperclip's recovery has parked the issue since.
+  const parked = advise(base({ issue: { status: "blocked", assigneeAgentId: A }, recovery: { kind: "stranded_assigned_issue", ownerType: "board" }, runs: [run(A, "failed", 5)], lastFailure: { kind: "limit", label: "Codex", what: "quota or billing limit" } }));
+  assert.match(parked.what, /hit its Codex quota or billing limit\. Every run/);
+
+  const busy = advise(base({ runs: [run(A, "failed", 5, { errorCode: "provider_quota" })], lastFailure: { kind: "transient", label: "Codex" } }));
+  assert.match(busy.what, /failed on Codex's capacity 5 min ago \(the model was busy, not a usage limit\)/);
+  assert.equal(busy.watchdog, null);
+});
+
+test("advice: a review blocked because its participant couldn't be woken", () => {
+  const issue = { status: "blocked", assigneeAgentId: A, executionState: { status: "pending", currentParticipant: { type: "agent", agentId: B } } };
+  const recovery = { kind: "stranded_assigned_issue", cause: "execution_review_participant_recovery", ownerType: "board" };
+  const paused = advise(base({ issue, recovery, participant: { name: "Hoover", status: "paused" } }));
+  assert.match(paused.what, /couldn't wake Hoover, the agent its pending review stage waits on \(Hoover is paused\)/);
+  assert.deepEqual(paused.steps, ["Resume Hoover in Paperclip.", "Then set the issue's status back to In review: Paperclip re-pends the stage and wakes Hoover."]);
+  assert.equal(paused.watchdog, "auto");
+  const awake = advise(base({ issue, recovery, participant: { name: "Hoover", status: "idle" } }));
+  assert.equal(awake.steps.length, 1);
+  assert.equal(awake.watchdog, "manual");
+});
+
+test("advice: a review Paperclip escalated to you after the review-round limit", () => {
+  const issue = {
+    status: "in_review", assigneeAgentId: A,
+    executionPolicy: { stages: [{ id: "s1", type: "review", participants: [{ type: "agent", agentId: B }] }] },
+    executionState: { status: "pending", currentStageId: "s1", currentStageType: "review", changesRequestedCount: 3, currentParticipant: { type: "user", userId: "u-me" }, returnAssignee: { type: "agent", agentId: A } },
+  };
+  const a = advise(base({ issue }));
+  assert.match(a.what, /handed this review to you after 3 agent change requests in a row/);
+  assert.match(a.steps[1], /raise maxReviewRounds/);
+  assert.equal(a.watchdog, "manual");
+  assert.equal(advise(base({ issue, config: { watchdogReturnEscalatedReviews: true } })).watchdog, "auto");
+});
+
+test("advice: a cancelled blocker isn't a dropped wake", () => {
+  const a = advise(base({ issue: { status: "blocked", assigneeAgentId: A }, blockers: { blockers: [{ identifier: "ACM-2", status: "done" }, { identifier: "ACM-3", status: "cancelled" }] } }));
+  assert.match(a.what, /blocked by ACM-3, which was cancelled\. Paperclip never counts a cancelled blocker as resolved/);
+  assert.match(a.steps[0], /remove ACM-3 from "Blocked by"/);
+  assert.equal(a.watchdog, "auto");
+  assert.equal(advise(base({ issue: { status: "blocked", assigneeAgentId: A }, blockers: { blockers: [{ identifier: "ACM-3", status: "cancelled" }] }, config: { watchdogCancelledBlockers: false } })).watchdog, "manual");
+});
+
+test("advice: in review with no stage pending, and stages an agent wiped", () => {
+  const issue = { status: "in_review", assigneeAgentId: A, executionState: null };
+  const plain = advise(base({ issue, runs: [run(A, "succeeded", 30)] }));
+  assert.match(plain.what, /^It is in review, but no review stage is pending/);
+  const wiped = advise(base({ issue, runs: [run(A, "succeeded", 30)], stagesWipedBy: "Dinesh" }));
+  assert.match(wiped.what, /Its review stages were removed by Dinesh/);
+});
+
+test("advice: an agent waiting on a CI run", () => {
+  const facts = { runs: [run(A, "succeeded", 30)], ciRun: "acme/app#39498202022", lastComment: { body: "Waiting on run 39498202022." } };
+  const a = advise(base({ ...facts, config: { watchdog: true, githubToken: "t" } }));
+  assert.match(a.what, /finished 30 min ago, waiting on CI run acme\/app#39498202022/);
+  assert.equal(a.watchdog, "auto");
+  assert.equal(advise(base(facts)).watchdog, "manual", "without a GitHub token the watchdog can't read the run");
+});
+
+test("pch why says when the watchdog paused the assignee at a usage limit, from its state file", async (t) => {
+  const env = await setup();
+  t.after(env.close);
+  const agent = { id: uuid(), companyId: ids.company, name: "Gilfoyle", status: "paused", adapterType: "codex_local" };
+  env.db.agents.push(agent);
+  const issue = { id: uuid(), identifier: "ACM-110", companyId: ids.company, status: "todo", assigneeAgentId: agent.id };
+  env.db.issues.push(issue);
+  const resetAt = Date.parse("2030-01-07T15:45:00Z");
+  env.state.nudges.set(`limit:${ids.company}:codex:host-login`, {
+    companyId: ids.company, account: "codex:host-login", adapter: "codex_local", what: "usage limit", resetAt, timeZone: "UTC",
+    unknownReset: false, paused: { [agent.id]: { name: "Gilfoyle", pausedAt: new Date().toISOString(), tries: 0 } }, count: 1, at: Date.now(),
+  });
+  env.state.save({ force: true });
+  const lines = (await captureOutput(() => cmd.why(env.ctx, "ACM-110"))).join("\n");
+  assert.match(lines, /Paused by the watchdog at a usage limit; resumed at Mon 7 Jan, 15:50 \(UTC\)/);
+  assert.match(lines, /Recommendation: The watchdog paused Gilfoyle because its Codex usage limit was reached; it resets Mon 7 Jan, 15:45 \(UTC\)/);
+});

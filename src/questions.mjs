@@ -17,10 +17,9 @@
 // addressee an issue of its own that says which card to answer, and closes it
 // once the card is settled. `pch blocked` lists these cards.
 
-import { ts } from "./util.mjs";
+import { ACTIVE_RUN, ts } from "./util.mjs";
 
 export const QUESTION_STATUSES = "todo,in_progress,in_review,blocked";
-const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
 
 // The issue's pending cards; [] when Paperclip has no interactions route (404).
 // Any other failure throws: an unread issue must not look like one with no cards.

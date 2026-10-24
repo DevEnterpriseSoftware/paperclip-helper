@@ -24,7 +24,7 @@
 // Once per merge-group commit. Needs a GitHub token with "Actions: Read" (and
 // "Checks: Read" for the annotation).
 
-import { RELAYED_SIGNATURE, signed } from "./util.mjs";
+import { CLOSED_STATUSES, prLabel, RELAYED_SIGNATURE, signed } from "./util.mjs";
 import { HELPER_MARK } from "./conflicts.mjs";
 import { noteToBoard } from "./board-note.mjs";
 
@@ -33,7 +33,6 @@ const FAILED = new Set(["failure", "timed_out", "startup_failure"]);
 const CANCELLED = new Set(["cancelled"]);
 const RUN_PAGE = 100;
 
-const prLabel = (pr) => `PR #${pr.number}`;
 
 // The merge group's branch for one PR into one base.
 const queueBranchPrefix = (base, number) => `gh-readonly-queue/${base}/pr-${number}-`;
@@ -90,7 +89,7 @@ function infraNote(pr, drop, requeued = false) {
   );
 }
 
-const CLOSED = new Set(["done", "cancelled"]);
+const CLOSED = CLOSED_STATUSES;
 // Merge-group runs are listed from this far back: a queue's timeout is an hour by default.
 const RUN_LOOKBACK_MS = 12 * 60 * 60_000;
 const RUN_PAGES = 5;
@@ -168,7 +167,7 @@ export function createMergeQueueHandler({ ctx, state, github, identifiersOf, res
     if (!issue.assigneeAgentId) return addComment(issue.identifier ?? issue.id, text);
     if (config.dryRun) return { identifier: issue.identifier, action: "note (dry run)" };
     await github
-      .comment(repo, pr.number, `${signed(text, RELAYED_SIGNATURE)}\n\n${HELPER_MARK}`)
+      .comment(repo, pr.number, `${signed(text)}\n\n${HELPER_MARK}`)
       .catch((err) => log.warn("relay: could not comment on the PR", { repo, pr: pr.number, error: err.message }));
     await noteToBoard({ api, config, log }, issue.companyId, `${issue.identifier}: ${text}`, { source: "relay", signature: RELAYED_SIGNATURE });
     return { identifier: issue.identifier, action: "note on the PR" };

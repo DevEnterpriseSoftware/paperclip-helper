@@ -16,7 +16,7 @@
 //   * an issue in progress or in review whose stages an agent removed: the board
 //     is told once.
 
-import { ts } from "./util.mjs";
+import { pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 import { listIssues } from "./paperclip.mjs";
 import { noteToBoard } from "./board-note.mjs";
 import { notesText } from "./quiet-notes.mjs";
@@ -143,7 +143,7 @@ export function createStagesCheck({ ctx, records, state, stats, dryRunSeen, gith
       const comment =
         `This issue was closed while ${label} was still open and unreviewed, so the watchdog has reopened it. ` +
         `Its review stages were wiped (by ${by}, ${when(wipe)} UTC), so the board or the architect must restore them before it is reviewed. ` +
-        `Don't mark it done again until they are. ${pr.html_url}\n\n_Paperclip Helper watchdog._`;
+        `Don't mark it done again until they are. ${pr.html_url}\n\n${WATCHDOG_SIGNATURE}`;
       if (config.dryRun) {
         dryRunSeen.add(key);
         log("watchdog: would reopen a done issue whose PR is still open (dry run)", { issue: row.identifier, pr: pr.html_url });
@@ -152,7 +152,7 @@ export function createStagesCheck({ ctx, records, state, stats, dryRunSeen, gith
       try {
         await api.request("PATCH", `/api/issues/${row.id}`, { status: "in_progress", comment });
       } catch (err) {
-        if (err?.status === 409 && /paused/i.test(err.message)) return false; // a paused task: next scan
+        if (pausedRefusal(err)) return false; // a paused task: next scan
         records.set(key, { count: 1, at: now(), failed: true });
         state.touch();
         log.warn("watchdog: couldn't reopen a done issue whose PR is still open; left to you", { issue: row.identifier, error: err.message });

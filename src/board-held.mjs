@@ -19,8 +19,9 @@
 //     is Paperclip's guard against two agents bouncing work for ever. Raising
 //     `maxReviewRounds` in the issue's execution policy is the other way.
 
+import { listIssues } from "./paperclip.mjs";
 import { cardText } from "./questions.mjs";
-import { ts } from "./util.mjs";
+import { ACTIVE_RUN, agentMention, approvalWaitingOn, asleep, mapLimit, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3; // Paperclip's, issue-execution-policy.ts
 const RESOLVED = new Set(["answered", "accepted", "rejected"]);
@@ -104,4 +105,183 @@ export function reviewStage(issue) {
   return stages.find((s) => s?.id === issue?.executionState?.currentStageId) ?? null;
 }
 
-export { cardText };
+// ---------------------------------------------------------------- the check (watchdog.mjs runs it each tick)
+
+// Issues waiting on your review are looked at once per stall window.
+const BOARD_STATUSES = "in_review";
+// How long after you answer an agent's card the watchdog waits before returning
+// the issue: time for you to approve it, or send it back yourself.
+const ANSWER_WAIT_MS = 30 * 60_000;
+const CONCURRENCY = 4;
+
+// Checks 12 and 13. From the watchdog: its records (keys from `record`), `agentFor`
+// (an agent by id, cached for the tick), `quiet` (the issue has been still for the
+// stall window) and `startedRuns` (the issue's runs Paperclip didn't refuse).
+export function createBoardHeldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, quiet, startedRuns }) {
+  const { api, config, log } = ctx;
+  const now = () => ctx.now();
+  const stallMs = config.watchdogStallSec * 1000;
+  const boardScanAt = new Map(); // companyId → when issues waiting on your review were last looked at
+
+
+  // Returns the issue to its implementer as your "changes requested" decision:
+  // status in_progress with the comment, in one PATCH (Paperclip's rule). Once
+  // per key; a paused task or a refused decision is logged and tried no more.
+  async function returnToAgent(issue, key, agent, message, logExtra) {
+    if (records.has(key)) return false;
+    const who = issue.identifier ?? issue.id;
+    const comment = `${agentMention(agent)} ${message}\n\n${WATCHDOG_SIGNATURE}`;
+    if (config.dryRun) {
+      if (dryRunSeen.has(key)) return false;
+      dryRunSeen.add(key);
+      log("watchdog: would return the issue to its agent (dry run)", { issue: who, agent: agent.name, ...logExtra });
+      return false;
+    }
+    // Several requests have passed since the issue was read. If you decided in the
+    // meantime (approved it, say), in_progress would reopen it: read it again.
+    const { userId } = await ctx.identity();
+    const current = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+    if (
+      !current ||
+      !approvalWaitingOn(current, userId) ||
+      (current.executionState?.lastDecisionId ?? null) !== (issue.executionState?.lastDecisionId ?? null) ||
+      current.executionState?.returnAssignee?.agentId !== agent.id
+    ) {
+      log.debug("watchdog: the issue changed before it could be returned; looked at again next time", { issue: who });
+      return false;
+    }
+    try {
+      await api.request("PATCH", `/api/issues/${issue.id}`, { status: "in_progress", comment });
+    } catch (err) {
+      if (pausedRefusal(err)) {
+        log.debug("watchdog: the issue is paused; return postponed", { issue: who });
+        return false;
+      }
+      records.set(key, { count: 1, at: now(), failed: true });
+      state.touch();
+      log.warn("watchdog: Paperclip refused to return the issue to its agent; left to you", { issue: who, ...logExtra, error: err.message });
+      return false;
+    }
+    records.set(key, { count: 1, at: now() });
+    state.touch();
+    stats.returned += 1;
+    log("watchdog: returned the issue to its agent", { issue: who, agent: agent.name, ...logExtra });
+    return true;
+  }
+
+  async function checkWaitingOnYou(companyId, agents) {
+    if (!config.watchdogDeliverAnswers && !config.watchdogReturnEscalatedReviews) return;
+    const last = boardScanAt.get(companyId);
+    if (last && now() - last < stallMs) return;
+    boardScanAt.set(companyId, now());
+    const { userId } = await ctx.identity();
+    if (!userId) return;
+    const issues = (await listIssues(api, companyId, BOARD_STATUSES)).filter(
+      (i) => i.assigneeUserId === userId && !i.assigneeAgentId && !i.executionRunId && !i.checkoutRunId && quiet(i),
+    );
+    await mapLimit(issues, CONCURRENCY, async (row) => {
+      try {
+        const issue = await api.request("GET", `/api/issues/${row.id}`).catch(() => null);
+        if (!issue || !approvalWaitingOn(issue, userId)) return;
+        const back = issue.executionState?.returnAssignee;
+        if (back?.type !== "agent" || !back.agentId) return;
+        const agent = await agentFor(back.agentId, agents).catch(() => null);
+        // Returning it to an agent Paperclip can't invoke only parks it.
+        if (!agent || asleep(agent)) return;
+        const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => null);
+        if (!Array.isArray(runs) || runs.some((r) => ACTIVE_RUN.has(r.status))) return;
+        const cards = await api.request("GET", `/api/issues/${issue.id}/interactions`).catch(() => []);
+        // An escalated review is only ever returned by 13: returning it as you for an
+        // answer would reset Paperclip's round count behind WATCHDOG_RETURN_ESCALATED_REVIEWS.
+        if (escalatedReview(issue, userId)) {
+          if (config.watchdogReturnEscalatedReviews) await returnEscalated(issue, agent, cards, runs, agents);
+          return;
+        }
+        if (config.watchdogDeliverAnswers) await deliverAnswer(issue, agent, cards, runs);
+      } catch (err) {
+        log.warn("watchdog: check of an issue waiting on your review failed", { issue: row.identifier ?? row.id, error: err.message });
+      }
+    });
+  }
+
+  // 12. The agent's card, answered by a person, with no run of the agent since.
+  async function deliverAnswer(issue, agent, cards, runs) {
+    const answered = answeredCards(cards, agent.id).sort((a, b) => ts(b.resolvedAt) - ts(a.resolvedAt));
+    const card = answered[0];
+    if (!card) return false;
+    const answeredAt = ts(card.resolvedAt);
+    // Give you time to decide yourself after answering (approve, or send it back with a note).
+    if (now() - answeredAt < Math.max(stallMs, ANSWER_WAIT_MS)) return true;
+    // A run of the agent that started after the answer, or was still going when it
+    // came, has seen it (Paperclip hands a running agent the answer).
+    if (startedRuns(runs).some((r) => r.agentId === agent.id && (ACTIVE_RUN.has(r.status) || ts(r.finishedAt) >= answeredAt || ts(r.startedAt ?? r.createdAt) >= answeredAt))) return false;
+    const key = record.answer(card);
+    if (records.has(key)) return false;
+    const what = cardText(card, 300);
+    return returnToAgent(
+      issue,
+      key,
+      agent,
+      `your card on this issue${what ? ` ("${what}")` : ""} was answered, but the answer reached no one: the issue was ` +
+        `waiting on the board's review, so Paperclip woke no agent. The answer:\n\n${quote(answerText(card))}\n\n` +
+        `The watchdog has returned the issue to you. Act on the answer (check what it reports), then hand the issue back for ` +
+        `review; if nothing needs to change, say so and resubmit as it is.`,
+      { reason: "answered card", card: card.id },
+    );
+  }
+
+  // 13. A review Paperclip escalated to you after the agents used up their rounds.
+  async function returnEscalated(issue, agent, cards, runs, agents) {
+    const decisionId = issue.executionState?.lastDecisionId ?? null;
+    const seen = record.escalatedSeen(issue, decisionId);
+    if (records.has(seen)) return;
+    const who = issue.identifier ?? issue.id;
+    // Waiting on a person for something else (a card addressed to one): that comes first.
+    const waitingOnPerson = (Array.isArray(cards) ? cards : []).some((c) => c?.status === "pending" && (c.addresseeUserId || !c.addresseeAgentId));
+    if (waitingOnPerson) return;
+    const comments = await api.request("GET", `/api/issues/${issue.id}/comments?order=desc&limit=20`).catch(() => null);
+    if (!Array.isArray(comments)) return;
+    // The reviewer's request: the latest comment by one of the stage's reviewers, or
+    // else by any agent other than the implementer.
+    const reviewers = new Set((reviewStage(issue)?.participants ?? []).filter((p) => p?.type === "agent").map((p) => p.agentId));
+    const request =
+      comments.find((c) => c?.authorAgentId && reviewers.has(c.authorAgentId)) ??
+      comments.find((c) => c?.authorAgentId && c.authorAgentId !== agent.id);
+    if (!request) return;
+    // The implementer has run since that request: it isn't waiting to hear it.
+    if (startedRuns(runs).some((r) => r.agentId === agent.id && ts(r.startedAt ?? r.createdAt) > ts(request.createdAt))) return;
+    const budget = record.escalated(issue);
+    const used = records.get(budget)?.count ?? 0;
+    records.set(seen, { count: 1, at: now() });
+    state.touch();
+    if (used >= config.watchdogMaxNudges) {
+      log.warn("watchdog: a review Paperclip escalated to you again; the watchdog's returns are used up, so it's yours", {
+        issue: who,
+        rounds: issue.executionState?.changesRequestedCount ?? null,
+        hint: "Approve, request changes yourself, or raise maxReviewRounds in the issue's execution policy.",
+      });
+      return;
+    }
+    const reviewer = await agentFor(request.authorAgentId, agents).catch(() => null);
+    const rounds = issue.executionState?.changesRequestedCount ?? null;
+    const done = await returnToAgent(
+      issue,
+      `${budget}:${used + 1}`,
+      agent,
+      `${reviewer?.name ?? "The reviewer"} requested changes again, and after ${rounds ?? "several"} rounds Paperclip handed the ` +
+        `review to the board instead of back to you (its review-round limit). The watchdog returns it to you with the latest ` +
+        `request:\n\n${quote(request.body)}\n\nPlease address it and resubmit. If you think the request is wrong, or it needs ` +
+        `a decision from the board, say so in a comment instead of resubmitting unchanged.`,
+      { reason: "escalated review", rounds, reviewer: reviewer?.name ?? null },
+    );
+    if (done) {
+      records.set(budget, { count: used + 1, at: now() });
+      state.touch();
+    } else {
+      records.delete(seen); // not returned (dry run, paused): look again next time
+      state.touch();
+    }
+  }
+
+  return { check: checkWaitingOnYou };
+}
