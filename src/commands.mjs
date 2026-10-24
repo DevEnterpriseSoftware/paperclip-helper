@@ -48,6 +48,8 @@ export const USAGE = `Paperclip Helper
                                where the tokens go: per agent runs, tokens, cost, what woke it, and what to look at
   pch costs                    preview what cost sync would post (changes nothing)
   pch costs --sessions         check whether resumed sessions report cumulative costs
+  pch costs --audit [--days N] check the cost figures of the last N days (default 7): tokens, reported cost,
+                               what the tokens cost at list price, what is synced, duplicates (changes nothing)
   pch models                   every agent's adapter, model and effort
   pch set-model FROM TO [--apply]   move every agent on model FROM to TO (preview without --apply)
   pch login                    create the helper's board API key (approve it in the browser)
@@ -780,9 +782,16 @@ export async function usage(ctx, args = []) {
 
 // ---------------------------------------------------------------- costs
 
-export async function costs(ctx, flags = []) {
+export async function costs(ctx, args = []) {
   const sync = createCostSync(ctx);
-  if (flags.includes("--sessions")) return sync.sessions();
+  if (args.includes("--sessions")) return sync.sessions();
+  if (args.includes("--audit")) {
+    const i = args.findIndex((a) => a === "--days" || a.startsWith("--days="));
+    const value = i < 0 ? "7" : args[i].includes("=") ? args[i].split("=")[1] : args[i + 1];
+    const days = Number(value);
+    if (!(days > 0)) throw new Error("usage: costs --audit [--days N]");
+    return sync.audit({ days, print: out });
+  }
   if (!ctx.config.costSync) out("(COST_SYNC is off: this is what it would post if you turned it on.)\n");
   return sync.preview();
 }

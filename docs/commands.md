@@ -18,6 +18,7 @@
 | `pch usage [--days N] [--agent NAME]` | Where the tokens go: per agent, its runs, tokens, cost, model and effort, what woke it, and the agents worth a look (one that polls, one that keeps failing, one using most of its provider's tokens). Read-only. See [`usage`](#usage-where-the-tokens-go). |
 | `pch costs` | Previews what cost sync would post, and what it does to budgets. |
 | `pch costs --sessions` | Checks whether resumed sessions report cumulative costs (see [Compatibility](../README.md#compatibility)). |
+| `pch costs --audit [--days N]` | Checks the cost figures of the last N days (default 7): tokens, reported cost, what the tokens cost at list price, what cost sync posts, and duplicates. Changes nothing. See [cost sync](cost-sync.md#checking-the-figures). |
 | `pch models` | Every agent's adapter, model, effort and status. |
 | `pch set-model FROM TO [--apply]` | Moves every agent on model `FROM` to `TO`. It previews unless you pass `--apply`. |
 | `pch login`, `pch revoke` | Create the helper's key; revoke and delete it. |

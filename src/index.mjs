@@ -143,7 +143,7 @@ async function main() {
     release: () => cmd.release(ctx, [arg, ...rest].find((x) => x && !x.startsWith("--")), flags),
     workspace: () => cmd.workspace(ctx, [arg, ...rest].find((x) => x && !x.startsWith("--")), flags),
     worktrees: () => cmd.worktrees(ctx, flags),
-    costs: () => cmd.costs(ctx, flags),
+    costs: () => cmd.costs(ctx, [arg, ...rest].filter(Boolean)),
     usage: () => cmd.usage(ctx, [arg, ...rest].filter(Boolean)),
     models: () => cmd.models(ctx),
     "set-model": () => cmd.setModel(ctx, arg, rest.filter((r) => !r.startsWith("--"))[0], flags),

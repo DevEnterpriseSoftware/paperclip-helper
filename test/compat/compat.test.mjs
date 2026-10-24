@@ -662,7 +662,8 @@ if (!BASE) {
       assert.ok(events[0].seq <= events.at(-1).seq, "events are listed oldest first");
 
       // Exactly the body cost-sync.mjs posts.
-      const event = await s.ctx.api.request("POST", `/api/companies/${s.company.id}/cost-events`, {
+      const body = {
+        idempotencyKey: `pch-cost-sync:compat-${run.id}`,
         agentId: run.agentId,
         heartbeatRunId: run.id,
         issueId: run.contextSnapshot.issueId,
@@ -676,9 +677,16 @@ if (!BASE) {
         outputTokens: 0,
         costCents: 3,
         occurredAt: new Date(run.finishedAt).toISOString(),
-      });
-      assert.equal(event.costCents, 3);
+      };
+      const event = await s.ctx.api.request("POST", `/api/companies/${s.company.id}/cost-events`, body);
+      assert.equal(Number(event.costCents), 3);
       assert.equal(event.heartbeatRunId, run.id);
+      if (event.idempotencyKey !== undefined) {
+        // Paperclip 2026.10+: the key is kept, and posting the same receipt again returns the first.
+        assert.equal(event.idempotencyKey, body.idempotencyKey);
+        const again = await s.ctx.api.request("POST", `/api/companies/${s.company.id}/cost-events`, body);
+        assert.equal(again.id, event.id, "a repeated post with the same idempotency key is recorded once");
+      }
 
       const activity = await s.ctx.api.request("GET", `/api/companies/${s.company.id}/activity?entityType=cost_event&limit=500`);
       const rows = Array.isArray(activity) ? activity : activity.items;

@@ -40,6 +40,8 @@ export function emptyDb() {
     heartbeatRuns: [], // { id, companyId, agentId, status, finishedAt, usageJson, contextSnapshot, createdAt, resultJson }
     runEvents: {}, // runId → [{ seq, eventType, payload }], oldest first
     costEvents: [],
+    costIdempotency: true, // false: a Paperclip before 2026.10, which drops idempotencyKey
+    hangAfterRecording: 0, // the next N cost posts are recorded but never answered
     activity: [],
     budgets: { policies: [] },
     interactions: {}, // issueId → [{ id, kind, status, addresseeAgentId, addresseeUserId, createdByAgentId, payload, createdAt }]
@@ -228,9 +230,27 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         return send(400, { error: "Validation error" });
       }
       if (body.issueId && !db.issues.some((i) => i.id === body.issueId)) return send(422, { error: "Issue not found" });
-      const event = { id: uuid(), companyId: m[1], ...body };
+      // Paperclip 2026.10 records a receipt once per idempotencyKey: the same receipt
+      // again returns the first, a different one is a 409. Older versions drop the key.
+      let receipt = body;
+      if (!db.costIdempotency) {
+        const { idempotencyKey: _dropped, ...rest } = body;
+        receipt = rest;
+      } else if (body.idempotencyKey) {
+        const existing = db.costEvents.find((e) => e.idempotencyKey === body.idempotencyKey);
+        if (existing) {
+          const { id: _id, companyId: _c, ...was } = existing;
+          const same = JSON.stringify(Object.entries(was).sort()) === JSON.stringify(Object.entries(body).sort());
+          return same ? send(201, existing) : send(409, { error: "Idempotency key already used for a different cost receipt" });
+        }
+      }
+      const event = { id: uuid(), companyId: m[1], ...receipt };
       db.costEvents.push(event);
-      db.activity.push({ action: "cost.reported", actorType: "user", actorId: who.userId, entityType: "cost_event", entityId: event.id });
+      db.activity.push({ action: "cost.reported", actorType: "user", actorId: who.userId, entityType: "cost_event", entityId: event.id, runId: body.heartbeatRunId ?? null });
+      if (db.hangAfterRecording > 0) {
+        db.hangAfterRecording -= 1;
+        return; // recorded, but the answer never comes
+      }
       return send(201, event);
     }
     if ((m = p.match(/^\/api\/companies\/([^/]+)\/activity$/))) {

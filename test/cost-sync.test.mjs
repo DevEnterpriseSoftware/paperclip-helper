@@ -17,6 +17,7 @@ function seed(db) {
   const claude = agent("Claude", "claude_local", { model: "claude-sonnet-5" });
   const codex = agent("Codex", "codex_local", { model: "gpt-5.3-codex" });
   const fast = agent("Fast", "codex_local", { model: "gpt-5.3-codex", fastMode: true });
+  const codexDefault = agent("Default", "codex_local"); // no model configured: Codex's default
   const gemini = agent("Gemini", "gemini_local");
   const issue = { id: uuid(), identifier: "ACM-1", companyId: ids.company, status: "done" };
   db.issues.push(issue);
@@ -41,13 +42,13 @@ function seed(db) {
     apiKey: run(uuid(), claude.id, { billingType: "metered_api", provider: "anthropic", biller: "anthropic", model: "claude-sonnet-5", costUsd: 2 }),
     codex: run(uuid(), codex.id, sub({ provider: "openai", biller: "chatgpt", model: "gpt-5.3-codex", ...codexTokens, costStatus: "unpriced" })),
     fast: run(uuid(), fast.id, sub({ provider: "openai", biller: "chatgpt", model: "gpt-5.3-codex", ...codexTokens })),
-    blankModel: run(uuid(), codex.id, sub({ provider: "openai", biller: "chatgpt", model: "unknown", ...codexTokens })),
+    blankModel: run(uuid(), codexDefault.id, sub({ provider: "openai", biller: "chatgpt", model: "unknown", ...codexTokens })),
     tiny: run(uuid(), claude.id, sub({ provider: "anthropic", biller: "anthropic", model: "claude-sonnet-5", costUsd: 0.004 })),
     running: run(uuid(), claude.id, null, { status: "running", finishedAt: null }),
     settling: run(uuid(), claude.id, sub({ provider: "anthropic", biller: "anthropic", model: "claude-sonnet-5", costUsd: 3 }), { finishedAt: minutesAgo(1) }),
     gemini: run(uuid(), gemini.id, sub({ provider: "google", biller: "google", model: "gemini-3-pro", costUsd: 0.5 })),
   };
-  return { claude, codex, fast, gemini, issue, runs };
+  return { claude, codex, fast, codexDefault, gemini, issue, runs };
 }
 
 async function syncEnv(t, extra = {}) {
@@ -62,11 +63,16 @@ const byRun = (db) => new Map(db.costEvents.map((e) => [e.heartbeatRunId, e]));
 test("price table: lookup by date and alias, and OpenAI's cached-input arithmetic", () => {
   assert.equal(priceFor(BUILTIN_PRICES, "gpt-5.6", "2026-09-30").model, "gpt-5.6-sol");
   assert.equal(priceFor(BUILTIN_PRICES, "OpenAI/GPT-5.3-Codex", "2026-09-30").output, 14);
-  assert.equal(priceFor(BUILTIN_PRICES, "claude-sonnet-5"), null);
+  assert.equal(priceFor(BUILTIN_PRICES, "claude-sonnet-5").cachedInput, 0.2);
+  assert.equal(priceFor(BUILTIN_PRICES, "anthropic/claude-opus-5.5[1m]").model, "claude-opus-5-5");
+  assert.equal(priceFor(BUILTIN_PRICES, "claude-opus-5-5-20260915").output, 20);
+  assert.equal(priceFor(BUILTIN_PRICES, "gpt-7"), null);
   const table = { models: { m: [{ from: "2026-01-01", input: 1, cachedInput: 0.1, output: 2 }, { from: "2026-06-01", input: 3, cachedInput: 0.3, output: 6 }] }, aliases: {} };
   assert.equal(priceFor(table, "m", "2026-03-01").input, 1);
   assert.equal(priceFor(table, "m", "2026-07-01").input, 3);
-  const usd = estimateUsd({ input: 1.75, cachedInput: 0.175, output: 14 }, { inputTokens: 1_000_000, cachedInputTokens: 400_000, outputTokens: 100_000 });
+  // 600K fresh input, 400K cache reads, 100K output at gpt-5.3-codex prices:
+  // 0.6 × 1.75 + 0.4 × 0.175 + 0.1 × 14 = 1.05 + 0.07 + 1.40 = $2.52.
+  const usd = estimateUsd({ input: 1.75, cachedInput: 0.175, output: 14 }, { input: 600_000, cacheRead: 400_000, output: 100_000 });
   assert.equal(Math.round(usd * 100), 252);
 });
 
@@ -82,6 +88,7 @@ test("posts subscription runs once: Claude's reported cost, Codex estimated from
     {
       id: undefined,
       companyId: undefined,
+      idempotencyKey: `pch-cost-sync:${env.runs.claude.id}`,
       agentId: env.claude.id,
       heartbeatRunId: env.runs.claude.id,
       issueId: env.issue.id,
@@ -205,8 +212,9 @@ test("COST_SYNC_ADAPTERS replaces the default adapters", async (t) => {
   assert.deepEqual([...byRun(env.db).keys()], [env.runs.gemini.id]);
 });
 
-test("a post interrupted by a crash is never repeated", async (t) => {
+test("without idempotency keys, a post interrupted by a crash is never repeated", async (t) => {
   const env = await syncEnv(t);
+  env.db.costIdempotency = false;
   fs.writeFileSync(
     env.ctx.config.costStateFile,
     JSON.stringify({ version: 2, companies: {}, inflight: { [env.runs.codex.id]: minutesAgo(5) }, skipped: {} }),
@@ -226,8 +234,9 @@ test("an event whose issue Paperclip no longer has is posted without it", async 
   assert.equal(byRun(env.db).get(env.runs.codex.id).issueId, env.issue.id, "other events keep theirs");
 });
 
-test("a 5xx is retried next time; a timeout is not", async (t) => {
+test("without idempotency keys, a 5xx is retried next time; a timeout is not", async (t) => {
   const env = await syncEnv(t, { PAPERCLIP_TIMEOUT_SEC: "1" });
+  env.db.costIdempotency = false;
   const path = `/api/companies/${ids.company}/cost-events`;
 
   env.fake.fail("POST", path, 503);

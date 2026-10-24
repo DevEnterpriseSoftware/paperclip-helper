@@ -16,6 +16,7 @@
 
 import { effortOf, ts } from "./util.mjs";
 import { companyAgents } from "./paperclip.mjs";
+import { splitTokens } from "./prices.mjs";
 
 const POLL_SHARE = 0.25;
 const FAILED_SHARE = 0.2;
@@ -26,15 +27,20 @@ const MONITOR_WAKE = "issue_monitor_due";
 
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
 // Input here is fresh input: cached input is its own column. Codex counts cache hits
-// in its input, and Paperclip stored them that way until recently (now it subtracts
-// them, codex-local parse.ts): an input at least as large as the cached input
-// includes it (as cost sync assumes too, prices.mjs).
+// in its input, and Paperclip stored them that way until 2026.10; runs stored since
+// carry rawInputIncludesCached: false (splitTokens in prices.mjs, as cost sync uses).
 export function tokensOf(run, adapterType) {
   const u = run.usageJson ?? {};
-  let input = num(u.inputTokens ?? run.inputTokens);
-  const cached = num(u.cachedInputTokens ?? run.cachedInputTokens);
-  if (adapterType === "codex_local" && cached > 0 && input >= cached) input -= cached;
-  return { input, cached, output: num(u.outputTokens ?? run.outputTokens) };
+  const t = splitTokens(
+    {
+      inputTokens: u.inputTokens ?? run.inputTokens,
+      cachedInputTokens: u.cachedInputTokens ?? run.cachedInputTokens,
+      outputTokens: u.outputTokens ?? run.outputTokens,
+      rawInputIncludesCached: u.rawInputIncludesCached,
+    },
+    adapterType,
+  );
+  return { input: t.input, cached: t.cacheRead, output: t.output };
 }
 const FINISHED = new Set(["succeeded", "failed", "timed_out", "cancelled"]);
 // What woke the run: its wake reason, else how it was invoked (assignment, timer, on demand).
