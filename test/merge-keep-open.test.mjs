@@ -171,3 +171,48 @@ test("when Paperclip refuses the hand-back, the relay comments and leaves the is
   assert.match(note.body, /This issue says the merge doesn't complete it/);
   assert.match(note.body, /Paperclip refused to return the issue \(.*no return assignee.*\): it is left as it was for you to decide/);
 });
+
+test("unfinishedWork: open checklist items and sections still to do; ticked items, quoted code and plain proofs sections don't count", async () => {
+  const { unfinishedWork } = await import("../src/decisions.mjs");
+  assert.equal(unfinishedWork("Fix it.\n\n- [x] parser\n- [ ] proof 2\n* [ ] proof 3"), "2 open checklist items");
+  assert.equal(unfinishedWork("## Proofs\n\n- [x] proof 1\n- [x] proof 2"), null);
+  assert.equal(unfinishedWork("## Proofs\n\nProof 1 passed. Proof 2 still to run."), "a section still to do (Proofs)");
+  assert.equal(unfinishedWork("## Proofs\n\nAll five passed on the release build."), null);
+  assert.equal(unfinishedWork("## Remaining\n\nThe Windows installer."), "a section still to do (Remaining)");
+  assert.equal(unfinishedWork("## Remaining\n\n"), null);
+  assert.equal(unfinishedWork("Template:\n\n```\n- [ ] step\n```"), null);
+  assert.equal(unfinishedWork("1. [ ] first\n\n## To do\n\nship"), "1 open checklist item and a section still to do (To do)");
+  assert.equal(unfinishedWork(null), null);
+});
+
+test("no marker but open checklist items: closed on merge as before, with a line in the merge comment", async (t) => {
+  const env = await keepEnv(t);
+  const issue = inReview(env, { description: "Run the proofs.\n\n- [x] proof 1\n- [ ] proof 2\n- [ ] proof 3" });
+  const result = await env.relay.handle("pull_request", merged(issue));
+  assert.equal(result.action, "approve");
+  assert.equal(issue.status, "done", "the close isn't changed");
+  assert.equal(env.db.patches.length, 1);
+  assert.match(
+    env.db.patches[0].body.comment,
+    /^Approved: PR #12 merged[\s\S]*\n\n_Closed on merge, though the description still lists 2 open checklist items\. If this PR was only a step, reopen the issue and add the marker \("Merge does not complete this issue"\)\._\n\n_Relayed from GitHub by Paperclip Helper\._$/,
+  );
+  assert.ok(env.logs.some((l) => /description still lists work to do/.test(l.msg)));
+});
+
+test("no unfinished work, the marker, or an approval that isn't the last stage: no such line", async (t) => {
+  const env = await keepEnv(t);
+  const finished = inReview(env, { description: "- [x] proof 1\n- [x] proof 2" });
+  await env.relay.handle("pull_request", merged(finished, 30));
+  assert.doesNotMatch(env.db.patches.at(-1).body.comment, /Closed on merge/);
+
+  const marked = inReview(env, { description: `- [ ] proof 2\n\n${MARKER}.` });
+  assert.equal((await env.relay.handle("pull_request", merged(marked, 31))).action, "changes");
+  assert.doesNotMatch(env.db.patches.at(-1).body.comment, /Closed on merge/);
+
+  // The approval stage is the first of two: this approval moves it on, it doesn't close it.
+  const early = inReview(env, { description: "- [ ] proof 2", executionPolicy: { stages: [{ id: "s1", type: "approval" }, { id: "s2", type: "approval" }] } });
+  early.executionState.currentStageId = "s1";
+  early.executionState.currentStageIndex = 0;
+  await env.relay.handle("pull_request", merged(early, 32));
+  assert.doesNotMatch(env.db.patches.at(-1).body.comment, /Closed on merge/);
+});

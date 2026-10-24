@@ -169,7 +169,9 @@ const RECORD_REFRESH_MS = 24 * 60 * 60_000;
 
 // `record`: the watchdog's record keys (agentPaused, agentResumed, agentSwept,
 // resumeRestore). Each tick: startTick(), check() per company, then endTick(at).
-export function createResumeSweep({ ctx, records, state, stats, dryRunSeen, record }) {
+// `onSettled(companyId)`: called once per resume when its settle window has passed
+// (check 18 then looks at the holds a pause left on that company's issues).
+export function createResumeSweep({ ctx, records, state, stats, dryRunSeen, record, onSettled = null }) {
   const { config, api, log } = ctx;
   const now = () => ctx.now();
   const seenStatus = new Map(); // agentId → its status at this process's previous tick
@@ -177,6 +179,7 @@ export function createResumeSweep({ ctx, records, state, stats, dryRunSeen, reco
   let previousTickAt = null; // when this process's previous tick started
   const sweepHeld = new Map(); // agentId → ids of its issues a resume sweep will restore on a later tick
   let slots = new Map(); // agentId → Promise<{ left }>: runs it may still be given this tick (startTick)
+  const settledSeen = new Set(); // "agentId:resumedAt" whose settled resume onSettled was told of
 
   // An agent missing from the company's list: gone for good only when Paperclip says
   // so (404, or terminated, which the list leaves out). Unknown otherwise.
@@ -354,8 +357,14 @@ export function createResumeSweep({ ctx, records, state, stats, dryRunSeen, reco
   // Tracks pauses and resumes (for the settle window, even with the sweep off), then sweeps.
   async function checkResumes(companyId, agents, tickAt) {
     const tracked = await trackPauses(companyId, agents, tickAt);
-    if (!config.watchdogResumeSweep) return;
     const resumed = tracked.filter(({ agent }) => !settling(agent.id));
+    for (const { agent, entry } of resumed) {
+      const seen = `${agent.id}:${entry.resumedAt}`;
+      if (settledSeen.has(seen)) continue;
+      settledSeen.add(seen);
+      onSettled?.(companyId, agent);
+    }
+    if (!config.watchdogResumeSweep) return;
     if (!resumed.length) return;
     const blocked = (await listIssues(api, companyId, "blocked")).sort(sweepOrder);
     const fullIssues = new Map(); // issueId → its full read, shared by the agents swept this tick

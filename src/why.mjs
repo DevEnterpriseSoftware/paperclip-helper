@@ -9,6 +9,8 @@ import { deadLinkWorkspaceId, describeLink, linkFacts } from "./workspace.mjs";
 import { classifyFailure, labelOf, localZone, resetLabel } from "./limits.mjs";
 import { issueActivity, stagesWipe } from "./stages.mjs";
 import { runRefs, waitingOn } from "./ci-runs.mjs";
+import { PAUSE_CANCEL, RECONCILIATION_CAUSE } from "./release.mjs";
+import { describeWakes } from "./paused-holds.mjs";
 
 // A blocker counts as "finalizing" until the latest operation on its execution
 // workspace is a successful workspace_finalize. Show the last few operations.
@@ -116,10 +118,30 @@ async function whyReport(ctx, identifier, out) {
   const linkLine = link ? describeLink(link) : null;
   if (linkLine) out(`Workspace: ${linkLine}`);
   const hold = full?.executionBlocker;
+  let pauseHold = null;
   if (hold) {
     // Paperclip's recovery is holding the issue: new runs are refused until it's released.
     out(`Execution hold: ${hold.cause ?? "unknown cause"}${hold.runId ? `, source run ${String(hold.runId).slice(0, 8)}` : ""}`);
     if (hold.nextAction) out(`  Next action: ${hold.nextAction}`);
+    // A run a pause cancelled (watchdog 18): every agent's wakes wait behind it.
+    if (hold.cause === RECONCILIATION_CAUSE && hold.runId) {
+      const source = await api.request("GET", `/api/heartbeat-runs/${hold.runId}`).catch(() => null);
+      if (source?.status === "cancelled" && source.errorCode === PAUSE_CANCEL) {
+        const ownerName = await nameOf(hold.agentId ?? source.agentId);
+        const owner = await api.request("GET", `/api/agents/${hold.agentId ?? source.agentId}`).catch(() => null);
+        const waiting = (wakes?.events ?? []).filter((e) => e.kind === "wake_request" && ["queued", "claimed", "deferred_issue_execution"].includes(e.status));
+        for (const e of waiting) await nameOf(e.agentId);
+        const held = describeWakes(waiting, (id) => names.get(id) ?? null);
+        pauseHold = {
+          ownerName, ownerStatus: owner?.status ?? null, ownerAdapter: owner?.adapterType ?? null, runId: hold.runId, waiting: waiting.length, held,
+          assigneeName: full?.assigneeAgentId ? await nameOf(full.assigneeAgentId) : null,
+        };
+        out(
+          `Queued wakes held by an unreconciled run from a pause: ${ownerName ?? "an agent"}'s run ${String(hold.runId).slice(0, 8)} was cancelled when ${ownerName ?? "it"} was paused; ` +
+            `${held ? `${held} won't start` : "no run starts on the issue"} until it's resolved.`,
+        );
+      }
+    }
   }
   const recent = (wakes?.events ?? []).filter((e) => e.kind === "wake_request").slice(0, 5).reverse();
   if (recent.length) {
@@ -250,6 +272,7 @@ async function whyReport(ctx, identifier, out) {
     participant,
     stagesWipedBy,
     ciRun,
+    pauseHold,
     recovery,
     queue,
     cards,

@@ -65,6 +65,30 @@ Acme: subscription runs that finished in the last 7 days (412 runs)
 - Paperclip lists only the latest 1,000 runs per company; the audit says when that cuts the period short.
 - Already-synced runs keep what was posted for them; the audit shows what they would get now.
 
+## Comparing two periods
+
+1.12 changed how runs are costed (Claude runs priced from their tokens when they report no cost or clearly less; Codex runs Paperclip stores net of cache reads priced in full), so a week-on-week change on the Costs page mixes that change with real usage. `pch costs --compare-days N` costs the last N days and the N days before them twice each, as cost sync posts them now and as it did before 1.12, and splits the change. It changes nothing.
+
+```text
+$ pch costs --compare-days 7
+Acme: subscription runs, 2026-10-10 to 2026-10-17 against 2026-10-17 to 2026-10-24 (7 days each)
+  anthropic:
+    earlier: 212 runs, 4.2M input, 610.0M cache reads, 3.9M output; costed as before 1.12 $380.10, as now $401.75
+    later:   230 runs, 4.6M input, 660.4M cache reads, 4.1M output; costed as before 1.12 $412.80, as now $431.60
+  openai:
+    earlier: 170 runs, 18.0M input, 140.2M cache reads, 2.1M output; costed as before 1.12 $51.20, as now $87.30
+    later:   182 runs, 19.9M input, 151.0M cache reads, 2.3M output; costed as before 1.12 $56.40, as now $96.40
+  If the earlier period was posted before 1.12 and the later one with it, the Costs page moves +$96.70 ($431.30 → $528.00):
+    usage:   +$38.95   (the change at today's costing, $489.05 → $528.00)
+    costing: +$57.75   (what today's costing adds to the earlier period's runs)
+  If both periods were posted with 1.12, the whole change is usage: +$38.95.
+```
+
+- **usage** is the change with both periods costed the same way, today's: the part a different costing can't explain.
+- **costing** is what today's costing adds to the earlier period's runs. It is part of the change on the Costs page only for the runs that were posted before you upgraded: if 1.12 came in mid-period, the true split lies between the two lines.
+- "As before 1.12" is a reconstruction: Claude runs at their reported cost (nothing for one that reported none), Codex runs with the cache reads subtracted from their input a second time and cache writes as input, at today's prices.
+- Paperclip lists only the latest 1,000 runs per company; when that cuts the earlier period short, it says so, and fewer days help. `--audit --compare-days N` prints the audit, then the comparison.
+
 ## Cost sync settings
 
 | Setting | Default | Meaning |

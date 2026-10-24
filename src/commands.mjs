@@ -9,7 +9,9 @@ import { companyAgents, companyPrefixes } from "./paperclip.mjs";
 import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, plural, signed } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
 import { blocked as blockedReport } from "./blocked.mjs";
-import { holdFacts, releaseHold, releaseProblems, RELEASE_OUTCOMES, unprovable } from "./release.mjs";
+import {
+  actsAsUser, continuationText, continuePausedHold, CONVERSATION_ADAPTERS, holdFacts, pausedHold, releaseHold, releaseProblems, RELEASE_OUTCOMES, unprovable,
+} from "./release.mjs";
 import {
   clearLink,
   clearProblems,
@@ -24,6 +26,8 @@ import { readUsage, render, summarize } from "./usage.mjs";
 import { answerFor, findCard } from "./answer.mjs";
 export { why } from "./why.mjs";
 import { excerpt } from "./advice.mjs";
+import { findReady } from "./ready.mjs";
+import { COUNTERS, minutesSaved, readMetrics } from "./metrics.mjs";
 
 export const USAGE = `Paperclip Helper: fixes what a self-hosted Paperclip doesn't recover from by itself.
 
@@ -34,6 +38,7 @@ What's going on
   why ISSUE [--prompt]       why nobody is working on an issue, and what to do about it
                              (--prompt: the same as a prompt for an LLM chat)
   blocked                    what every blocked issue waits on, and every question card waiting
+  ready                      PRs approved by every reviewer, clean and green, in queue order
   usage [--days N] [--agent NAME]
                              where the tokens go: runs, tokens and cost per agent, and what woke it
   check [ISSUE]              who the key belongs to; with an issue, what a merge would do to it
@@ -58,6 +63,8 @@ Costs
   costs                      what cost sync would post (changes nothing)
   costs --sessions           whether resumed sessions report cumulative costs
   costs --audit [--days N]   check the last N days' cost figures (default 7; changes nothing)
+  costs --compare-days N     the last N days' costs against the N days before: how much of the
+                             change is usage, and how much 1.12's costing (changes nothing)
 
 Setup
   run                        run the service in the foreground, as its container does
@@ -191,6 +198,38 @@ export async function blocked(ctx) {
   await blockedReport(ctx, out);
 }
 
+// ---------------------------------------------------------------- ready
+
+// PRs ready to queue (ready.mjs): issues at your approval stage, every earlier stage
+// done, whose PR is open, not a draft, and clean on GitHub. In queue order, then the
+// issues at your approval that aren't ready and why. Read-only.
+export async function ready(ctx) {
+  const { config, api } = ctx;
+  if (!config.githubToken && !config.githubTokenFile) throw new Error("pch ready reads the PRs from GitHub: set GITHUB_TOKEN or GITHUB_TOKEN_FILE (Pull requests: Read).");
+  if (!config.repos.length) throw new Error("pch ready looks for PRs in GITHUB_REPOS: set it.");
+  const github = createGitHub({ config, log: ctx.log });
+  const me = await ctx.identity();
+  for (const companyId of me.companyIds ?? []) {
+    const company = await api.request("GET", `/api/companies/${companyId}`).catch(() => null);
+    const skipped = [];
+    const list = await findReady({ api, config, github, userId: me.userId, companyId, skipped });
+    const agents = new Map((await companyAgents(api, companyId).catch(() => [])).map((a) => [a.id, a]));
+    out(`${company?.name ?? companyId}: ${list.length ? `${plural(list.length, "PR")} ready to queue, in queue order` : "no PR ready to queue"}`);
+    list.forEach((r, i) => {
+      const reviewers = r.reviewers.map((id) => agents.get(id)?.name).filter(Boolean);
+      out(
+        `  ${i + 1}. ${r.pr.repo}#${r.pr.number}  ${r.issue.identifier ?? r.issue.id}  ${r.issue.title ?? ""}`.trimEnd() +
+          `${r.pr.sha ? `  (head ${String(r.pr.sha).slice(0, 9)})` : ""}${reviewers.length ? `  reviewed by ${reviewers.join(", ")}` : ""}`,
+      );
+      if (r.pr.url) out(`     ${r.pr.url}`);
+    });
+    if (skipped.length) {
+      out("  At your approval, but not ready:");
+      for (const s of skipped) out(`    ${s.issue.identifier ?? s.issue.id}: ${s.why}`);
+    }
+  }
+}
+
 // ---------------------------------------------------------------- release
 
 // An execution hold that messages and Interrupt can't clear (see release.mjs).
@@ -223,6 +262,31 @@ export async function release(ctx, identifier, { apply = false, outcome: actionO
   }
   const saved = queue?.entries?.length ?? 0;
   if (saved) out(`Saved messages: ${saved}${queue.executionWait?.message ? ` ("${queue.executionWait.message}")` : ""}`);
+  // A run a pause cancelled: Paperclip lifts its hold only on an explicit continuation
+  // (release.mjs): the issue with that run's agent, and a board user's comment.
+  if (pausedHold(facts)) {
+    out("The run was cancelled when its agent was paused. The hold covers every agent's wakes on the issue; Paperclip lifts it only");
+    out(`when a board user comments while ${agent?.name ?? "that agent"} has the issue and isn't paused.`);
+    const name = agent?.name ?? "the run's agent";
+    if (!agent || agent.status === "paused") throw new Error(`${name} is still paused: resume it first. Nothing changed.`);
+    if (["terminated", "pending_approval"].includes(agent.status)) throw new Error(`${name} is ${agent.status}: only a reconciliation releases this hold. Nothing changed.`);
+    if (!CONVERSATION_ADAPTERS.has(agent.adapterType)) throw new Error(`Paperclip continues only an agent on a conversation adapter, and ${name} is on ${agent.adapterType}. Nothing changed.`);
+    const back = issue.assigneeAgentId !== agent.id;
+    if (!apply) {
+      out("");
+      out(`--apply ${back ? `assigns ${identifier} back to ${name}, then ` : ""}comments, as you, asking ${name} to continue from where the pause cut it off`);
+      out("and hand the issue on as usual. That comment is what lifts the hold and starts its run.");
+      out(`  pch release ${identifier} --apply`);
+      return;
+    }
+    if (!actsAsUser(await ctx.identity())) {
+      throw new Error(`Paperclip lifts it only on a board user's comment, and this key doesn't comment as one: ${back ? `assign ${identifier} to ${name}, then ` : ""}comment on it yourself. Nothing changed.`);
+    }
+    const result = await continuePausedHold(ctx.api, facts, { text: continuationText(agent, `\n\n${COMMAND_SIGNATURE}`) });
+    out(`${identifier}: ${result.reassigned ? `assigned back to ${name}, and ` : ""}asked ${name} to continue.`);
+    out(result.lifted ? "The hold is gone; its run should start within seconds." : `Paperclip still showed the hold a moment later: if no run starts, run \`pch why ${identifier}\`.`);
+    return;
+  }
   if (unprovable(facts)) out("Paperclip can't release this by itself: the run recorded no process it could check.");
 
   const problems = releaseProblems(facts);
@@ -577,15 +641,20 @@ export async function usage(ctx, { days = 7, agent = null } = {}) {
 
 // ---------------------------------------------------------------- costs
 
-export async function costs(ctx, { sessions = false, audit = false, days = 7, given = new Set() } = {}) {
-  if (sessions && audit) throw new Error("usage: pch costs [--sessions | --audit [--days N]] (one at a time)");
+export async function costs(ctx, { sessions = false, audit = false, days = 7, compareDays = null, given = new Set() } = {}) {
+  const compare = given.has("compareDays");
+  if (sessions && (audit || compare)) throw new Error("usage: pch costs [--sessions | --audit [--days N] | --compare-days N] (one at a time)");
   if (given.has("days") && !audit) throw new Error("--days goes with --audit: pch costs --audit --days N");
+  if (compare && !(compareDays > 0)) throw new Error("usage: pch costs --compare-days N   (N: the days in each period, e.g. 7 for week on week)");
   const sync = createCostSync(ctx);
   if (sessions) return sync.sessions();
   if (audit) {
     if (!(days > 0)) throw new Error("usage: pch costs --audit [--days N]");
-    return sync.audit({ days, print: out });
+    await sync.audit({ days, print: out });
+    if (!compare) return;
+    out("");
   }
+  if (compare) return sync.compare({ days: compareDays, print: out });
   if (!ctx.config.costSync) out("(COST_SYNC is off: this is what it would post if you turned it on.)\n");
   return sync.preview();
 }
@@ -656,6 +725,9 @@ export async function status(ctx) {
         w.limitPauses ? `${plural(w.limitPauses, "agent")} paused at a usage limit (${w.limitResumes} resumed)` : null,
         counted(w.reopened, "done issue with an open PR reopened", "done issues with an open PR reopened"),
         counted(w.wipes, "wiped review stage reported", "wiped review stages reported"),
+        counted(w.pausedHolds, "hold from a paused run lifted", "holds from a paused run lifted"),
+        counted(w.runnerProblems, "broken runner reported", "broken runners reported"),
+        counted(w.readyNotes, "PR ready to queue reported", "PRs ready to queue reported"),
       ].filter(Boolean);
       out(`  Since start: ${done.length ? done.join(", ") : "nothing needed doing"}.`);
       if (w.stuck) out(`  ${plural(w.stuck, "issue")} stuck behind a deferred wake: see the log.`);
@@ -673,6 +745,7 @@ export async function status(ctx) {
     const unpriced = Object.entries(c?.unpriced ?? {});
     if (unpriced.length) out(`  Not priced: ${unpriced.map(([m, n]) => `${m} (${plural(n, "run")})`).join(", ")}; see COST_PRICES_FILE and CODEX_DEFAULT_MODEL.`);
   }
+  showMetrics(readMetrics(ctx.config));
   // Live checks, from this container.
   try {
     const me = await ctx.identity();
@@ -684,6 +757,37 @@ export async function status(ctx) {
     process.exitCode = 1;
   }
   if (stale) process.exitCode = 1;
+}
+
+// The lifetime counts and latest problems from data/metrics.json (metrics.mjs).
+function showMetrics(m) {
+  if (!m?.totals) return;
+  const t = m.totals;
+  const n = (v) => Number(v ?? 0).toLocaleString("en-GB");
+  const versions = m.firstVersion && m.firstVersion !== m.version ? `, ${m.firstVersion} → ${m.version}` : "";
+  out("");
+  out(`All time (since ${since(m.firstStartedAt)}, ${plural(m.starts ?? 1, "start")}${versions}):`);
+  const credited = COUNTERS.filter((c) => c.minutes && t[c.key] > 0);
+  const actions = credited.reduce((sum, c) => sum + t[c.key], 0);
+  const minutes = minutesSaved(t);
+  const time = minutes >= 90 ? `${(minutes / 60).toFixed(minutes >= 600 ? 0 : 1)} h` : `${minutes} min`;
+  out(
+    actions
+      ? `  Kept things moving: ${n(actions)} ${actions === 1 ? "action" : "actions"}, about ${time} of hand work saved (a rough guess per action).`
+      : "  Kept things moving: nothing needed doing yet.",
+  );
+  for (const c of credited) {
+    const extra = c.key === "nudges" && t.ciReports ? ` (${n(t.ciReports)} of them finished CI runs reported)` : "";
+    out(`    ${n(t[c.key]).padStart(6)}  ${c.label}${extra}`);
+  }
+  out(`  Relay: ${n(t.githubEvents)} GitHub ${t.githubEvents === 1 ? "event" : "events"} handled${t.relayFailures ? `, ${n(t.relayFailures)} failed` : ""}.`);
+  out(`  Watchdog: ${n(t.watchdogChecks)} ${t.watchdogChecks === 1 ? "check" : "checks"} run${t.stuck ? `; ${n(t.stuck)} wakes found stuck behind a stopped run` : ""}.`);
+  out(`  Cost sync: ${n(t.costPosts)} run ${t.costPosts === 1 ? "cost" : "costs"} posted ($${(Number(t.costCents ?? 0) / 100).toLocaleString("en-GB", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}).`);
+  const recent = Array.isArray(m.recent) ? m.recent : [];
+  out(`  Problems: ${plural(m.warnings ?? 0, "warning")}, ${plural(m.errors ?? 0, "error")}${recent.length ? `. The latest ${recent.length}, newest last:` : "."}`);
+  for (const p of recent) {
+    out(`    ${since(p.at).replace(" UTC", "")}  ${p.level === "error" ? "ERROR" : "warn "}  ${p.msg}${p.detail ? ` (${p.detail})` : ""}`);
+  }
 }
 
 // Docker HEALTHCHECK: the service's heartbeat is fresh and the relay answers.

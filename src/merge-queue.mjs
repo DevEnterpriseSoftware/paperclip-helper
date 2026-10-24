@@ -10,6 +10,10 @@
 //   * CI_FAILURE with a failed merge-group job: the PR is at fault, so it is sent
 //     back like a conflict, with the run, the failed jobs and the first failure
 //     annotation;
+//   * CI_FAILURE whose failed jobs all failed setting up their runner, before
+//     checkout ("Set up runner": a self-hosted runner's job-started hook, say): none
+//     of the PR's code ran, so the board is told and the PR isn't sent back or
+//     queued again (it would fail the same way on that runner);
 //   * CI_FAILURE with only a cancelled job (a runner restarted), or CI_TIMEOUT (the
 //     queue's status-check timeout ran out while the runs waited for a runner): the
 //     PR isn't at fault. The board is told, without waking the implementer, and with
@@ -27,6 +31,7 @@
 import { CLOSED_STATUSES, prLabel, RELAYED_SIGNATURE, signed } from "./util.mjs";
 import { findIdentifiers } from "./identifiers.mjs";
 import { noteToBoard } from "./board-note.mjs";
+import { setupFailureRunner } from "./ci-runs.mjs";
 
 export const QUEUE_BOT = "github-merge-queue[bot]";
 const FAILED = new Set(["failure", "timed_out", "startup_failure"]);
@@ -48,10 +53,12 @@ export function latestGroupRuns(runs, base, number) {
 }
 
 // What dropped the PR, from its latest merge group's runs and their jobs:
-// { kind: "failed", run, jobs } | { kind: "cancelled", run, jobs } | { kind: "timeout", runs }.
+// { kind: "failed", run, jobs } | { kind: "runner", run, jobs, runner } | { kind: "cancelled", run, jobs } | { kind: "timeout", runs }.
 export function classifyDrop(groupRuns) {
   for (const run of groupRuns) {
     const failed = (run.jobs ?? []).filter((j) => FAILED.has(j.conclusion));
+    const runner = failed.length ? setupFailureRunner(run.jobs) : null;
+    if (runner) return { kind: "runner", run, jobs: failed, runner };
     if (failed.length || (FAILED.has(run.conclusion) && !(run.jobs ?? []).length)) return { kind: "failed", run, jobs: failed };
   }
   for (const run of groupRuns) {
@@ -78,6 +85,12 @@ function failureBrief(pr, { run, jobs }, annotation) {
 }
 
 function infraNote(pr, drop, requeued = false) {
+  if (drop.kind === "runner") {
+    return (
+      `${prLabel(pr)} was dropped from the merge queue because its merge-group jobs failed setting up runner \`${drop.runner}\` ("Set up runner"), ` +
+      `before checkout: none of the PR's code ran. Fix the runner, then queue it again.${drop.run.html_url ? `\n\n${drop.run.html_url}` : ""}\n\n${pr.html_url}`
+    );
+  }
   const cause =
     drop.kind === "cancelled"
       ? `a cancelled run${drop.jobs.length ? ` (${drop.jobs.map((j) => `\`${j.name}\``).join(", ")} cancelled)` : ""}, which is usually a runner restarting`
@@ -224,6 +237,7 @@ export function createMergeQueueHandler({ ctx, state, github, decisions, sweepCo
     }
 
     // Not the PR's fault, or nothing to show: tell the board, and optionally queue it again.
+    // A runner that fails every job's set-up would fail the queued PR again: not queued again.
     const infra = drop.kind === "cancelled" || drop.kind === "timeout";
     const again = infra && config.relayRequeueOnInfraDrop && !config.dryRun ? await requeue(repo, pr) : null;
     const note =

@@ -159,7 +159,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         userId: who.userId,
         user: db.users[who.userId],
         companyIds: db.companies.map((c) => c.id),
-        source: "board_key",
+        source: db.meSource ?? "board_key", // a test can make the key something other than a board user's
         keyId: who.keyId,
       });
     }
@@ -380,6 +380,8 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           issue.status = body.status;
         }
         if (body.blockedByIssueIds) issue.blockedBy = body.blockedByIssueIds.map((id) => ({ id }));
+        // A reassignment on its own: the stage and the hold stay as they are.
+        if ("assigneeAgentId" in body) Object.assign(issue, { assigneeAgentId: body.assigneeAgentId, assigneeUserId: body.assigneeAgentId ? null : issue.assigneeUserId });
         if ("executionPolicy" in body) {
           // Like Paperclip's applyMonitorTransition: a policy sent without its monitor clears it ("manual").
           const had = issue.executionPolicy?.monitor;
@@ -409,6 +411,31 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         const comment = boardComment(issue, body.body, "comment", who);
         db.comments.push(comment);
         issue.updatedAt = new Date().toISOString();
+        // Paperclip's admitExplicitNativeContinuation (main at e5c9e60): a hold a cancelled run
+        // left (legacy_execution_requires_reconciliation) lifts only on a board user's comment
+        // while the issue is assigned to that run's own agent, invokable, on a conversation
+        // adapter; the comment's wake starts its run. Any other comment waits behind the hold.
+        // Modelled only for a run a pause cancelled, the case seen working; other holds
+        // have proofs of their own (a process, a stop record) the fake doesn't model.
+        const hold = issue.executionBlocker;
+        const source = hold ? db.heartbeatRuns.find((r) => r.id === hold.runId) : null;
+        if (hold?.cause === "legacy_execution_requires_reconciliation" && source?.errorCode === "agent_paused") {
+          const owner = db.agents.find((a) => a.id === hold.agentId);
+          const user = !/^agent/.test(db.meSource ?? "board_key");
+          const conversation = ["claude_local", "codex_local", "gemini_local", "cursor", "opencode_local"].includes(owner?.adapterType);
+          if (user && owner && conversation && issue.assigneeAgentId === owner.id && !["paused", "terminated", "pending_approval"].includes(owner.status)) {
+            issue.executionBlocker = null;
+            db.continuations = [...(db.continuations ?? []), { issueId: issue.id, agentId: owner.id, commentId: comment.id }];
+            const runs = (db.issueRuns[issue.id] ??= []);
+            const run = { id: uuid(), runId: null, companyId: issue.companyId, agentId: owner.id, status: "queued", reason: "issue_reopened_via_comment", createdAt: new Date().toISOString() };
+            run.runId = run.id;
+            runs.unshift(run);
+            db.heartbeatRuns.push(run);
+          } else {
+            (db.wakes[issue.id] ??= []).unshift({ kind: "wake_request", agentId: issue.assigneeAgentId, status: "deferred_issue_execution", reason: "issue_commented", requestedAt: new Date().toISOString() });
+          }
+          return send(201, { id: comment.id, body: body.body });
+        }
         wakeAssignee(issue, "issue_commented");
         return send(201, { id: comment.id, body: body.body });
       }
@@ -479,7 +506,17 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         if (!body?.outcome || !body.sourceIssueStatus || (r && (r.providerStopped !== true || !r.runId || (r.outcomeEvidence ?? "").length < 20))) {
           return send(400, { error: "Validation error" });
         }
-        if (!hold || hold.recoveryActionId !== body.actionId || r?.runId !== hold.runId) return send(409, { error: "Recovery action is not active" });
+        if (!hold || hold.recoveryActionId !== body.actionId || (r && r.runId !== hold.runId)) return send(409, { error: "Recovery action is not active" });
+        // Paperclip (routes/issues.ts, main at e5c9e60): a reconciliation record goes with a
+        // move to todo, and a move to todo for a reconciliation cause needs one; it must come
+        // from the run's own agent as the assignee ("The recovery source or task owner changed").
+        const reconcile = hold.cause === "legacy_execution_requires_reconciliation" && body.sourceIssueStatus === "todo";
+        if (r && !reconcile) return send(409, { error: "An execution reconciliation must target the current execution recovery action and continue the task." });
+        if (reconcile && !r) return send(409, { error: "An execution reconciliation is required to continue this task." });
+        if (r && hold.agentId && issue.assigneeAgentId && hold.agentId !== issue.assigneeAgentId) return send(409, { error: "The recovery source or task owner changed." });
+        // An action Paperclip's own sweep settled (replay "blocked"): without a reconciliation
+        // the request is answered as a replay and changes nothing.
+        if (hold.settled && !r) return send(200, { issue, recoveryAction: { id: hold.recoveryActionId, status: "resolved" } });
         db.resolutions = [...(db.resolutions ?? []), { issueId: issue.id, body }];
         issue.executionBlocker = null;
         issue.status = body.sourceIssueStatus;

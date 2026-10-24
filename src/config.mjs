@@ -229,9 +229,15 @@ export function loadConfig(env = process.env) {
     // the machine Paperclip runs on. Empty: the helper's own.
     watchdogLimitTimeZone: zone("WATCHDOG_LIMIT_TIME_ZONE"),
     watchdogNotifyIssue: get("WATCHDOG_NOTIFY_ISSUE"),
+    // Minutes an issue held by a run a pause cancelled must be quiet (no comment, status
+    // move or reassignment by a person, no stage hand-off) before the watchdog continues it.
+    watchdogHoldQuietMin: num("WATCHDOG_HOLD_QUIET_MIN", 60),
     // Reopen a done issue whose own PR is still open, and report issues whose review
     // stages an update removed (the open-PR part needs a GitHub token).
     watchdogStagesWipe: bool("WATCHDOG_STAGES_WIPE", true),
+    // Tell the board when an issue reaches your approval stage with its PR approved by
+    // every reviewer, clean and green: ready to queue (needs a GitHub token). Off by default.
+    watchdogReportReadyToMerge: bool("WATCHDOG_REPORT_READY_TO_MERGE", false),
 
     // cost-sync.mjs: API-equivalent cost of subscription runs
     costSync: bool("COST_SYNC", true),

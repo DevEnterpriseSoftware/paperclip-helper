@@ -16,6 +16,8 @@ import { ACTIVE_RUN, approvalWaitingOn, ts } from "./util.mjs";
 import { cardText, strandedCard } from "./questions.mjs";
 import { escalatedReview } from "./board-held.mjs";
 import { PARTICIPANT_RECOVERY_CAUSE } from "./resume.mjs";
+import { pausedHoldWhy } from "./paused-holds.mjs";
+import { CONVERSATION_ADAPTERS } from "./release.mjs";
 
 const ASLEEP = new Set(["paused", "terminated", "pending_approval"]);
 const QUEUED_TOO_LONG_MS = 10 * 60_000;
@@ -53,6 +55,7 @@ export function advise(facts) {
     participant = null, // the agent a pending review stage waits on: { name, status }
     stagesWipedBy = null, // in review with no stage: who removed its stages (watchdog 17), when the activity log shows it
     ciRun = null, // the CI run the assignee's latest comments say it waits on: "repo#id" or the bare id
+    pauseHold = null, // the hold is from a run a pause cancelled (watchdog 18): { ownerName, runId, waiting, held }
     config = {},
     now = Date.now(),
   } = facts;
@@ -193,6 +196,37 @@ export function advise(facts) {
   }
 
   const hold = issue.executionBlocker;
+  // A run a pause cancelled holds every agent's wakes on the issue (watchdog 18).
+  // Paperclip lifts it only on a board user's comment while the issue is assigned
+  // to that run's agent, and that agent isn't paused.
+  if (hold && pauseHold) {
+    const owner = pauseHold.ownerName ?? "the paused agent";
+    const paused = pauseHold.ownerStatus === "paused";
+    const conversation = !pauseHold.ownerAdapter || CONVERSATION_ADAPTERS.has(pauseHold.ownerAdapter);
+    const what =
+      `${pausedHoldWhy(pauseHold)}: ${pauseHold.held ? `${pauseHold.held} won't start` : "no run starts here"}. ` +
+      "A status change, a reassignment on its own, an agent's comment, a comment while someone else has the issue, and Interrupt all leave it.";
+    if (!conversation) {
+      return {
+        what: `${what} Paperclip continues only an agent on a conversation adapter, and ${owner} is on ${pauseHold.ownerAdapter}.`,
+        steps: [`pch release ${identifier}   (shows the held run; a reconciliation is what's left)`],
+        watchdog: "manual",
+      };
+    }
+    return {
+      what,
+      steps: [
+        ...(paused ? [`Resume ${owner} first: nothing lifts the hold while ${owner} is paused.`] : []),
+        `${pauseHold.assigneeName && pauseHold.assigneeName !== owner ? `Assign the issue back to ${owner} (it is with ${pauseHold.assigneeName} now).` : `Keep the issue assigned to ${owner}.`}`,
+        `Then, as the board: ${comment(`${owner}, your run was cancelled by a pause. Please continue from where it cut you off and hand the issue on as usual.`)}`,
+        `pch release ${identifier} --apply   (does both${paused ? ", once it is resumed" : ""})`,
+      ],
+      watchdog: config.watchdog === false || config.watchdogReleaseHolds === false ? "manual" : "auto",
+      autoNote:
+        `The watchdog does both by itself once ${owner} is resumed and the resume has settled (WATCHDOG_RELEASE_HOLDS), ` +
+        "paced by the agent's run limit, and tells the board.",
+    };
+  }
   // A run that recorded no process id or stop can never prove it stopped: a
   // message or Interrupt is saved again behind it, every time.
   const unprovable = hold && (queue?.executionWait?.reason === "process_identity_missing" ||

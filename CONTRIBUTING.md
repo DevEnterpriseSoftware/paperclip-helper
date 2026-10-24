@@ -19,7 +19,7 @@ src/
   quiet-notes.mjs   the relay's quiet notes, in each issue's pull-requests document
   identifiers.mjs   finding issue identifiers (ACM-12) in PR titles, branches and bodies
   watchdog.mjs      stalled-work checks and nudges (the list of checks is at its top)
-  ci-runs.mjs       watchdog 11: CI runs agents wait on
+  ci-runs.mjs       watchdog 11: CI runs agents wait on (and runners that fail every job's set-up)
   board-held.mjs    watchdog 12, 13: issues waiting on your review
   questions.mjs     watchdog 10: question cards addressed to a teammate
   release.mjs       watchdog 7 and `pch release`: holds Paperclip can't release
@@ -27,6 +27,8 @@ src/
   resume.mjs        watchdog 15: issues blocked while their agent was paused
   limits.mjs        watchdog 16: usage limits (a recogniser per adapter)
   stages.mjs        watchdog 17: wiped review stages
+  paused-holds.mjs  watchdog 18: wakes held by a run an agent's pause cancelled
+  ready.mjs         watchdog 19 and `pch ready`: PRs ready to queue
   board-note.mjs    notes for the board (log, and WATCHDOG_NOTIFY_ISSUE)
   cost-sync.mjs     API-equivalent cost events
   prices.mjs        model price table
@@ -38,6 +40,7 @@ src/
   answer.mjs        `pch answer`
   store.mjs         small JSON state files, written atomically
   instance.mjs      the service's heartbeat, and whether another helper is already running
+  metrics.mjs       all-time counts and the latest warnings and errors (data/metrics.json), for `pch status`
   util.mjs          small shared helpers
   log.mjs           one JSON line per event, with secrets masked
 test/

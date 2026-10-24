@@ -83,7 +83,7 @@ test("Codex: a marked run's fresh input is priced in full (it used to be lost)",
   const r = e.run(codex.id, sub({ provider: "openai", biller: "chatgpt", model: "gpt-6.1-sol", inputTokens: 100_000, cachedInputTokens: 900_000, outputTokens: 50_000, rawInputIncludesCached: false }));
   await e.sync.tick();
   // 0.1M × $2 + 0.9M × $0.10 + 0.05M × $10 = 0.20 + 0.09 + 0.50 = $0.79.
-  // (Subtracting the cache reads again priced the fresh input at nothing: $0.51.)
+  // (Subtracting the cache reads again priced the fresh input at nothing: $0.59.)
   assert.equal(e.posted().get(r.id).costCents, 79);
   assert.equal(e.posted().get(r.id).costStatus, "estimated");
 });
@@ -323,4 +323,38 @@ test("costs --audit: per-agent figures, why runs were raised, and duplicate post
 test("estimateUsd prices cache writes as input when a model has no write price", () => {
   const usd = estimateUsd({ input: 1, cachedInput: 0.1, output: 2 }, { input: 1_000_000, cacheWrite: 1_000_000 });
   assert.equal(usd, 2);
+});
+
+test("costs --compare-days: two periods costed as before 1.12 and as now, the change split into usage and costing", async (t) => {
+  const e = await env(t);
+  const claude = e.agent("Opus", "claude_local", { model: "claude-opus-5-5" });
+  const codex = e.agent("Codex", "codex_local", { model: "gpt-6.1-sol" });
+  const earlier = { finishedAt: minutesAgo(60 * 24 * 10) };
+  // Earlier week: reported $2.50; no cost reported (nothing posted before 1.12, $1.32 now);
+  // a Codex run Paperclip stored net of cache reads ($0.59 before 1.12, $0.79 now).
+  e.run(claude.id, opus({ costUsd: 2.5 }), earlier);
+  e.run(claude.id, opus({}), { ...earlier, status: "timed_out" });
+  e.run(codex.id, sub({ provider: "openai", model: "gpt-6.1-sol", inputTokens: 100_000, cachedInputTokens: 900_000, outputTokens: 50_000, rawInputIncludesCached: false }), { ...earlier, resultJson: { fastMode: false } });
+  // Later week: two runs reporting $2.50 each.
+  e.run(claude.id, opus({ costUsd: 2.5 }));
+  e.run(claude.id, opus({ costUsd: 2.5 }));
+  e.run(claude.id, opus({ costUsd: 9 }), { finishedAt: minutesAgo(60 * 24 * 15) }); // before both periods
+
+  const text = (await captureOutput(() => e.sync.compare({ days: 7 }))).join("\n");
+  assert.match(text, /anthropic:\n    earlier: 2 runs, .*costed as before 1\.12 \$2\.50, as now \$3\.82\n    later:   2 runs, .*costed as before 1\.12 \$5\.00, as now \$5\.00/);
+  assert.match(text, /openai:\n    earlier: 1 runs, 0\.1M input, 0\.9M cache reads, 0\.1M output; costed as before 1\.12 \$0\.59, as now \$0\.79/);
+  assert.match(text, /the Costs page moves \+\$1\.91 \(\$3\.09 → \$5\.00\)/);
+  assert.match(text, /usage: {3}\+\$0\.39 {3}\(the change at today's costing, \$4\.61 → \$5\.00\)/);
+  assert.match(text, /costing: \+\$1\.52 {3}\(what today's costing adds to the earlier period's runs\)/);
+  assert.equal(e.db.costEvents.length, 0, "the comparison posts nothing");
+});
+
+test("pch costs --compare-days goes alone or after --audit, and needs a number of days", async (t) => {
+  const e = await env(t);
+  const { costs } = await import("../src/commands.mjs");
+  await assert.rejects(costs(e.ctx, { sessions: true, compareDays: 7, given: new Set(["sessions", "compareDays"]) }), /one at a time/);
+  await assert.rejects(costs(e.ctx, { compareDays: 0, given: new Set(["compareDays"]) }), /usage: pch costs --compare-days N/);
+  const both = await captureOutput(() => costs(e.ctx, { audit: true, compareDays: 7, given: new Set(["audit", "compareDays"]) }));
+  assert.ok(both.some((l) => /subscription runs that finished in the last 7 days/.test(l)), "the audit");
+  assert.ok(both.some((l) => /against .* \(7 days each\)/.test(l)), "then the comparison");
 });

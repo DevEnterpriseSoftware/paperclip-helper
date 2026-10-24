@@ -100,7 +100,10 @@
 //    WATCHDOG_CI_RERUN_MAX times, while it is still the PR's head. Runs dispatched
 //    with workflow_dispatch on the repository's default branch (read from GitHub)
 //    are never re-run or silenced when the branch moves; every conclusion,
-//    including cancelled, is reported.
+//    including cancelled, is reported. A failed run whose jobs all failed setting
+//    up their runner, before checkout, when another PR's run failed the same way
+//    on that runner, is a runner problem: the board is told once (a day) per
+//    runner, the agent that it isn't its PR, and nothing is re-run.
 //
 // 12. Answers that reach nobody (board-held.mjs). An agent asked you with a card
 //    and you answered it while the issue waited on your review, so Paperclip
@@ -166,12 +169,25 @@
 //    re-created. (The relay closes an issue on its PR's merge when no stage is
 //    left to approve: RELAY_DONE_WITHOUT_STAGES.)
 //
+// 18. Wakes held by a run an agent's pause cancelled (paused-holds.mjs). The run's
+//    execution hold covers the whole issue, so once the board moves the issue on,
+//    every wake for the next owner waits behind it, and Paperclip lifts it only on
+//    a board user's comment while that run's agent has the issue. The board is told
+//    once; with WATCHDOG_RELEASE_HOLDS on, once the agent is resumed (the resume
+//    sweep asks for the scan), the issue goes back to it and one comment asks it to
+//    continue. 1's nudge waits for it, and gives the two steps when it won't.
+//
+// 19. PRs ready to queue (ready.mjs). With WATCHDOG_REPORT_READY_TO_MERGE on (off
+//    by default), an issue at your approval stage, every earlier stage done, whose
+//    PR is open, not a draft and clean on GitHub, gets one note saying so, and
+//    whether its reviewers can be paused again. `pch ready` lists them.
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
 import { companyAgents, listIssues } from "./paperclip.mjs";
 import { ACTIVE_RUN, agentMention, asleep, every, mapLimit, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
-import { holdFacts, releaseHold, releaseProblems, unprovable } from "./release.mjs";
+import { holdFacts, pausedHold, releaseHold, releaseProblems, RECONCILIATION_CAUSE, unprovable } from "./release.mjs";
 import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
 import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue, strandedCard } from "./questions.mjs";
 import { createGitHub } from "./github.mjs";
@@ -181,6 +197,9 @@ import { createLimitCheck, localZone, RECOGNISERS } from "./limits.mjs";
 import { createStagesCheck } from "./stages.mjs";
 import { findIdentifiers } from "./identifiers.mjs";
 import { createResumeSweep, PARTICIPANT_RECOVERY_CAUSE, reviewParticipantOf } from "./resume.mjs";
+import { createPausedHoldCheck, pausedHoldSteps, pausedHoldWhy } from "./paused-holds.mjs";
+import { noteToBoard } from "./board-note.mjs";
+import { createReadyCheck } from "./ready.mjs";
 
 const WATCHED_STATUSES = "todo,in_progress,in_review";
 const OPEN_STATUSES = "backlog,todo,in_progress,in_review,blocked";
@@ -236,6 +255,9 @@ const record = {
   agentResumed: (agentId) => `agent-resumed:${agentId}`, // its resume, while its issues are restored: { since, resumedAt, companyId }
   agentSwept: (agentId) => `agent-swept:${agentId}`, // the last resume whose sweep ended: { resumedAt }, so a restart doesn't sweep it again
   resumeRestore: (issue, commentId) => `resume-restore:${issue.id}:${commentId ?? "?"}`, // the one restore of an issue after a pause's recovery block
+  pausedHold: (issue, runId) => `paused-hold:${issue.id}:${runId}`, // a hold from a run a pause cancelled: reported, resolved or left to you, once
+  pausedHoldNudge: (issue, runId) => `paused-hold-nudge:${issue.id}:${runId}`, // the comment that wakes the assignee after resolving it
+  readyToQueue: (issue, pr) => `ready:${issue.id}:${pr.repo}#${pr.number}:${pr.sha}`, // the board's note that a PR is ready to queue
 };
 
 export function createWatchdog(ctx, state, deps = {}) {
@@ -243,7 +265,8 @@ export function createWatchdog(ctx, state, deps = {}) {
   const records = state.nudges;
   const stats = {
     ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, questions: 0,
-    ciReports: 0, ciReruns: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, lastError: null,
+    ciReports: 0, ciReruns: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, pausedHolds: 0,
+    runnerProblems: 0, readyNotes: 0, lastError: null,
   };
   const stallMs = config.watchdogStallSec * 1000;
   const liveWorkspaces = new Map(); // workspaceId → when it was last seen live
@@ -255,7 +278,7 @@ export function createWatchdog(ctx, state, deps = {}) {
   const now = () => ctx.now();
   const limits = createLimitCheck({ api, config, log, records, state, now, stats, dryRunSeen });
   // 15. Issues blocked while their agent was paused (resume.mjs). 6 and 2 leave its issues to it.
-  const resumes = createResumeSweep({ ctx, records, state, stats, dryRunSeen, record });
+  const resumes = createResumeSweep({ ctx, records, state, stats, dryRunSeen, record, onSettled: (companyId) => pausedHolds.scanSoon(companyId) });
 
   async function agentFor(id, agents) {
     if (!agents.has(id)) agents.set(id, await api.request("GET", `/api/agents/${id}`));
@@ -407,6 +430,8 @@ export function createWatchdog(ctx, state, deps = {}) {
   async function releaseUnprovableHold(issue, agents) {
     if (!config.watchdogReleaseHolds) return false;
     const facts = await holdFacts(api, issue.id).catch(() => null);
+    // A run a pause cancelled is 18's: its hold is resolved without moving the issue to todo.
+    if (facts?.hold && pausedHold(facts)) return true;
     if (!facts?.hold || !unprovable(facts)) return false;
     const { hold, run } = facts;
     const who = issue.identifier ?? issue.id;
@@ -790,14 +815,40 @@ export function createWatchdog(ctx, state, deps = {}) {
   }
 
   const quiet = (issue) => now() - ts(issue.updatedAt) >= stallMs;
+
+  // The issue's hold from a run a pause cancelled (18), or null.
+  async function pausedHoldOf(issue) {
+    const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+    if (full?.executionBlocker?.cause !== RECONCILIATION_CAUSE) return null;
+    const facts = await holdFacts(api, issue.id).catch(() => null);
+    return facts?.hold && pausedHold(facts) ? facts : null;
+  }
   const candidate = (issue) => issue.assigneeAgentId && !issue.executionRunId && !issue.checkoutRunId && quiet(issue);
 
   async function checkHandOffs(companyId, agents) {
     const issues = (await listIssues(api, companyId, WATCHED_STATUSES)).filter(candidate);
     await mapLimit(issues, CONCURRENCY, async (issue) => {
       try {
+        if (pausedHolds.actedOn(issue.id)) return;
         const stall = await stalledHandOff(issue, agents);
         if (!stall) return;
+        // Every wake held behind a run a pause cancelled (18): a comment waits behind it
+        // too. 18 resolves it and then wakes the owner, saying why; without that, the
+        // nudge says why instead of guessing at an environment lease.
+        const held = await pausedHoldOf(issue);
+        if (held) {
+          const r = records.get(record.pausedHold(issue, held.hold.runId));
+          if (config.watchdogReleaseHolds && !r?.failed && !r?.left) return;
+          await nudge(
+            issue,
+            record.handOff(issue, stall.latest),
+            stall.agent,
+            `this issue is yours now (${issue.status}), but no run has started since the hand-off: ${pausedHoldWhy({ ownerName: held.agent?.name, runId: held.hold.runId })}. ` +
+              `The board has to lift that hold before any run starts here. ${pausedHoldSteps({ ownerName: held.agent?.name, assigneeName: stall.agent.name, identifier: issue.identifier ?? issue.id })}`,
+            { reason: "dropped hand-off", heldBy: held.hold.runId, sinceRunSec: stall.sinceRunSec },
+          );
+          return;
+        }
         await nudge(
           issue,
           record.handOff(issue, stall.latest),
@@ -1219,11 +1270,22 @@ export function createWatchdog(ctx, state, deps = {}) {
   // The issue's runs, without those Paperclip cancelled before they started.
   const startedRuns = (runs) => (Array.isArray(runs) ? runs : []).filter((r) => !refused(r) && !neverStarted(r));
 
-  const ciRunsCheck = createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns });
+  const ciRunsCheck = createCiRunsCheck({
+    ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns,
+    noteToBoard: (companyId, text, extra) => noteToBoard(ctx, companyId, text, extra),
+  });
 
   // ---------------------------------------------------------------- 12, 13. issues waiting on your review
 
   const boardHeld = createBoardHeldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, quiet, startedRuns });
+
+  // ---------------------------------------------------------------- 18. holds from a pause
+
+  const pausedHolds = createPausedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, resumes });
+
+  // ---------------------------------------------------------------- 19. PRs ready to queue
+
+  const readyCheck = createReadyCheck({ ctx, records, state, stats, dryRunSeen, record, github });
 
   async function tick() {
     const started = now();
@@ -1258,12 +1320,15 @@ export function createWatchdog(ctx, state, deps = {}) {
           await run("dead links", companyId, () => checkDeadLinks(companyId, agents));
           await run("scheduled workspaces", companyId, () => checkScheduledWorkspaces(companyId, agents));
         }
+        // Before the checks that comment: a comment waits behind such a hold too.
+        await run("paused-run holds", companyId, () => pausedHolds.check(companyId, agents));
         await run("blocked issues", companyId, () => checkBlocked(companyId, agents));
         await run("hand-offs", companyId, () => checkHandOffs(companyId, agents));
         if (config.watchdogRouteQuestions) await run("question cards", companyId, () => checkQuestions(companyId, agents));
         await run("waiting on you", companyId, () => boardHeld.check(companyId, agents));
         if (config.watchdogCiRuns) await run("CI runs", companyId, () => ciRunsCheck.check(companyId, agents));
         if (config.watchdogStagesWipe) await run("review stages", companyId, () => stagesCheck.check(companyId, agents));
+        if (config.watchdogReportReadyToMerge) await run("ready to queue", companyId, () => readyCheck.check(companyId, agents));
       }
       stats.lastError = failure;
     } catch (err) {
@@ -1301,6 +1366,7 @@ export function createWatchdog(ctx, state, deps = {}) {
           ? { adapters: [...RECOGNISERS.keys()], graceMin: config.watchdogLimitResumeGraceMin, codexTimeZone: config.watchdogLimitTimeZone || localZone(), notifyIssue: config.watchdogNotifyIssue || null }
           : false,
         stagesWipe: config.watchdogStagesWipe ? (github ? true : "on, without the open-PR part: no GitHub token") : false,
+        reportReadyToMerge: config.watchdogReportReadyToMerge ? (github ? true : "off: no GitHub token (GITHUB_TOKEN or GITHUB_TOKEN_FILE)") : false,
         resumeSweep: config.watchdogResumeSweep,
         // Runs at once per agent, for the sweep's restores and 6's nudges.
         runsPerAgent: config.watchdogResumeSweepLimit || "the agent's maxConcurrentRuns",

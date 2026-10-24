@@ -70,6 +70,81 @@ export function unprovable(facts) {
   return Boolean(run?.detailRead && run.processPid == null && run.processGroupId == null);
 }
 
+// A hold left by a run an agent's pause cancelled ("Cancelled due to agent pause",
+// errorCode agent_paused). Paperclip counts a pause-cancel as needing reconciliation,
+// and the hold covers the whole issue: every agent's wakes on it, the next owner's
+// (a reviewer's, say) included, wait behind it, however long ago the pause was.
+// Resuming the agent doesn't clear it, and neither does a status change, a
+// reassignment, an agent's comment or Interrupt.
+export const PAUSE_CANCEL = "agent_paused";
+export function pausedHold(facts) {
+  const { hold, run } = facts ?? {};
+  return hold?.cause === RECONCILIATION_CAUSE && run?.status === "cancelled" && run.errorCode === PAUSE_CANCEL;
+}
+
+// What lifts it: an explicit continuation (admitExplicitNativeContinuation,
+// server/src/services/explicit-native-continuation.ts, main at e5c9e60). A board
+// user's plain comment on the issue (wake reason issue_commented or
+// issue_reopened_via_comment) while the issue is assigned to the hold's own agent
+// (executionBlocker.agentId, whose run the pause cancelled), that agent invokable, on
+// a conversation adapter, and the comment newer than the run's end. A comment while
+// anyone else is the assignee is saved behind the hold like any other.
+export const CONVERSATION_ADAPTERS = new Set([
+  "claude_local", "codex_local", "cursor", "gemini_local", "opencode_local", "pi_local", "grok_local", "kimi_local", "hermes_local",
+]);
+
+// Does the helper's key comment as a board user (actorType "user")? A board API key
+// does (getActorInfo, routes/authz.ts: source board_key), as do a session and
+// local_implicit; an agent's key doesn't. From `pch login`'s identity (/api/cli-auth/me).
+export const actsAsUser = (identity) => Boolean(identity?.userId) && !/^agent/i.test(String(identity?.source ?? ""));
+
+// The two steps, as the board would take them: the issue back to the hold's own agent
+// (a PATCH of assigneeAgentId alone; the comment goes separately, as a single PATCH
+// that names another assignee keeps the stage's returnAssignee), then the comment.
+// Returns { reassigned, from, lifted, status }: `lifted` when Paperclip no longer shows
+// the hold once the comment is in (it lifts it as the comment's wake is admitted, so
+// a moment later is possible too).
+export async function continuePausedHold(api, facts, { text }) {
+  const { issue, hold } = facts;
+  const id = encodeURIComponent(issue.id ?? issue.identifier);
+  const from = issue.assigneeAgentId ?? null;
+  const reassigned = from !== hold.agentId;
+  if (reassigned) await api.request("PATCH", `/api/issues/${id}`, { assigneeAgentId: hold.agentId });
+  await api.request("POST", `/api/issues/${id}/comments`, { body: text });
+  const after = await api.request("GET", `/api/issues/${id}`).catch(() => null);
+  return { reassigned, from, lifted: Boolean(after) && !after.executionBlocker, status: after?.status ?? issue.status };
+}
+
+// The comment that continues it, to the agent whose run the pause cancelled.
+export function continuationText(agent, signature = "") {
+  return (
+    `${agent ? `[@${agent.name}](agent://${agent.id}) ` : ""}your run on this issue was cancelled when you were paused, and Paperclip has held the issue since. ` +
+    "Please continue from where the pause cut you off, then hand the issue on as you normally would (back to review, say)." +
+    signature
+  );
+}
+
+// After a release: is the hold gone, and do saved messages still wait? Paperclip may
+// start them by itself; they are pressed only if they still wait.
+async function deliverAfterRelease(api, id) {
+  const after = await api.request("GET", `/api/issues/${id}`);
+  if (after.executionBlocker) {
+    const err = new Error(`Paperclip accepted the release but still holds the issue (${after.executionBlocker.cause ?? "unknown cause"})`);
+    err.stillHeld = true;
+    throw err;
+  }
+  const queue = await api.request("GET", `/api/issues/${id}/queued-comments`).catch(() => null);
+  if (queue?.queueId && queue.entries?.length && queue.state === "deferred" && !queue.targetRunId && queue.protocol === "legacy") {
+    await api.request("POST", `/api/issues/${id}/queued-comments/interrupt`, {
+      queueId: queue.queueId,
+      revision: queue.revision,
+      targetRunId: null,
+    });
+    return { status: after.status, delivered: queue.entries.length, waiting: 0 };
+  }
+  return { status: after.status, delivered: 0, waiting: queue?.entries?.length ?? 0 };
+}
+
 // Records the board's reconciliation, then delivers the saved messages the way
 // Interrupt does. Returns { status, delivered, waiting }.
 export async function releaseHold(api, facts, { actionOutcome = "mixed", note, signature = "" } = {}) {
@@ -92,21 +167,5 @@ export async function releaseHold(api, facts, { actionOutcome = "mixed", note, s
           : `The board verified its actions as ${actionOutcome.replace("_", " ")}.`),
     },
   });
-  const after = await api.request("GET", `/api/issues/${id}`);
-  if (after.executionBlocker) {
-    const err = new Error(`Paperclip accepted the release but still holds the issue (${after.executionBlocker.cause ?? "unknown cause"})`);
-    err.stillHeld = true;
-    throw err;
-  }
-  // Paperclip may start the saved messages by itself; press only if they still wait.
-  const queue = await api.request("GET", `/api/issues/${id}/queued-comments`).catch(() => null);
-  if (queue?.queueId && queue.entries?.length && queue.state === "deferred" && !queue.targetRunId && queue.protocol === "legacy") {
-    await api.request("POST", `/api/issues/${id}/queued-comments/interrupt`, {
-      queueId: queue.queueId,
-      revision: queue.revision,
-      targetRunId: null,
-    });
-    return { status: after.status, delivered: queue.entries.length, waiting: 0 };
-  }
-  return { status: after.status, delivered: 0, waiting: queue?.entries?.length ?? 0 };
+  return deliverAfterRelease(api, id);
 }

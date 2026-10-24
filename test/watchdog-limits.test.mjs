@@ -623,3 +623,34 @@ test("an agent Paperclip has since paused for its budget is not resumed at the r
   const [, record] = [...env.state.nudges.entries()].find(([k]) => k.startsWith("limit:"));
   assert.deepEqual(record.paused, {}, "left to you, and forgotten");
 });
+
+test("a failed Codex run that mentions a limit the recogniser doesn't take for one is logged in full, once a day", async (t) => {
+  const env = await codexEnv(t);
+  const a = codex(env.db, "Codex Engineer");
+  const claudeAgent = claude(env.db, "Claude Engineer");
+  const odd = "You have reached the request limit for this workspace. Contact your administrator.";
+  failedRun(env.db, a, { at: T0 - 2 * MIN, errorCode: "adapter_failed", error: odd });
+  failedRun(env.db, a, { at: T0 - MIN, errorCode: "adapter_failed", error: "Workspace quota exhausted (second message)." });
+  // Neither a recognised Codex limit, capacity, nor another adapter's failure is logged.
+  failedRun(env.db, a, { at: T0 - 3 * MIN, errorCode: "provider_quota", error: "Selected model is at capacity. Please try a different model." });
+  failedRun(env.db, claudeAgent, { at: T0 - 3 * MIN, errorCode: "adapter_failed", error: "rate limit somewhere" });
+  const logged = () => env.logs.filter((l) => /recogniser doesn't take it for one/.test(l.msg));
+
+  await env.watchdog.tick();
+  await env.watchdog.tick();
+  assert.equal(logged().length, 1);
+  assert.equal(logged()[0].error, odd, "the first one, word for word");
+  assert.equal(logged()[0].agent, "Codex Engineer");
+  assert.equal(lifecycle(env, "pause").length, 0, "nothing is paused for it");
+
+  env.clock.at = T0 + 23 * 60 * MIN;
+  await env.watchdog.tick();
+  assert.equal(logged().length, 1, "not again within the day");
+  env.clock.at = T0 + 25 * 60 * MIN;
+  await env.watchdog.tick();
+  assert.equal(logged().length, 1, "a day later, only a failure since the last one counts");
+  failedRun(env.db, a, { at: env.clock.at - MIN, errorCode: "adapter_failed", error: "Monthly quota for this key reached." });
+  await env.watchdog.tick();
+  assert.equal(logged().length, 2);
+  assert.equal(logged()[1].error, "Monthly quota for this key reached.");
+});

@@ -442,6 +442,8 @@ test("HTTP: signature check, JSON summary, duplicate deliveries, and redelivery 
   const redelivered = await deliver("d1");
   assert.equal(redelivered.status, 200);
   assert.deepEqual(await redelivered.json(), { identifier: "ACM-2", action: "approve", status: "done" });
+  assert.equal(relay.stats.approvals, 1, "counted for the lifetime metrics");
+  assert.equal(relay.stats.changeRequests, 0);
   const duplicate = await deliver("d1");
   assert.deepEqual(await duplicate.json(), { duplicate: "d1" });
   assert.equal(db.patches.length, 1);

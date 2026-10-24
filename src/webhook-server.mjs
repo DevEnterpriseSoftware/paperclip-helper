@@ -36,7 +36,7 @@ function send(res, status, body) {
 export function createWebhookServer({ ctx, state, handle, answerWithinMs = ANSWER_WITHIN_MS }) {
   const { config, log } = ctx;
   const deliveries = state.deliveries;
-  const stats = { handled: 0, failed: 0, answeredLate: 0, lastEventAt: null, lastError: null };
+  const stats = { handled: 0, failed: 0, answeredLate: 0, approvals: 0, changeRequests: 0, lastEventAt: null, lastError: null };
   const inflight = new Set(); // promises: deliveries being received or worked on
   const working = new Set(); // delivery ids being worked on, not yet remembered
 
@@ -57,6 +57,9 @@ export function createWebhookServer({ ctx, state, handle, answerWithinMs = ANSWE
         state.touch();
       }
       stats.handled += 1;
+      // Decisions recorded for you (a merge-queue drop counts as a drop, not here).
+      if (!result.drop && (result.action === "approve" || result.action === "done")) stats.approvals += 1;
+      if (!result.drop && result.action === "changes") stats.changeRequests += 1;
       stats.lastEventAt = new Date().toISOString();
       log("relay: handled", { event, action: payload?.action, delivery, result });
       return { status: 200, body: result };

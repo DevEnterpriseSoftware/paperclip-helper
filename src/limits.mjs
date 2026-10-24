@@ -29,6 +29,8 @@
 // transient.
 
 import { asleep, plural, ts } from "./util.mjs";
+
+const DAY_MS = 24 * 60 * 60_000;
 import { noteToBoard } from "./board-note.mjs";
 
 const LIMIT_CODES = new Set(["claude_transient_upstream", "provider_quota"]);
@@ -412,6 +414,36 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
       if (now() >= event.resetAt + graceMs) await resume(event, agents);
       else await pauseIdle(event, agents, runs);
     }
+    logUnrecognised(runs, agents);
+  }
+
+  // A failed run whose error talks about a limit or quota, which its adapter's
+  // recogniser doesn't take for one: its full text, once a day, so the recogniser
+  // can be checked against a real message. Only Codex for now: its wording is read
+  // from Codex's source, not yet seen in a run. ("Rate limit" retries, which Codex
+  // handles itself, can show up here too: that's what checking is for.)
+  const UNRECOGNISED_CHECKED = new Set(["codex_local"]);
+  let unrecognisedAt = 0; // a dry run's record, in memory only
+  function logUnrecognised(runs, agents) {
+    const key = "limit-unrecognised";
+    const last = config.dryRun ? unrecognisedAt : records.get(key)?.at ?? 0;
+    if (now() - last < DAY_MS) return;
+    const candidates = runs
+      .filter((run) => run?.status === "failed" && /\b(limit|quota)\b/i.test(String(run.error ?? "")) && ts(run.finishedAt ?? run.createdAt) > last)
+      .filter((run) => UNRECOGNISED_CHECKED.has(agents.get(run.agentId)?.adapterType))
+      .filter((run) => !classifyFailure(run, agents.get(run.agentId), { timeZone }))
+      .sort((a, b) => ts(a.finishedAt ?? a.createdAt) - ts(b.finishedAt ?? b.createdAt));
+    const run = candidates[0];
+    if (!run) return;
+    const agent = agents.get(run.agentId);
+    if (config.dryRun) unrecognisedAt = now();
+    else {
+      records.set(key, { count: 1, at: now(), runId: run.id });
+      state.touch();
+    }
+    log.warn(`watchdog: a failed ${labelOf(agent.adapterType)} run mentions a limit or quota, but its usage-limit recogniser doesn't take it for one; please check it against this message (logged once a day)`, {
+      agent: agent.name, adapter: agent.adapterType, run: run.id, errorCode: run.errorCode ?? null, finishedAt: run.finishedAt ?? null, error: String(run.error),
+    });
   }
 
   // The event a limit failure starts, or the running one it extends; null when

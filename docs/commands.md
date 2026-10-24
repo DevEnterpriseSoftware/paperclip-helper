@@ -4,10 +4,11 @@
 
 | Command | What it does |
 |---|---|
-| `pch status` | What the service is doing, its last checks and counts, Paperclip's version and build commit, and when the key expires. |
+| `pch status` | What the service is doing, its last checks and counts, Paperclip's version and build commit, and when the key expires. Then the all-time figures: what the helper has done since it was first started (agents woken, holds released, decisions relayed, …), roughly how much hand work that saved, how many warnings and errors it has logged, and the latest ten. See [all-time figures](#all-time-figures-in-pch-status). |
 | `pch check [ISSUE]` | Who the key belongs to, its companies and prefixes. With an issue, its stage, current participant, and whether a merge would approve it. With `RELAY_FIX_CONFLICTS` on, also whether the GitHub token (`GITHUB_TOKEN`, or the one in `GITHUB_TOKEN_FILE`) can read each repository. |
 | `pch why ISSUE` | Why nobody is working on an issue, and what to do about it: Paperclip's own diagnosis (wakes, blockers, workspace clean-ups, runs and leases, recovery), then a recommendation. `--prompt` prints it all as a prompt for an LLM chat. |
 | `pch blocked` | Why each blocked issue is blocked, which issues the chains of blocked issues end at and what those wait on, and every question card that is waiting. See [`blocked`](#blocked-what-the-blocked-issues-wait-on). |
+| `pch ready` | The PRs ready to queue, in queue order: issues at your approval stage with every earlier stage done, whose PR is open, not a draft and clean on GitHub (no conflict, required checks green). Then the issues at your approval that aren't ready, and why. Read-only; needs a GitHub token. See [the watchdog](watchdog.md#19-prs-ready-to-queue). |
 | `pch approve ISSUE [comment]` | Approves an issue whose approval is waiting on you. It refuses otherwise. |
 | `pch changes ISSUE comment` | Requests changes. The comment is required and becomes the brief. |
 | `pch comment ISSUE text` | Comments as you, which wakes the assignee. |
@@ -19,6 +20,7 @@
 | `pch costs` | Previews what cost sync would post, and what it does to budgets. |
 | `pch costs --sessions` | Checks whether resumed sessions report cumulative costs (see [Compatibility](../README.md#compatibility)). |
 | `pch costs --audit [--days N]` | Checks the cost figures of the last N days (default 7): tokens, reported cost, what the tokens cost at list price, what cost sync posts, and duplicates. Changes nothing. See [cost sync](cost-sync.md#checking-the-figures). |
+| `pch costs --compare-days N` | The last N days against the N days before, each costed as cost sync posts it now and as it did before 1.12: how much of a change is usage, and how much the new costing. Changes nothing; after `--audit`, both. See [cost sync](cost-sync.md#comparing-two-periods). |
 | `pch models` | Every agent's adapter, model, effort and status. |
 | `pch set-model FROM TO [--apply]` | Moves every agent on model `FROM` to `TO`. It previews unless you pass `--apply`. |
 | `pch run` | Runs the service in the foreground, as its container does. It refuses to start while another helper is running on the same data directory (see [Troubleshooting](troubleshooting.md)). You don't need it with the installer's setup: the service already runs in its own container. |
@@ -28,6 +30,27 @@
 | `pch version`, `pch help` | Version, and this list. `pch <command> --help` prints that command's usage. |
 
 Options work the same for every command. A value can follow its option or be joined to it: `--days 7` and `--days=7`. An option the command doesn't have stops it with its usage line, so a typo never runs a command without what you meant, or posts the option as part of a comment. A comment's text is the rest of the words, or one quoted argument; a `--` within it stays. To start it with `--`, put a bare `--` before it: `pch comment ACM-1 -- --force is fine here` (PowerShell drops a bare `--`, so there write `'--'`). A quoted phrase works too, as long as it has a space: `pch comment ACM-1 "--force is fine here"`.
+
+## All-time figures in `pch status`
+
+The service keeps a small file, `data/metrics.json`, beside its state file. Every heartbeat (30 seconds) it adds this run's counts to the totals the file held when it started, so the figures carry over restarts and upgrades (the `data/` folder is the container's mounted volume). It also counts every warning and error it logs and keeps the latest ten, with what each was about (issue, check, error).
+
+```text
+All time (since 2026-10-01 09:12 UTC, 12 starts, 1.11.0 → 1.13.0):
+  Kept things moving: 219 actions, about 28 h of hand work saved (a rough guess per action).
+       142  stalled agents woken (61 of them finished CI runs reported)
+        61  merges and approvals recorded as your decision
+        12  change requests relayed to an agent
+         4  holds released
+  Relay: 230 GitHub events handled, 3 failed.
+  Watchdog: 18,203 checks run.
+  Cost sync: 1,204 run costs posted ($312.40).
+  Problems: 23 warnings, 2 errors. The latest 2, newest last:
+    2026-10-24 15:02  warn   watchdog: issue check failed (issue ACM-12, error timeout)
+    2026-10-24 16:10  ERROR  relay: failed (error Paperclip answered 502)
+```
+
+"Hand work saved" multiplies each count by a rough guess at the minutes it would take you to notice the stall, find why and do it by hand (10 for an agent woken, 15 for a hold released, 3 for a decision relayed, …; the list is `COUNTERS` in `src/metrics.mjs`). It's for a sense of scale, not a measurement. A helper killed outright loses at most one heartbeat's counts. Delete `data/metrics.json` to start the figures again.
 
 ## `blocked`: what the blocked issues wait on
 
@@ -126,7 +149,7 @@ The recommendation names what is going on, gives the steps as commands you can p
 - a run that is working, about to start, or has sat queued for more than ten minutes;
 - a link to a closed workspace, which fails every run at setup;
 - a review Paperclip escalated to you after its review-round limit, or a review or approval waiting on you;
-- an execution hold;
+- an execution hold: one left by a run an agent's pause cancelled ("Queued wakes held by an unreconciled run from a pause: …", with the wakes it holds and the two steps that lift it), or any other;
 - a last run that hit its plan's usage limit (Claude or Codex, with the reset time);
 - a review blocked because its participant couldn't be woken, and any other issue Paperclip's recovery parked;
 - saved messages waiting behind an earlier run;
@@ -146,6 +169,8 @@ Paperclip holds an issue (`legacy_execution_requires_reconciliation`) when a run
 It refuses while the run is still active, its environment lease is unreleased, or its process is alive on the helper's host. Since nobody verified what the run did, have the agent check the branch before it builds on it.
 
 The [watchdog](watchdog.md#7-holds-paperclip-can-never-release-by-itself) does this by itself for a hold whose run recorded no process at all (`WATCHDOG_RELEASE_HOLDS`). Use the command for a hold it leaves to you, or to release one without waiting.
+
+**A hold left by a run an agent's pause cancelled** (`agent_paused`) keeps every agent's wakes on the issue from starting, a reviewer's after a hand-off too, and Paperclip lifts it only on a board user's comment while the issue is assigned to that run's agent and the agent isn't paused. For it, `--apply` takes those two steps: if someone else has the issue, it assigns it back to that agent (a `PATCH` of the assignee alone), then comments, as you, asking the agent to continue from where the pause cut it off and hand the issue on as usual. It refuses while the agent is still paused, and for an agent that isn't on a conversation adapter. The [watchdog](watchdog.md#18-wakes-held-by-a-run-an-agents-pause-cancelled) does this by itself once the agent is resumed.
 
 ## `workspace`: an issue linked to the wrong workspace
 

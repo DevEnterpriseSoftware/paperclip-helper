@@ -18,6 +18,7 @@ import { createCostSync } from "./cost-sync.mjs";
 import * as cmd from "./commands.mjs";
 import { parseCommandLine, SPECS } from "./args.mjs";
 import { HEARTBEAT_MS, otherInstance } from "./instance.mjs";
+import { createMetrics, watchProblems } from "./metrics.mjs";
 
 // Set once the service starts: from then on, even a crash is a JSON log line.
 let serviceLog = null;
@@ -52,6 +53,9 @@ async function runService(ctx) {
     log("relay off: set GITHUB_WEBHOOK_SECRET, GITHUB_OWNER_LOGIN and GITHUB_REPOS to turn it on");
   }
 
+  // Lifetime counts and the latest warnings and errors (data/metrics.json, for `pch status`).
+  const metrics = createMetrics(config, { version: VERSION });
+  watchProblems(log, metrics);
   log("paperclip helper starting", { version: VERSION, paperclip: config.paperclipApi, dryRun: config.dryRun });
   const startedAt = new Date().toISOString();
   let identity = null;
@@ -98,6 +102,18 @@ async function runService(ctx) {
   costSync?.start();
 
   const writeStatus = (extra = {}) => {
+    const components = {
+      relay: relay ? { on: true, ...relay.stats } : { on: false },
+      watchdog: watchdog ? { on: true, ...watchdog.stats } : { on: false },
+      costSync: costSync ? { on: true, ...costSync.stats } : { on: false },
+    };
+    try {
+      metrics.update(components);
+      metrics.save();
+    } catch (err) {
+      // Not log.error: that would count itself as a problem on every heartbeat.
+      log.debug("could not write the metrics file", { error: err.message });
+    }
     try {
       writeJson(config.statusFile, {
         version: VERSION,
@@ -107,9 +123,7 @@ async function runService(ctx) {
         paperclip: config.paperclipApi,
         identity: identity ? { userId: identity.userId, name: identity.user?.name ?? null, companies: identity.companyIds ?? [] } : null,
         keyExpiresAt: key?.expiresAt ?? null,
-        relay: relay ? { on: true, ...relay.stats } : { on: false },
-        watchdog: watchdog ? { on: true, ...watchdog.stats } : { on: false },
-        costSync: costSync ? { on: true, ...costSync.stats } : { on: false },
+        ...components,
         ...extra,
       });
     } catch (err) {
@@ -162,6 +176,7 @@ async function main() {
     check: () => cmd.check(ctx, a.issue),
     why: () => cmd.why(ctx, a.issue, { prompt: o.prompt }),
     blocked: () => cmd.blocked(ctx),
+    ready: () => cmd.ready(ctx),
     approve: () => cmd.decide(ctx, "approve", a.issue, a.text),
     changes: () => cmd.decide(ctx, "changes", a.issue, a.text),
     comment: () => cmd.comment(ctx, a.issue, a.text),

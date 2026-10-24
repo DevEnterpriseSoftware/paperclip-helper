@@ -47,6 +47,54 @@ export function isWorkProductOf(wp, pr) {
   );
 }
 
+// Work an issue's description still lists as not done, in a few words ("2 open
+// checklist items", "a section still to do (Proofs)"), or null. Open checklist items
+// are "- [ ]" lines (any bullet); a section counts when its heading says it is still
+// to do (To do, Remaining, Outstanding, Next steps, Follow-ups, Pending), or when it is
+// a proofs or verification section whose text says something is pending, to do or
+// not yet done. Code blocks are left out: a checklist quoted in one isn't the issue's.
+const OPEN_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+\[ \]\s+\S/;
+const HEADING = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/;
+const TODO_HEADING = /\b(to[\s-]?do|todo|remaining|outstanding|still to do|next steps?|follow[\s-]?ups?|pending|not (?:yet )?done)\b/i;
+const PROOF_HEADING = /\b(proofs?|verification|verify|evidence)\b/i;
+const PENDING_TEXT = /\b(to[\s-]?do|todo|tbd|pending|not (?:yet )?(?:done|run|started)|still to (?:do|run|come))\b/i;
+
+export function unfinishedWork(description) {
+  const lines = String(description ?? "").split(/\r?\n/);
+  let fenced = false;
+  let open = 0;
+  const sections = [];
+  let current = null; // { title, level, text: [] }
+  const close = () => {
+    if (!current) return;
+    const body = current.text.join("\n");
+    const pending = TODO_HEADING.test(current.title) ? body.trim().length > 0 : PROOF_HEADING.test(current.title) && PENDING_TEXT.test(body);
+    if (pending) sections.push(current.title);
+    current = null;
+  };
+  for (const line of lines) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      fenced = !fenced;
+      continue;
+    }
+    if (fenced) continue;
+    const h = line.match(HEADING);
+    if (h) {
+      close();
+      current = { title: h[2].replace(/[*_`]/g, "").trim(), text: [] };
+      continue;
+    }
+    if (OPEN_ITEM.test(line)) open += 1;
+    // A done item ("- [x]") isn't text that says something is pending.
+    else if (current && !/^\s*(?:[-*+]|\d+[.)])\s+\[[xX]\]/.test(line)) current.text.push(line);
+  }
+  close();
+  const parts = [];
+  if (open) parts.push(`${open} open checklist item${open === 1 ? "" : "s"}`);
+  if (sections.length) parts.push(`${sections.length === 1 ? "a section" : `${sections.length} sections`} still to do (${sections.slice(0, 3).join(", ")})`);
+  return parts.length ? parts.join(" and ") : null;
+}
+
 // What to say on the PR when a decision you asked for wasn't recorded; null when
 // it was. `asked` names what you did ("`/changes`", "Request changes"); `result`
 // is decide()'s; `identifiers` are the issues the PR names.
@@ -225,6 +273,34 @@ export function createDecisions(ctx) {
     return null;
   }
 
+  // The approval about to close the issue: its pending stage is the last one. Without
+  // the stage list (or the stage's place in it), assumed so: a merge's approval
+  // normally is the last decision, and the note it adds only asks you to look.
+  function closesOnApproval(issue) {
+    const stages = issue?.executionPolicy?.stages;
+    const state = issue?.executionState;
+    if (!Array.isArray(stages) || !stages.length || !state) return true;
+    if (Number.isInteger(state.currentStageIndex)) return state.currentStageIndex >= stages.length - 1;
+    if (state.currentStageId) return stages.at(-1)?.id == null || stages.at(-1).id === state.currentStageId;
+    return true;
+  }
+
+  // A line for the merge comment when the issue's description still lists work to do
+  // (unfinished), and nothing marked the merge as only a step: the close still goes
+  // ahead, but you can see at once that it may have been early.
+  async function unfinishedNote(issue) {
+    if (!closesOnApproval(issue)) return "";
+    const full = issue.description == null ? (await api.request("GET", `/api/issues/${issue.id}`).catch(() => null)) ?? issue : issue;
+    const left = unfinishedWork(full.description);
+    if (!left) return "";
+    log("relay: a merge closes an issue whose description still lists work to do; noted in the merge comment", { identifier: issue.identifier ?? issue.id, left });
+    const marker = config.relayMergeKeepOpenMarker;
+    return (
+      `\n\n_Closed on merge, though the description still lists ${left}. If this PR was only a step, reopen the issue` +
+      `${marker ? ` and add the marker ("${marker}")` : ""}._`
+    );
+  }
+
   // The hand-off that sent the issue to review: its implementer's comments since
   // the implementer last moved the issue to in_review (Paperclip's activity log), the
   // hand-off comment itself included. A board move back to review (the resume
@@ -315,9 +391,10 @@ export function createDecisions(ctx) {
       const keep = await mergeKeepsOpen(issue);
       if (keep) return returnAfterMerge(pr, identifier, keep, { wiped: true });
       if (config.dryRun) return { identifier, action: "done (dry run)", reason: "its review stages were wiped" };
+      const note = await unfinishedNote({ ...issue, executionPolicy: null });
       await api.request("PATCH", `/api/issues/${encodeURIComponent(identifier)}`, {
         status: "done",
-        comment: signed(`${comment}\n\nThis issue's review stages had been wiped, so there was no approval to record: closed as done on the merge.`, RELAYED_SIGNATURE),
+        comment: signed(`${comment}\n\nThis issue's review stages had been wiped, so there was no approval to record: closed as done on the merge.${note}`, RELAYED_SIGNATURE),
       });
       return { identifier, action: "done", reason: "its review stages were wiped" };
     }
@@ -336,17 +413,20 @@ export function createDecisions(ctx) {
       return { ...result, code: "ambiguous", waitingOn: ambiguous, reason: `several issues wait on you (${list}) and none lists this PR`, status: issue.status, stageType };
     }
 
+    let note = "";
     if (kind === "approve" && merged) {
       // The merge was one step of the issue, not all of it: back to its implementer.
       const keep = await mergeKeepsOpen(issue);
       if (keep) return { ...(await returnAfterMerge(pr, identifier, keep)), ...(via ? { via } : {}) };
+      // Nothing says so, but the description still lists work to do: say so, and close it anyway.
+      note = await unfinishedNote(issue);
     }
 
     const status = DECISION_STATUS[kind];
     if (config.dryRun) return { identifier, action: `${kind} (dry run)`, status };
     const path = `/api/issues/${encodeURIComponent(identifier)}`;
     // The decision and its comment must travel in the same PATCH.
-    await api.request("PATCH", path, { status, comment: signed(comment, RELAYED_SIGNATURE) });
+    await api.request("PATCH", path, { status, comment: signed(`${comment}${note}`, RELAYED_SIGNATURE) });
 
     // Approving a stage that isn't the last one only moves the issue to the next
     // stage. When that stage is yours too (an escalated review followed by your

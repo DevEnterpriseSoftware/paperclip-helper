@@ -131,6 +131,42 @@ export function ciMessage({ run, jobs, reruns = 0 }) {
   return lines.join("\n");
 }
 
+// ---------------------------------------------------------------- runner problems
+
+// A job that failed setting up its runner, before checkout: GitHub's own "Set up
+// runner" or "Set up job" step failed (a self-hosted runner's job-started hook that
+// quarantines the machine, say, or a runner that can't start the job), so none of
+// the PR's code ran. Every failed job of the run must look like that, on a known runner.
+const SETUP_STEP = /^set up (runner|job)$/i;
+export function failedBeforeCheckout(job) {
+  const steps = Array.isArray(job?.steps) ? job.steps : [];
+  const failed = steps.find((st) => FAILED.has(st?.conclusion));
+  if (!failed || !SETUP_STEP.test(String(failed.name ?? "").trim()) || !job.runner_name) return false;
+  return !steps.some((st) => /checkout/i.test(String(st?.name ?? "")) && st.conclusion === "success");
+}
+
+// The runner a run's failed jobs all failed to set up on, or null.
+export function setupFailureRunner(jobs) {
+  const failed = failedJobs(jobs);
+  if (!failed.length || !failed.every(failedBeforeCheckout)) return null;
+  const runners = new Set(failed.map((j) => j.runner_name));
+  return runners.size === 1 ? failed[0].runner_name : null;
+}
+
+// What the agent is told instead of the usual report: the run never reached its code.
+export function runnerProblemMessage({ run, runner }) {
+  const name = run.name ?? run.display_title ?? "CI";
+  const attempt = Number(run.run_attempt ?? 1);
+  const label = `${name} run ${run.id}${attempt > 1 ? ` (attempt ${attempt})` : ""}`;
+  return [
+    `the CI run you were waiting on failed before checkout, on runner \`${runner}\`: ${label} failed in GitHub's "Set up runner" step, ` +
+      `so none of your change ran. ${run.html_url ?? ""}`.trim(),
+    "",
+    "Not your PR: other pull requests' jobs on that runner fail the same way, and the board has been told. " +
+      "Don't change your code for it. Once the runner works again, start the run again (or push), and say which run you wait on.",
+  ].join("\n");
+}
+
 // ---------------------------------------------------------------- the check (watchdog.mjs runs it each tick)
 
 // Issues the CI-run check reads: an agent that waits on CI leaves its issue in
@@ -139,12 +175,17 @@ const CI_STATUSES = "todo,in_progress,in_review,blocked";
 const CI_LOOKBACK_MS = 3 * 24 * 60 * 60_000;
 const DEFAULT_BRANCH_TTL_MS = 60 * 60_000; // a renamed default branch is picked up within the hour
 const CONCURRENCY = 4;
+// Runner problems: other PRs' runs that failed the same way, looked for in the
+// repository's failed runs of the last day (newest first, a page), jobs read for a few.
+const RUNNER_LOOKBACK_MS = 24 * 60 * 60_000;
+const RUNNER_RUNS_READ = 12;
+const RUNNER_NOTE_EVERY_MS = 24 * 60 * 60_000;
 
 // Check 11. From the watchdog: its records (keys from `record`), the GitHub client,
 // `agentFor` (an agent by id, cached for the tick), `nudge` (its once-per-key
 // comment that wakes the agent), `hasPendingWake` (a wake already on its way),
 // `candidate` (an issue the watchdog may act on) and `startedRuns`.
-export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns }) {
+export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns, noteToBoard }) {
   const { api, config, log } = ctx;
   const now = () => ctx.now();
   const stallMs = config.watchdogStallSec * 1000;
@@ -157,6 +198,7 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
   const ciRepoWarned = new Set(); // repos whose default branch GitHub didn't give, warned once until it does
   const ciSilenced = new Map(); // CI record key → { companyId, reasons }: why a finished run isn't reported, as logged
   const ciRefused = new Set(); // repos whose runs the GitHub token may not read, warned once until it can
+  const runnerScans = new Map(); // "repo|runner" → { failures, at }: other PRs' setup failures, for one scan
   const rerunPattern = (() => {
     if (!config.watchdogCiRerunJobs) return null;
     try {
@@ -279,12 +321,79 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     return true;
   }
 
+  // The repository's runs that failed setting up on this runner in the last day,
+  // other than `run`'s own branch: [{ run, pr, at }]. Read once per scan and runner.
+  async function setupFailuresOn(repo, runner, run) {
+    const key = `${repo}|${runner}`;
+    let scan = runnerScans.get(key);
+    if (!scan) {
+      const since = new Date(now() - RUNNER_LOOKBACK_MS).toISOString().replace(/\.\d+Z$/, "Z");
+      const q = new URLSearchParams({ status: "failure", created: `>=${since}`, per_page: "50" });
+      const data = await github.request("GET", `/repos/${repo}/actions/runs?${q}`).catch(() => null);
+      const rows = (Array.isArray(data?.workflow_runs) ? data.workflow_runs : []).filter((r) => r.conclusion === "failure").slice(0, RUNNER_RUNS_READ);
+      const failures = [];
+      for (const r of rows) {
+        const jobs = (ciRuns.get(`${repo}#${r.id}`)?.jobs) ?? (await github.workflowJobs(repo, r.id).catch(() => []));
+        if (setupFailureRunner(jobs) !== runner) continue;
+        failures.push({ run: r, jobs, pr: r.pull_requests?.[0]?.number ?? null, branch: r.head_branch ?? null, at: ts(r.created_at ?? r.run_started_at ?? r.updated_at) });
+      }
+      scan = { failures };
+      runnerScans.set(key, scan);
+    }
+    return scan.failures.filter((f) => String(f.run.id) !== String(run.id) && (f.branch ?? f.pr) !== (run.head_branch ?? run.pull_requests?.[0]?.number));
+  }
+
+  // The first failure annotation of the jobs, if GitHub shows it ("Checks: Read").
+  async function firstAnnotation(repo, jobs) {
+    for (const job of failedJobs(jobs)) {
+      const notes = await github.request("GET", `/repos/${repo}/check-runs/${job.id}/annotations?per_page=50`).catch(() => null);
+      const failure = (Array.isArray(notes) ? notes : []).find((a) => a.annotation_level === "failure");
+      if (failure?.message) return String(failure.message).split("\n")[0].slice(0, 300);
+    }
+    return null;
+  }
+
+  // A run that failed before checkout on a runner other PRs' jobs fail on too:
+  // { runner } when it is, after telling the board once (a day) per runner; null otherwise.
+  async function runnerProblem(found, companyId) {
+    const { repo, run, jobs } = found;
+    if (run.conclusion !== "failure") return null;
+    const runner = setupFailureRunner(jobs);
+    if (!runner) return null;
+    const others = await setupFailuresOn(repo, runner, run);
+    if (!others.length) return null; // one PR alone: reported as usual
+    const key = `runner:${repo}:${runner}`;
+    const prior = records.get(key);
+    if ((!prior || now() - prior.at >= RUNNER_NOTE_EVERY_MS) && !dryRunSeen.has(key)) {
+      // Claimed before anything else is awaited: issues are checked a few at a time.
+      if (config.dryRun) dryRunSeen.add(key);
+      else {
+        records.set(key, { count: 1, at: now() });
+        state.touch();
+      }
+      const all = [{ run, jobs, pr: run.pull_requests?.[0]?.number ?? null, branch: run.head_branch ?? null, at: ts(run.created_at ?? run.updated_at) }, ...others];
+      const first = all.reduce((a, b) => (b.at && (!a.at || b.at < a.at) ? b : a));
+      const prs = [...new Set(all.map((f) => (f.pr ? `PR #${f.pr}` : f.branch ? `\`${f.branch}\`` : null)).filter(Boolean))];
+      const annotation = (await firstAnnotation(repo, first.jobs)) ?? (await firstAnnotation(repo, jobs));
+      const when = first.at ? new Date(first.at).toISOString().slice(0, 16).replace("T", " ") + "Z" : "today";
+      const text =
+        `Runner \`${runner}\` (${repo}) fails jobs in "Set up runner", before checkout: ${all.length} runs on ${prs.length} pull requests have failed that way ` +
+        `since ${when} (${prs.slice(0, 5).join(", ")}${prs.length > 5 ? ", …" : ""}). First error: ${annotation ?? "no annotation GitHub shows"}. ` +
+        "That's the runner (its job-started hook, or the machine), not the PRs: the agents are told so, and nothing is re-run.";
+      if (!config.dryRun) records.set(key, { count: 1, at: now(), since: first.at || null });
+      stats.runnerProblems = (stats.runnerProblems ?? 0) + 1;
+      await noteToBoard(companyId, text, { runner, repo, runs: all.length });
+    }
+    return { runner };
+  }
+
   async function checkCiRuns(companyId, agents) {
     if (!github) return;
     const last = ciScanAt.get(companyId);
     if (last && now() - last < stallMs) return;
     ciScanAt.set(companyId, now());
     ciRuns.clear();
+    runnerScans.clear();
     const issues = (await listIssues(api, companyId, CI_STATUSES)).filter(
       (i) => candidate(i) && now() - ts(i.updatedAt) < CI_LOOKBACK_MS,
     );
@@ -380,6 +489,15 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     // that may never be delivered (a monitor's own wake can sit deferred for
     // hours), and the comment's wake joins any that is: report anyway.
     if (await hasPendingWake(full, runs, agents, { freshWithin: stallMs })) return silent("a wake for the agent is waiting to start");
+    // Failed setting up a runner other PRs' jobs fail on too: not the agent's to fix, and not re-run.
+    const runnerIssue = await runnerProblem(found, companyId);
+    if (runnerIssue) {
+      const posted = await nudge(full, key, agent, runnerProblemMessage({ run, runner: runnerIssue.runner }), {
+        reason: "CI run failed on its runner", repo: found.repo, run: run.id, runner: runnerIssue.runner,
+      });
+      if (posted) stats.ciReports += 1;
+      return;
+    }
     if (!dispatchedOnDefault && (await rerunFlaky(found, issue))) return;
     // Pushed since: that push's own run is what counts now.
     if (!dispatchedOnDefault && (await headMoved(found.repo, run)) === true) return silent("its branch or pull request has moved on");

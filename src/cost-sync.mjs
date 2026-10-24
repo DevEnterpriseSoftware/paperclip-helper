@@ -675,6 +675,110 @@ export function createCostSync(ctx) {
     }
   }
 
+  // One subscription run's figures, as the audit shows them: its tokens, the cost it
+  // reported, what its tokens cost at list price, what cost sync posts for it now
+  // (posts, with its basis), and what cost sync posted for it before 1.12 (`before`):
+  // Claude's reported cost as it was, nothing for a run that reported none; Codex's
+  // tokens with the cache reads subtracted from the input a second time, cache writes
+  // as input. `detail` is the run's own record (undefined when it couldn't be read).
+  async function auditFigures(run, agent, u, detail, table) {
+    const adapter = agent.adapterType;
+    const provider = unknown(u.provider) ? PROVIDER_OF[adapter] ?? "unknown" : u.provider;
+    const tokens = splitTokens(u, adapter, detail?.resultJson?.usage);
+    const fast = adapter === "codex_local" ? (await fastModeOf(run, agent, detail)) === true : false;
+    const priced = tokenPrice(u, agent, adapter, table, run.finishedAt, detail);
+    const tokenUsd = priced.usd !== undefined ? priced.usd * (fast ? 2 : 1) : null;
+    const raw = typeof u.cacheAdjustedCostUsd === "number" ? u.cacheAdjustedCostUsd : u.costUsd;
+    const reported = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : null;
+    let posts = null;
+    let basis = "unpriced";
+    if (provider === "anthropic") ({ usd: posts, basis } = claudeCost({ reported, floor: tokenUsd }));
+    else if (reported !== null) [posts, basis] = [reported, "reported"];
+    else if (tokenUsd !== null) [posts, basis] = [tokenUsd, "estimated"];
+    let before = reported ?? 0;
+    if (provider !== "anthropic" && reported === null) {
+      const input = Math.max(0, (Number(u.inputTokens) || 0) - (Number(u.cachedInputTokens) || 0));
+      const old = tokenPrice({ ...u, inputTokens: input, rawInputIncludesCached: false, usageByModel: undefined }, agent, adapter, table, run.finishedAt, null);
+      before = old.usd !== undefined ? old.usd * (fast ? 2 : 1) : 0;
+    }
+    return { provider, tokens, tokenUsd, reported, posts, basis, before };
+  }
+
+  // `costs --compare-days N`: the last N days against the N days before, read-only.
+  // Both periods are costed twice, as cost sync posts them now and as it did before
+  // 1.12, so a week-on-week change splits into usage (the change at today's costing)
+  // and costing (what today's costing adds to the earlier period). What the Costs page
+  // actually shows depends on when 1.12 started posting: before, the earlier period's
+  // posts are the "before 1.12" figure; after, today's.
+  async function compare({ print = console.log, days = 7 } = {}) {
+    const { companyIds = [] } = await ctx.identity();
+    const table = prices();
+    const nowMs = Date.now();
+    const edges = [nowMs - 2 * days * 86_400_000, nowMs - days * 86_400_000, nowMs];
+    const money = (n) => `$${n.toFixed(2)}`;
+    const mtok = (n) => `${(n / 1e6).toFixed(1)}M`;
+    const day = (ms) => new Date(ms).toISOString().slice(0, 10);
+    const signedMoney = (n) => `${n < 0 ? "-" : "+"}${money(Math.abs(n))}`;
+    for (const companyId of companyIds) {
+      const company = await api.request("GET", `/api/companies/${companyId}`).catch(() => null);
+      const agents = await agentsOf(companyId);
+      const runs = await api.request("GET", `/api/companies/${companyId}/heartbeat-runs?limit=${RUN_WINDOW}`);
+      const list = Array.isArray(runs) ? runs : [];
+      const oldest = list.reduce((m, r) => Math.min(m, Date.parse(r.finishedAt ?? r.createdAt ?? "") || Infinity), Infinity);
+      const picked = [];
+      for (const run of list) {
+        const at = Date.parse(run.finishedAt ?? "");
+        if (!TERMINAL_RUN.has(run.status) || !(at >= edges[0] && at < edges[2])) continue;
+        const u = run.usageJson;
+        if (u?.billingType !== "subscription_included") continue;
+        const agent = await agentOf(agents, run.agentId);
+        if (!agent || !config.costSyncAdapters.includes(agent.adapterType)) continue;
+        picked.push({ run, agent, u, period: at < edges[1] ? 0 : 1 });
+      }
+      for (let i = 0; i < picked.length; i += 6) {
+        await Promise.all(picked.slice(i, i + 6).map(async (p) => {
+          p.detail = await recordOf(`/api/heartbeat-runs/${p.run.id}`);
+        }));
+      }
+      // provider → [earlier, later], each { runs, tokens, before, now }
+      const rows = new Map();
+      const empty = () => ({ runs: 0, input: 0, cacheRead: 0, output: 0, before: 0, now: 0 });
+      for (const p of picked) {
+        const f = await auditFigures(p.run, p.agent, p.u, p.detail, table);
+        const pair = rows.get(f.provider) ?? [empty(), empty()];
+        const r = pair[p.period];
+        r.runs += 1;
+        r.input += f.tokens.input + f.tokens.cacheWrite;
+        r.cacheRead += f.tokens.cacheRead;
+        r.output += f.tokens.output;
+        r.before += f.before;
+        r.now += f.posts ?? 0;
+        rows.set(f.provider, pair);
+      }
+      print(`${company?.name ?? companyId}: subscription runs, ${day(edges[0])} to ${day(edges[1])} against ${day(edges[1])} to ${day(edges[2])} (${days} days each)`);
+      if (Number.isFinite(oldest) && list.length >= RUN_WINDOW && oldest > edges[0]) {
+        print(`  Paperclip lists only the latest ${RUN_WINDOW} runs, back to ${new Date(oldest).toISOString().slice(0, 16)}Z: the earlier period is incomplete, so the comparison isn't meaningful. Try fewer days.`);
+      }
+      if (!rows.size) print("  No subscription runs in either period.");
+      const total = [empty(), empty()];
+      for (const [provider, [a, b]] of rows) {
+        for (const [i, r] of [a, b].entries()) for (const k of Object.keys(r)) total[i][k] += r[k];
+        print(`  ${provider}:`);
+        print(`    earlier: ${a.runs} runs, ${mtok(a.input)} input, ${mtok(a.cacheRead)} cache reads, ${mtok(a.output)} output; costed as before 1.12 ${money(a.before)}, as now ${money(a.now)}`);
+        print(`    later:   ${b.runs} runs, ${mtok(b.input)} input, ${mtok(b.cacheRead)} cache reads, ${mtok(b.output)} output; costed as before 1.12 ${money(b.before)}, as now ${money(b.now)}`);
+      }
+      if (rows.size) {
+        const [a, b] = total;
+        const usage = b.now - a.now;
+        const costing = a.now - a.before;
+        print(`  If the earlier period was posted before 1.12 and the later one with it, the Costs page moves ${signedMoney(b.now - a.before)} (${money(a.before)} → ${money(b.now)}):`);
+        print(`    usage:   ${signedMoney(usage)}   (the change at today's costing, ${money(a.now)} → ${money(b.now)})`);
+        print(`    costing: ${signedMoney(costing)}   (what today's costing adds to the earlier period's runs)`);
+        print(`  If both periods were posted with 1.12, the whole change is usage: ${signedMoney(usage)}.`);
+      }
+    }
+  }
+
   // `costs --audit`: checks the figures. Changes nothing. For every subscription
   // run of the synced adapters that finished in the last `days` days, per agent:
   // tokens, the cost reported, what the tokens cost at list price, and what cost
@@ -720,19 +824,8 @@ export function createCostSync(ctx) {
       let unreadable = 0;
       for (const { run, agent, u, detail } of picked) {
         const adapter = agent.adapterType;
-        const provider = unknown(u.provider) ? PROVIDER_OF[adapter] ?? "unknown" : u.provider;
         if (detail === undefined) unreadable += 1;
-        const tokens = splitTokens(u, adapter, detail?.resultJson?.usage);
-        const fast = adapter === "codex_local" ? (await fastModeOf(run, agent, detail)) === true : false;
-        const priced = tokenPrice(u, agent, adapter, table, run.finishedAt, detail);
-        const tokenUsd = priced.usd !== undefined ? priced.usd * (fast ? 2 : 1) : null;
-        const raw = typeof u.cacheAdjustedCostUsd === "number" ? u.cacheAdjustedCostUsd : u.costUsd;
-        const reported = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : null;
-        let posts = null;
-        let basis = "unpriced";
-        if (provider === "anthropic") ({ usd: posts, basis } = claudeCost({ reported, floor: tokenUsd }));
-        else if (reported !== null) [posts, basis] = [reported, "reported"];
-        else if (tokenUsd !== null) [posts, basis] = [tokenUsd, "estimated"];
+        const { provider, tokens, tokenUsd, reported, posts, basis } = await auditFigures(run, agent, u, detail, table);
 
         const key = agent.name ?? run.agentId;
         const a = byAgent.get(key) ?? { adapter, runs: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, reported: 0, tokenUsd: 0, posts: 0, noCost: 0, low: 0, unpriced: 0 };
@@ -820,6 +913,7 @@ export function createCostSync(ctx) {
     preview,
     sessions,
     audit,
+    compare,
     evaluate,
     stats,
     start() {

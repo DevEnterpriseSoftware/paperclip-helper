@@ -266,7 +266,7 @@ function Install-PaperclipHelper {
     'WATCHDOG_RETRY_DEFERRED', 'WATCHDOG_RELEASE_HOLDS', 'WATCHDOG_CLEAR_DEAD_LINKS', 'WATCHDOG_ROUTE_QUESTIONS',
     'WATCHDOG_CI_RUNS', 'WATCHDOG_CI_RERUN_JOBS', 'WATCHDOG_CI_RERUN_MAX', 'WATCHDOG_DELIVER_ANSWERS', 'WATCHDOG_RETURN_ESCALATED_REVIEWS',
     'WATCHDOG_CANCELLED_BLOCKERS', 'WATCHDOG_RESUME_SWEEP', 'WATCHDOG_RESUME_SWEEP_LIMIT', 'WATCHDOG_RESUME_SETTLE_MIN',
-    'WATCHDOG_USAGE_LIMIT_PAUSE', 'WATCHDOG_LIMIT_RESUME_GRACE_MIN', 'WATCHDOG_LIMIT_TIME_ZONE', 'WATCHDOG_NOTIFY_ISSUE', 'WATCHDOG_STAGES_WIPE', 'COST_SYNC', 'COST_SYNC_SINCE')
+    'WATCHDOG_USAGE_LIMIT_PAUSE', 'WATCHDOG_LIMIT_RESUME_GRACE_MIN', 'WATCHDOG_LIMIT_TIME_ZONE', 'WATCHDOG_NOTIFY_ISSUE', 'WATCHDOG_STAGES_WIPE', 'WATCHDOG_REPORT_READY_TO_MERGE', 'COST_SYNC', 'COST_SYNC_SINCE')
 
   # Old names of managed settings: read once (Pick), then dropped from .env.
   $Retired = @('WATCHDOG_LIMIT_PAUSE')
@@ -618,6 +618,7 @@ $network
   $s.WATCHDOG_LIMIT_TIME_ZONE = Pick 'WATCHDOG_LIMIT_TIME_ZONE' ''
   $s.WATCHDOG_NOTIFY_ISSUE = Pick 'WATCHDOG_NOTIFY_ISSUE' ''
   $s.WATCHDOG_STAGES_WIPE = Pick 'WATCHDOG_STAGES_WIPE' 'true'
+  $s.WATCHDOG_REPORT_READY_TO_MERGE = Pick 'WATCHDOG_REPORT_READY_TO_MERGE' 'false'
   Say 'Paperclip loses track of work in a few known ways: a hand-off whose wake is dropped, blockers that'
   Say 'finish without anything picking the issue up, holds nobody can release. Every minute the watchdog'
   Say 'looks for these and wakes the right agent. Below, each check can be turned off on its own.'
@@ -661,6 +662,8 @@ $network
     Say 'When a plan hits its usage limit (Claude or Codex), every agent on it fails its next run, and Paperclip keeps retrying them.'
     $s.WATCHDOG_USAGE_LIMIT_PAUSE = if (Confirm 'Pause the agents on a plan that hits its usage limit (each once idle) and resume them when it resets?' (Truthy $s.WATCHDOG_USAGE_LIMIT_PAUSE)) { 'true' } else { 'false' }
     if (Truthy $s.WATCHDOG_USAGE_LIMIT_PAUSE) { Set-LimitZone }
+    Say 'Once every reviewer has approved, an issue waits at your approval stage, and nothing says its PR can be queued.'
+    $s.WATCHDOG_REPORT_READY_TO_MERGE = if (Confirm 'Tell you once such a PR is clean and green (on the issue; needs the GitHub token)?' (Truthy $s.WATCHDOG_REPORT_READY_TO_MERGE)) { 'true' } else { 'false' }
     Say 'Some things only you can settle: a usage-limit pause, wiped review stages, a merge-queue drop.'
     Say 'The helper always logs them; it can also comment on an issue you watch (in the same company).'
     Say 'Pick one assigned to a person or to nobody: a comment wakes an agent assignee.'

@@ -258,3 +258,18 @@ test("dropReason, classifyDrop and latestGroupRuns", () => {
   assert.equal(classifyDrop([run("x", 1, "success", [{ name: "a", conclusion: "success" }])]).kind, "timeout");
   assert.equal(classifyDrop([]).kind, "timeout");
 });
+
+test("merge-group jobs that failed setting up their runner, before checkout: the board is told, the PR isn't sent back or queued again", async (t) => {
+  const env = await queueEnv(t, { RELAY_REQUEUE_ON_INFRA_DROP: "true" });
+  const run = groupRun(env.gh, { conclusion: "failure", jobs: [["build", "failure"], ["test", "failure"]] });
+  for (const job of run.jobs) {
+    Object.assign(job, { runner_name: "builder-2", steps: [{ name: "Set up runner", conclusion: "failure" }, { name: "Run actions/checkout@v4", conclusion: "skipped" }] });
+  }
+  await env.relay.handle("pull_request", { ...dequeued(), action: "enqueued", sender: { login: "Owner" } }); // a person queued it
+  const answer = await drop(env);
+  assert.equal(answer.drop, "runner");
+  assert.equal(env.db.patches.length, 0, "not sent back");
+  assert.equal(env.gh.graphql.length, 0, "not queued again: it would fail the same way");
+  const [note] = env.db.comments.filter((c) => c.issueId === env.issue.id);
+  assert.match(note.body, /^PR #8 was dropped from the merge queue because its merge-group jobs failed setting up runner `builder-2` \("Set up runner"\), before checkout: none of the PR's code ran\. Fix the runner, then queue it again\./);
+});

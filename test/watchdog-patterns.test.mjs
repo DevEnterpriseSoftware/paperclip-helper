@@ -822,3 +822,86 @@ test("an issue you decided on meanwhile isn't returned", async (t) => {
   assert.ok(env.logs.some((l) => /changed before it could be returned/.test(l.msg)));
   assert.equal(env.db.patches.length, 0);
 });
+
+// ---------------------------------------------------------------- 11. runner problems
+
+// A job whose runner failed to set it up ("Set up runner", the job-started hook), before checkout.
+const setupFailed = (name, runner = "builder-2", id = Math.floor(Math.random() * 1e9)) => ({
+  id, name, conclusion: "failure", runner_name: runner,
+  steps: [{ name: "Set up runner", conclusion: "failure" }, { name: "Run actions/checkout@v4", conclusion: "skipped" }, { name: "Build", conclusion: "skipped" }],
+});
+
+// Three agents, each waiting on its own PR's run, all of which failed setting up the same runner.
+function runnerDown(env, prs = 3) {
+  env.gh.runs["org/app"] = {};
+  const out = [];
+  for (let i = 0; i < prs; i += 1) {
+    const a = agent(env.db, `Agent ${i + 1}`);
+    const id = 39600000000 + i;
+    const issue = { id: uuid(), identifier: `ACM-${300 + i}`, companyId: ids.company, status: "in_progress", assigneeAgentId: a.id, updatedAt: minutesAgo(60) };
+    env.db.issues.push(issue);
+    env.db.comments.push({ issueId: issue.id, identifier: issue.identifier, body: `Pushed. Waiting on run ${id}.`, authorAgentId: a.id, createdAt: minutesAgo(60) });
+    env.db.issueRuns[issue.id] = [{ runId: uuid(), agentId: a.id, status: "succeeded", createdAt: minutesAgo(70), startedAt: minutesAgo(70), finishedAt: minutesAgo(60) }];
+    env.gh.runs["org/app"][id] = {
+      id, name: "ci", status: "completed", conclusion: "failure", run_attempt: 1, head_branch: `acm-${300 + i}`, head_sha: `sha${i}`,
+      created_at: minutesAgo(50 - i), updated_at: minutesAgo(40 - i), html_url: `https://github.com/org/app/actions/runs/${id}`,
+      pull_requests: [{ number: 400 + i }], jobs: [setupFailed("build", "builder-2", id * 10), setupFailed("test", "builder-2", id * 10 + 1)],
+    };
+    out.push({ agent: a, issue, id });
+  }
+  env.gh.annotations[(39600000000) * 10] = [{ annotation_level: "failure", message: "Runner quarantined: machine verification failed (TPM attestation)" }];
+  return out;
+}
+
+test("runs that failed setting up the same runner on three PRs: one board note, and each agent told it isn't their PR", async (t) => {
+  const env = await watchdogEnv(t, { WATCHDOG_NOTIFY_ISSUE: "ACM-1", WATCHDOG_CI_RERUN_JOBS: "build|test" });
+  env.db.issues.push({ id: uuid(), identifier: "ACM-1", companyId: ids.company, status: "todo", title: "Board notes", updatedAt: minutesAgo(600) });
+  const waiting = runnerDown(env);
+  await env.watchdog.tick();
+
+  const notes = env.db.comments.filter((c) => c.identifier === "ACM-1");
+  assert.equal(notes.length, 1, "one board note for the runner");
+  assert.match(
+    notes[0].body,
+    /^Runner `builder-2` \(org\/app\) fails jobs in "Set up runner", before checkout: 3 runs on 3 pull requests have failed that way since .*Z \(PR #40\d, PR #40\d, PR #40\d\)\. First error: Runner quarantined: machine verification failed \(TPM attestation\)\./,
+  );
+  for (const { agent: a, issue } of waiting) {
+    const [told] = helperComments(env.db, issue);
+    assert.ok(told, `${a.name} is told`);
+    assert.ok(told.body.startsWith(`[@${a.name}](agent://${a.id}) the CI run you were waiting on failed before checkout, on runner \`builder-2\``));
+    assert.match(told.body, /Not your PR: other pull requests' jobs on that runner fail the same way/);
+    assert.doesNotMatch(told.body, /Failed jobs:/);
+  }
+  assert.equal(env.gh.reruns.length, 0, "nothing re-run, flaky pattern or not");
+  assert.equal(env.watchdog.stats.runnerProblems, 1);
+
+  env.later(10);
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.filter((c) => c.identifier === "ACM-1").length, 1, "once");
+});
+
+test("a single PR's run that failed setting up its runner gets the usual report", async (t) => {
+  const env = await watchdogEnv(t, { WATCHDOG_NOTIFY_ISSUE: "ACM-1" });
+  env.db.issues.push({ id: uuid(), identifier: "ACM-1", companyId: ids.company, status: "todo", title: "Board notes", updatedAt: minutesAgo(600) });
+  const [{ issue }] = runnerDown(env, 1);
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.filter((c) => c.identifier === "ACM-1").length, 0);
+  const [told] = helperComments(env.db, issue);
+  assert.match(told.body, /the CI run you were waiting on has finished/);
+  assert.match(told.body, /\*\*failure\*\*/);
+});
+
+test("failedBeforeCheckout and setupFailureRunner", async () => {
+  const { failedBeforeCheckout, setupFailureRunner } = await import("../src/ci-runs.mjs");
+  assert.equal(failedBeforeCheckout(setupFailed("build")), true);
+  assert.equal(failedBeforeCheckout({ ...setupFailed("build"), steps: [{ name: "Set up job", conclusion: "failure" }] }), true);
+  assert.equal(failedBeforeCheckout({ ...setupFailed("build"), runner_name: null }), false, "no runner named");
+  assert.equal(
+    failedBeforeCheckout({ ...setupFailed("build"), steps: [{ name: "Set up runner", conclusion: "success" }, { name: "Run actions/checkout@v4", conclusion: "success" }, { name: "Build", conclusion: "failure" }] }),
+    false,
+    "the PR's own step failed",
+  );
+  assert.equal(setupFailureRunner([setupFailed("a"), setupFailed("b"), { name: "c", conclusion: "success" }]), "builder-2");
+  assert.equal(setupFailureRunner([setupFailed("a"), { name: "b", conclusion: "failure", steps: [{ name: "Test", conclusion: "failure" }], runner_name: "builder-2" }]), null, "another job failed in its own code");
+  assert.equal(setupFailureRunner([setupFailed("a", "r1"), setupFailed("b", "r2")]), null, "two runners");
+});
