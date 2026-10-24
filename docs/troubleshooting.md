@@ -9,6 +9,7 @@ Start with `pch status` and, for a stuck issue, `pch why ISSUE`.
 | `Paperclip rejected the helper's board key` | It expired or was revoked. Run `pch login`. |
 | `config: …` lines, and the container restarts | A setting is missing or invalid. The line names it. |
 | Deliveries show 401 in GitHub | The webhook secret doesn't match `GITHUB_WEBHOOK_SECRET`. |
+| A delivery shows **202** with `still working after 8s` | The relay was still looking for the PR's issues when GitHub's 10 seconds were nearly up, so it answered and carried on. The log's `relay: handled` (or `relay: failed`) line for that delivery id says what it did. A failed one can be redelivered. |
 | A delivery failed with `Task is paused` | Paperclip refuses comments on a paused task. Resume it, then **Redeliver** in GitHub. |
 | Deliveries show `names no ACM issue` | The PR's title, branch and body contain no issue identifier. |
 | A **`/changes` or `/approve` did nothing** you can see | It reached the relay, but the PR's issue wasn't waiting on you, so your text was copied to the first issue the PR names as a comment. With a GitHub token the relay replies on the PR saying which issue and why. Record the decision with `pch changes ISSUE "…"`. |

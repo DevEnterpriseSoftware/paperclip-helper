@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { setup, sign } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
-import { createRelay, isWorkProductOf, verifySignature } from "../src/relay.mjs";
+import { createRelay } from "../src/relay.mjs";
+import { isWorkProductOf } from "../src/decisions.mjs";
+import { verifySignature } from "../src/webhook-server.mjs";
 import { findIdentifiers } from "../src/identifiers.mjs";
 import { createStateStore } from "../src/store.mjs";
 import { signed, SIGNATURE } from "../src/util.mjs";
@@ -11,7 +13,8 @@ const SECRET = "test-secret";
 // Most of these check the notes as comments (RELAY_QUIET_NOTES=false); quiet-notes.test.mjs checks the document.
 const RELAY_ENV = { GITHUB_WEBHOOK_SECRET: SECRET, GITHUB_OWNER_LOGIN: "Owner", GITHUB_REPOS: "org/app", RELAY_PORT: "0", RELAY_QUIET_NOTES: "false" };
 
-const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user } };
+// A stage waiting on you remembers who handed the work in (returnAssignee), as Paperclip's does.
+const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user }, returnAssignee: { type: "agent", agentId: "a-implementer" } };
 
 // Parent ACM-1 (named by the PR) with child ACM-2, whose approval waits on the operator.
 function seed(db) {
@@ -42,10 +45,10 @@ const pr = (extra = {}) => ({
 });
 const owner = { login: "owner" };
 
-async function relayEnv(t, extra = {}) {
+async function relayEnv(t, extra = {}, options = {}) {
   const env = await setup({ env: { ...RELAY_ENV, ...extra } });
   t.after(env.close);
-  const relay = createRelay(env.ctx, env.state);
+  const relay = createRelay(env.ctx, env.state, options);
   return { ...env, relay };
 }
 
@@ -91,7 +94,7 @@ test("a merge that only clears your escalated review also approves your approval
   // moved the issue to the approval stage, again the operator's, and left it in review.
   const { relay, db } = await relayEnv(t);
   const { child } = seed(db);
-  child.executionState = { status: "pending", currentStageType: "review", currentParticipant: { type: "user", userId: ids.user } };
+  child.executionState = { ...waitingOnMe, currentStageType: "review" };
   child.nextStages = [{ type: "approval", participant: { type: "user", userId: ids.user } }];
   const result = await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
   assert.deepEqual(result, { identifier: "ACM-2", action: "approve", status: "done", stages: ["review", "approval"] });
@@ -103,7 +106,7 @@ test("a merge that only clears your escalated review also approves your approval
 test("a merge stops at a stage that is someone else's, and says so", async (t) => {
   const { relay, db, logs } = await relayEnv(t);
   const { child } = seed(db);
-  child.executionState = { status: "pending", currentStageType: "review", currentParticipant: { type: "user", userId: ids.user } };
+  child.executionState = { ...waitingOnMe, currentStageType: "review" };
   child.nextStages = [{ type: "approval", participant: { type: "agent", agentId: "a-approver" } }];
   const result = await relay.handle("pull_request", { action: "closed", pull_request: pr(), repository: repo, sender: owner });
   assert.equal(db.patches.length, 1);
@@ -160,7 +163,8 @@ test("reviews: request changes, /approve, plain text, and a GitHub approval", as
   assert.equal(db.patches.at(-1).issueId, child.id);
   assert.match(db.patches.at(-1).body.comment, /^Changes requested on PR #8.*\n\nRename it\n\nInline comments, if any: `gh api repos\/Org\/App\/pulls\/8\/reviews\/55\/comments`/s);
 
-  child.status = "in_review";
+  // Resubmitted: back in review, the stage waiting on you again.
+  Object.assign(child, { status: "in_review", executionState: waitingOnMe });
   const approve = await relay.handle("pull_request_review", review("commented", "/approve ship it"));
   assert.equal(approve.action, "approve");
   assert.match(db.patches.at(-1).body.comment, /\n\nship it\n/);
@@ -496,6 +500,56 @@ test("Paperclip failing while the relay looks for the issue fails the delivery, 
   // The delivery was forgotten on disk too.
   assert.equal(createStateStore(env.ctx.config.stateFile).deliveries.has("d-down"), false);
   const redelivered = await deliver();
+  assert.equal(redelivered.status, 200);
+  assert.equal(child.status, "done");
+});
+
+test("HTTP: a slow delivery is answered before GitHub gives up, and finishes after", async (t) => {
+  const env = await relayEnv(t, {}, { answerWithinMs: 100 });
+  const { relay, db, fake } = env;
+  const { child } = seed(db);
+  const port = await relay.start();
+  t.after(() => relay.stop());
+  const payload = JSON.stringify({ action: "closed", pull_request: pr(), repository: repo, sender: owner });
+  const deliver = (delivery) =>
+    fetch(`http://127.0.0.1:${port}/hooks/github`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-github-event": "pull_request", "x-github-delivery": delivery, "x-hub-signature-256": sign(SECRET, payload) },
+      body: payload,
+    });
+
+  // Paperclip takes its time over the PR's issue: GitHub gets a 202 meanwhile.
+  fake.slow("GET", /^\/api\/issues\/ACM-1$/, 400);
+  const started = Date.now();
+  const answer = await deliver("slow-1");
+  assert.equal(answer.status, 202);
+  assert.ok(Date.now() - started < 350, "answered before the work finished");
+  assert.equal((await answer.json()).accepted, "slow-1");
+  assert.equal(child.status, "in_review", "still working");
+  // A redelivery while it's still going changes nothing, and isn't remembered yet.
+  const meanwhile = await deliver("slow-1");
+  assert.equal(meanwhile.status, 409);
+  assert.equal((await meanwhile.json()).inProgress, "slow-1");
+  // The watchdog saves the same state file every tick: a crash after it can still be redelivered.
+  env.state.touch();
+  env.state.save();
+  assert.equal(createStateStore(env.ctx.config.stateFile).deliveries.has("slow-1"), false, "a crash now can be redelivered");
+  await relay.idle();
+  assert.equal(child.status, "done");
+  assert.equal(db.patches.length, 1);
+  assert.equal(relay.stats.answeredLate, 1);
+  assert.equal(createStateStore(env.ctx.config.stateFile).deliveries.has("slow-1"), true);
+
+  // Slow and then failing: forgotten, on disk too, so a Redeliver tries again.
+  child.status = "in_review";
+  child.executionState = waitingOnMe;
+  fake.slow("GET", /^\/api\/issues\/ACM-1$/, 400);
+  fake.fail("PATCH", /^\/api\/issues\/ACM-2$/, 500);
+  assert.equal((await deliver("slow-2")).status, 202);
+  await relay.idle();
+  assert.equal(relay.stats.failed, 1);
+  assert.equal(createStateStore(env.ctx.config.stateFile).deliveries.has("slow-2"), false);
+  const redelivered = await deliver("slow-2");
   assert.equal(redelivered.status, 200);
   assert.equal(child.status, "done");
 });

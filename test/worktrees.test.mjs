@@ -82,7 +82,7 @@ test("worktrees previews: what Paperclip can close, what would lose work, what i
   const h = await setup();
   try {
     seed(h.db);
-    const lines = await captureOutput(() => cmd.worktrees(h.ctx, []));
+    const lines = await captureOutput(() => cmd.worktrees(h.ctx));
     const text = lines.join("\n");
     assert.match(text, /ACM: 10 open workspaces, 6 of them worktrees of issues finished 1\+ days ago/);
     assert.match(text, /Paperclip can close 2 and remove their worktrees:/);
@@ -108,7 +108,7 @@ test("worktrees --apply closes the clean ones and shows why a clean-up failed", 
   try {
     const s = seed(h.db);
     s.cancelled.ws.closeFails = "'/x/.paperclip/worktrees/ACM-2' contains modified or untracked files, use --force to delete it";
-    const lines = await captureOutput(() => cmd.worktrees(h.ctx, ["--apply"]));
+    const lines = await captureOutput(() => cmd.worktrees(h.ctx, { apply: true }));
     process.exitCode = 0;
     const text = lines.join("\n");
     assert.deepEqual(new Set(h.db.workspaceCloses), new Set([s.clean.ws.id, s.cancelled.ws.id]));
@@ -129,7 +129,7 @@ test("worktrees --include-untracked --include-unmerged --min-days=0 widen what i
   const h = await setup();
   try {
     const s = seed(h.db);
-    await captureOutput(() => cmd.worktrees(h.ctx, ["--apply", "--include-untracked", "--include-unmerged", "--min-days=0"]));
+    await captureOutput(() => cmd.worktrees(h.ctx, { apply: true, includeUntracked: true, includeUnmerged: true, minDays: 0 }));
     for (const k of ["clean", "cancelled", "untracked", "unmerged", "recent"]) assert.equal(s[k].ws.status, "archived", k);
     for (const k of ["dirty", "open", "held", "failedBefore", "shared"]) assert.notEqual(s[k].ws.status, "archived", k);
   } finally {
@@ -142,12 +142,11 @@ test("worktrees leaves a workspace another open issue still uses, and rejects un
   try {
     const { ws } = add(h.db, "ACM-1");
     h.db.issues.push({ id: uuid(), identifier: "ACM-2", companyId: ids.company, status: "todo", executionWorkspaceId: ws.id });
-    const lines = await captureOutput(() => cmd.worktrees(h.ctx, ["--apply"]));
+    const lines = await captureOutput(() => cmd.worktrees(h.ctx, { apply: true }));
     assert.match(lines.join("\n"), /won't close 1:\n    ACM-1 .*still linked to an open issue/);
     assert.match(lines.join("\n"), /Nothing to close\./);
     assert.deepEqual(h.db.workspaceCloses, []);
-    await assert.rejects(cmd.worktrees(h.ctx, ["--force"]), /unknown option --force/);
-    await assert.rejects(cmd.worktrees(h.ctx, ["--min-days=x"]), /--min-days must be/);
+    await assert.rejects(cmd.worktrees(h.ctx, { minDays: -1 }), /--min-days must be/);
   } finally {
     await h.close();
   }
@@ -187,7 +186,7 @@ test("worktrees asks GitHub about unmerged branches: a merged PR closes, an unme
       // Closed without merging: not delivered.
       pull(10, { state: "closed", merged_at: null, commits: 1, head: { ref: "ACM-23-branch", sha: "d" } }),
     ];
-    const lines = await captureOutput(() => cmd.worktrees(h.ctx, ["--apply"]));
+    const lines = await captureOutput(() => cmd.worktrees(h.ctx, { apply: true }));
     process.exitCode = 0;
     const text = lines.join("\n");
     assert.match(text, /ACM-21 .*\(PR #7 merged\)/);

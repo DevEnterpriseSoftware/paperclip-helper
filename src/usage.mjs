@@ -155,20 +155,3 @@ export async function readUsage(api, companyId, { since, until, agentName = null
   return { agents, runs, costs, costError, truncated };
 }
 
-// `pch usage [--days N] [--agent NAME]`: "--days=7" and "--days 7" both work.
-export function usageOptions(args) {
-  const opts = { days: 7, agent: null };
-  for (let i = 0; i < args.length; i++) {
-    const arg = String(args[i] ?? "");
-    const eq = arg.indexOf("=");
-    const flag = eq >= 0 ? arg.slice(0, eq) : arg;
-    const value = () => (eq >= 0 ? arg.slice(eq + 1) : args[++i]);
-    if (flag === "--days") opts.days = Number(value());
-    else if (flag === "--agent") {
-      opts.agent = value();
-      if (!opts.agent) throw new Error("--agent needs an agent's name, e.g. --agent Carla");
-    } else if (arg) throw new Error(`usage: pch usage [--days N] [--agent NAME] (unknown: ${arg})`);
-  }
-  if (!Number.isFinite(opts.days) || opts.days <= 0) throw new Error("--days needs a number of days, e.g. --days 7");
-  return opts;
-}

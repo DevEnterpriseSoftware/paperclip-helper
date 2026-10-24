@@ -98,7 +98,7 @@ Paperclip's API is large and mostly undocumented. Everything below was read in P
 The rule lives in `server/src/services/issue-execution-policy.ts`:
 
 - **Only the current participant can decide.** The participant of a pending review or approval stage records a decision with `PATCH /api/issues/:id { status, comment }`, **status and comment in the same request**. (live)
-  - **`done` approves.** The comment is required.
+  - **`done` approves.** The comment is required. Approving the last stage leaves `executionState` with `status: "completed"`, no current stage or participant, and `lastDecisionOutcome: "approved"` (`buildCompletedState`; main at 515ff0f).
   - **`in_progress` requests changes.** The comment is required, and the issue returns to the stage's `returnAssignee`. (live)
   - **Prior comments don't count.**
 - **Anyone else who moves the issue decides nothing.** A board user who is *not* the participant and moves it out of `in_review` just clears the execution state: no approval is recorded, and nothing returns to the engineer. That's why the helper checks `approvalWaitingOn` first.

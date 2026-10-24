@@ -414,7 +414,7 @@ if (!BASE) {
       // no process or stop record, which a process agent can't be made to leave. So
       // this checks the parts that can break: the command on an unheld issue, and the
       // resolve route's schema for exactly the body \`pch release --apply\` posts.
-      const lines = await captureOutput(() => commands.release(s.ctx, s.work.identifier ?? s.work.id, ["--apply"]));
+      const lines = await captureOutput(() => commands.release(s.ctx, s.work.identifier ?? s.work.id, { apply: true }));
       assert.match(lines.join("\n"), /no execution hold/, "release leaves an issue without a hold alone");
       const before = await s.ctx.api.request("GET", `/api/issues/${s.work.id}`);
       assert.equal(before.executionBlocker, null, "an issue nobody held has no executionBlocker");
@@ -733,7 +733,7 @@ if (!BASE) {
 
     test("pch set-model changes only the model: PATCH merges into adapterConfig", async () => {
       const newModel = `${s.oldModel}-new`;
-      const lines = await captureOutput(() => commands.setModel(s.ctx, s.oldModel, newModel, ["--apply"]));
+      const lines = await captureOutput(() => commands.setModel(s.ctx, s.oldModel, newModel, { apply: true }));
       assert.ok(lines.some((l) => l.startsWith("changed Modelled")), lines.join("\n"));
       const after = await s.ctx.api.request("GET", `/api/agents/${s.modelled.id}`);
       assert.equal(after.adapterConfig.model, newModel);

@@ -28,7 +28,7 @@ test("set-model previews, then changes only the model and keeps everything else"
   assert.match(preview.join("\n"), /would change Alpha: claude-opus-5 → claude-opus-5.5 \(effort xhigh kept\)/);
   assert.equal(a.adapterConfig.model, "claude-opus-5");
 
-  const lines = await captureOutput(() => cmd.setModel(env.ctx, "claude-opus-5", "claude-opus-5.5", ["--apply"]));
+  const lines = await captureOutput(() => cmd.setModel(env.ctx, "claude-opus-5", "claude-opus-5.5", { apply: true }));
   assert.deepEqual(a.adapterConfig, { model: "claude-opus-5.5", effort: "xhigh", env: { X: "1" } });
   assert.equal(b.adapterConfig.model, "claude-opus-5.5");
   assert.equal(c.adapterConfig.model, "claude-sonnet-5");
@@ -42,7 +42,7 @@ test("set-model flags an agent that lost settings", async (t) => {
   a.dropOnPatch = ["effort"];
   let lines;
   await assert.rejects(async () => {
-    lines = await captureOutput(() => cmd.setModel(env.ctx, "claude-opus-5", "x", ["--apply"]));
+    lines = await captureOutput(() => cmd.setModel(env.ctx, "claude-opus-5", "x", { apply: true }));
   }, /need checking/);
 });
 
@@ -240,7 +240,7 @@ test("release --apply reconciles the held run and delivers the saved messages", 
   const env = await setup();
   t.after(env.close);
   const { issue, runId, actionId } = heldIssue(env);
-  const lines = await captureOutput(() => cmd.release(env.ctx, "ACM-52", ["--apply"]));
+  const lines = await captureOutput(() => cmd.release(env.ctx, "ACM-52", { apply: true }));
   const [res] = env.db.resolutions;
   assert.equal(res.body.actionId, actionId);
   assert.equal(res.body.outcome, "restored");
@@ -261,12 +261,12 @@ test("release refuses a still-running run, a bad outcome, and an issue without a
   t.after(env.close);
   const { issue } = heldIssue(env);
   env.db.issueRuns[issue.id][0].status = "running";
-  await assert.rejects(cmd.release(env.ctx, "ACM-52", ["--apply"]), /Not releasing: the run is still running/);
-  await assert.rejects(cmd.release(env.ctx, "ACM-52", ["--outcome=maybe"]), /--outcome must be one of/);
+  await assert.rejects(cmd.release(env.ctx, "ACM-52", { apply: true }), /Not releasing: the run is still running/);
+  await assert.rejects(cmd.release(env.ctx, "ACM-52", { outcome: "maybe" }), /--outcome must be one of/);
   await assert.rejects(cmd.release(env.ctx, undefined), /usage: pch release/);
   assert.equal(env.db.resolutions, undefined);
 
   issue.executionBlocker = null;
-  const lines = await captureOutput(() => cmd.release(env.ctx, "ACM-52", ["--apply"]));
+  const lines = await captureOutput(() => cmd.release(env.ctx, "ACM-52", { apply: true }));
   assert.match(lines.join("\n"), /no execution hold/);
 });

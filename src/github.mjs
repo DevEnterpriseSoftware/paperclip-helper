@@ -18,6 +18,11 @@
 // whatever keeps that file fresh replaces it without the helper restarting.
 
 import fs from "node:fs";
+import { signed } from "./util.mjs";
+
+// Ends every comment the helper writes on a PR, so the relay doesn't copy its
+// own comments back to Paperclip when GitHub delivers them as webhooks.
+export const HELPER_MARK = "<!-- paperclip-helper -->";
 
 export class GitHubError extends Error {
   constructor(message, { status = 0, method, path, retryAfter = null } = {}) {
@@ -185,6 +190,8 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch, sleep 
     // GitHub is still working it out).
     pull: (repo, number) => request("GET", `/repos/${repo}/pulls/${number}`),
     comment: (repo, number, body) => request("POST", `/repos/${repo}/issues/${number}/comments`, { body }),
+    // The helper's own comment: signed, and marked so the relay ignores it when it comes back.
+    helperComment: (repo, number, text) => request("POST", `/repos/${repo}/issues/${number}/comments`, { body: `${signed(text)}\n\n${HELPER_MARK}` }),
     // GitHub Actions, for the watchdog's CI-run check (needs "Actions: read"; a re-run "read and write").
     // One workflow run: status, conclusion, run_attempt, head_sha, updated_at, pull_requests, html_url.
     workflowRun: (repo, id) => request("GET", `/repos/${repo}/actions/runs/${id}`),

@@ -16,6 +16,7 @@ import { createRelay } from "./relay.mjs";
 import { createWatchdog } from "./watchdog.mjs";
 import { createCostSync } from "./cost-sync.mjs";
 import * as cmd from "./commands.mjs";
+import { parseCommandLine, SPECS } from "./args.mjs";
 
 const HEARTBEAT_MS = 30_000;
 
@@ -124,51 +125,53 @@ async function runService(ctx) {
 }
 
 async function main() {
-  const [command, arg, ...rest] = process.argv.slice(2);
+  const [command = "run", ...words] = process.argv.slice(2);
+  let parsed;
+  try {
+    parsed = parseCommandLine(command, words);
+  } catch (err) {
+    console.error(Object.hasOwn(SPECS, command) ? err.message : `${err.message}\n\n${cmd.USAGE}`);
+    process.exit(2);
+  }
+  if (parsed.help) return console.log(parsed.usage);
+  const { args: a, options: o, given } = parsed;
   const ctx = createContext();
-  const text = rest.join(" ").trim();
-  const flags = [arg, ...rest].filter((x) => x?.startsWith("--"));
 
   const commands = {
     run: () => runService(ctx),
     login: () => cmd.login(ctx),
     revoke: () => cmd.revoke(ctx),
-    check: () => cmd.check(ctx, arg),
-    why: () => cmd.why(ctx, [arg, ...rest].find((x) => x && !x.startsWith("--")), { prompt: flags.includes("--prompt") }),
+    check: () => cmd.check(ctx, a.issue),
+    why: () => cmd.why(ctx, a.issue, { prompt: o.prompt }),
     blocked: () => cmd.blocked(ctx),
-    approve: () => cmd.decide(ctx, "approve", arg, text),
-    changes: () => cmd.decide(ctx, "changes", arg, text),
-    comment: () => cmd.comment(ctx, arg, text),
-    answer: () => cmd.answer(ctx, arg, rest[0], rest.slice(1).join(" ").trim()),
-    release: () => cmd.release(ctx, [arg, ...rest].find((x) => x && !x.startsWith("--")), flags),
-    workspace: () => cmd.workspace(ctx, [arg, ...rest].find((x) => x && !x.startsWith("--")), flags),
-    worktrees: () => cmd.worktrees(ctx, flags),
-    costs: () => cmd.costs(ctx, [arg, ...rest].filter(Boolean)),
-    usage: () => cmd.usage(ctx, [arg, ...rest].filter(Boolean)),
+    approve: () => cmd.decide(ctx, "approve", a.issue, a.text),
+    changes: () => cmd.decide(ctx, "changes", a.issue, a.text),
+    comment: () => cmd.comment(ctx, a.issue, a.text),
+    answer: () => cmd.answer(ctx, a.issue, a.card, a.text),
+    release: () => cmd.release(ctx, a.issue, o),
+    workspace: () => cmd.workspace(ctx, a.issue, o),
+    worktrees: () => cmd.worktrees(ctx, o),
+    costs: () => cmd.costs(ctx, { ...o, given }),
+    usage: () => cmd.usage(ctx, o),
     models: () => cmd.models(ctx),
-    "set-model": () => cmd.setModel(ctx, arg, rest.filter((r) => !r.startsWith("--"))[0], flags),
+    "set-model": () => cmd.setModel(ctx, a.from, a.to, o),
     status: () => cmd.status(ctx),
     health: () => cmd.health(ctx),
-    probe: () => cmd.probe(ctx, arg),
+    probe: () => cmd.probe(ctx, a.url),
     prefixes: () => cmd.prefixes(ctx),
     secret: () => cmd.secret(),
     update: () => cmd.update(),
-    wrapper: () => process.stdout.write(cmd.wrapperScript(arg)),
+    wrapper: () => process.stdout.write(cmd.wrapperScript(a.kind)),
     version: () => console.log(VERSION),
     help: () => console.log(cmd.USAGE),
   };
   commands["--help"] = commands["-h"] = commands.help;
   commands["--version"] = commands.version;
 
-  const run = commands[command ?? "run"];
-  if (!run) {
-    console.error(`Unknown command "${command}".\n\n${cmd.USAGE}`);
-    process.exit(2);
-  }
-  if (command && command !== "run" && ctx.problems.length) {
+  if (command !== "run" && ctx.problems.length) {
     for (const p of ctx.problems) console.error(`config: ${p}`);
   }
-  await run();
+  await commands[command]();
 }
 
 main().catch((err) => {

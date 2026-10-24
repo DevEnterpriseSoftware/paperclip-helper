@@ -7,7 +7,7 @@ import { ids, uuid } from "./fake-paperclip.mjs";
 import { pull, startFakeGitHub } from "./fake-github.mjs";
 import { createRelay } from "../src/relay.mjs";
 import { createStateStore } from "../src/store.mjs";
-import { HELPER_MARK } from "../src/conflicts.mjs";
+import { HELPER_MARK } from "../src/github.mjs";
 import { redact } from "../src/log.mjs";
 
 const RELAY_ENV = {
@@ -17,7 +17,8 @@ const RELAY_ENV = {
   RELAY_PORT: "0",
   RELAY_FIX_CONFLICTS: "true",
 };
-const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user } };
+// A stage waiting on you remembers who handed the work in (returnAssignee), as Paperclip's does.
+const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user }, returnAssignee: { type: "agent", agentId: "a-implementer" } };
 const REPO = "org/app";
 
 // ACM-1 in review and waiting on the operator; ACM-5 still with its engineer.

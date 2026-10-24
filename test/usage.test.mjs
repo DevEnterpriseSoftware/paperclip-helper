@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { captureOutput, setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import * as cmd from "../src/commands.mjs";
-import { compact, render, summarize, tokensOf, usageOptions, wakeOf } from "../src/usage.mjs";
+import { compact, render, summarize, tokensOf, wakeOf } from "../src/usage.mjs";
 
 const HOUR = 60 * 60_000;
 const ago = (h) => new Date(Date.now() - h * HOUR).toISOString();
@@ -47,7 +47,7 @@ test("pch usage prints per-agent totals, what woke them, and the agents worth a 
   const env = await setup();
   t.after(env.close);
   seed(env.db);
-  const lines = await captureOutput(() => cmd.usage(env.ctx, ["--days", "7"]));
+  const lines = await captureOutput(() => cmd.usage(env.ctx, { days: 7 }));
   const text = lines.join("\n");
   assert.match(text, /^Usage over the last 7 days/);
   assert.match(text, /^Agent\s+Runs\s+Failed\s+Input\s+Cached\s+Output\s+Cost\s+Model\s+Effort$/m);
@@ -70,11 +70,11 @@ test("--agent narrows it to one agent; an unknown name says so", async (t) => {
   const env = await setup();
   t.after(env.close);
   seed(env.db);
-  const lines = await captureOutput(() => cmd.usage(env.ctx, ["--agent=rex"]));
+  const lines = await captureOutput(() => cmd.usage(env.ctx, { agent: "rex" }));
   assert.ok(lines.some((l) => /^Rex\s+10/.test(l)));
   assert.ok(!lines.some((l) => /^Carla\s/.test(l)));
   assert.ok(lines.includes("Nothing stands out."));
-  assert.deepEqual(await captureOutput(() => cmd.usage(env.ctx, ["--agent", "Nobody"])), ["No agent called Nobody."]);
+  assert.deepEqual(await captureOutput(() => cmd.usage(env.ctx, { agent: "Nobody" })), ["No agent called Nobody."]);
 });
 
 test("one agent far above an even share of its provider's tokens is flagged", () => {
@@ -89,20 +89,14 @@ test("costs Paperclip refuses are said, not shown as $0; a refused run list is a
   t.after(env.close);
   seed(env.db);
   env.fake.fail("GET", `/api/companies/${ids.company}/costs/by-agent`, 403, { times: -1, body: { error: "Forbidden" } });
-  const lines = await captureOutput(() => cmd.usage(env.ctx, []));
+  const lines = await captureOutput(() => cmd.usage(env.ctx));
   assert.ok(lines.some((l) => /^Paperclip didn't give the costs \(.*Forbidden.*\): the Cost column is empty\.$/.test(l)));
   assert.ok(!lines.some((l) => /\$0 for subscription runs/.test(l)));
   env.fake.fail("GET", `/api/companies/${ids.company}/heartbeat-runs`, 403, { times: -1, body: { error: "Forbidden" } });
-  await assert.rejects(() => cmd.usage(env.ctx, []), /Forbidden/);
+  await assert.rejects(() => cmd.usage(env.ctx), /Forbidden/);
 });
 
-test("usageOptions, wakeOf, compact and a quiet company", () => {
-  assert.deepEqual(usageOptions([]), { days: 7, agent: null });
-  assert.deepEqual(usageOptions(["--days=3", "--agent", "Carla"]), { days: 3, agent: "Carla" });
-  assert.throws(() => usageOptions(["--days", "x"]), /--days needs a number/);
-  assert.throws(() => usageOptions(["--weeks", "2"]), /unknown: --weeks/);
-  assert.throws(() => usageOptions(["--agent"]), /--agent needs an agent's name/);
-  assert.deepEqual(usageOptions(["--agent=A=B"]), { days: 7, agent: "A=B" });
+test("wakeOf, compact and a quiet company", () => {
   assert.deepEqual(tokensOf({ usageJson: { inputTokens: 1_100, cachedInputTokens: 1_000 } }, "codex_local"), { input: 100, cached: 1_000, output: 0 });
   assert.deepEqual(tokensOf({ usageJson: { inputTokens: 100, cachedInputTokens: 1_000 } }, "codex_local"), { input: 100, cached: 1_000, output: 0 });
   assert.deepEqual(tokensOf({ usageJson: { inputTokens: 1_100, cachedInputTokens: 1_000 } }, "claude_local"), { input: 1_100, cached: 1_000, output: 0 });

@@ -25,7 +25,7 @@
 // "Checks: Read" for the annotation).
 
 import { CLOSED_STATUSES, prLabel, RELAYED_SIGNATURE, signed } from "./util.mjs";
-import { HELPER_MARK } from "./conflicts.mjs";
+import { findIdentifiers } from "./identifiers.mjs";
 import { noteToBoard } from "./board-note.mjs";
 
 export const QUEUE_BOT = "github-merge-queue[bot]";
@@ -103,7 +103,7 @@ export function dropReason(reason) {
   return "other";
 }
 
-export function createMergeQueueHandler({ ctx, state, github, identifiersOf, resolveTarget, decide, addComment, sweepConflicts }) {
+export function createMergeQueueHandler({ ctx, state, github, decisions, sweepConflicts }) {
   const { config, log, api } = ctx;
   const records = state.queue;
   const stats = { dropped: 0, sentBack: 0, noted: 0, requeued: 0, lastError: null };
@@ -164,10 +164,10 @@ export function createMergeQueueHandler({ ctx, state, github, identifiersOf, res
   // assigned (it waits on a person), else on the PR and in the board notes
   // (board-note.mjs), since a board comment wakes the issue's agent.
   async function tellBoard(repo, pr, issue, text) {
-    if (!issue.assigneeAgentId) return addComment(issue.identifier ?? issue.id, text);
+    if (!issue.assigneeAgentId) return decisions.addComment(issue.identifier ?? issue.id, text);
     if (config.dryRun) return { identifier: issue.identifier, action: "note (dry run)" };
     await github
-      .comment(repo, pr.number, `${signed(text)}\n\n${HELPER_MARK}`)
+      .helperComment(repo, pr.number, text)
       .catch((err) => log.warn("relay: could not comment on the PR", { repo, pr: pr.number, error: err.message }));
     await noteToBoard({ api, config, log }, issue.companyId, `${issue.identifier}: ${text}`, { source: "relay", signature: RELAYED_SIGNATURE });
     return { identifier: issue.identifier, action: "note on the PR" };
@@ -185,7 +185,7 @@ export function createMergeQueueHandler({ ctx, state, github, identifiersOf, res
       sweepConflicts?.(repo, pr.base?.ref);
       return { pr: number, drop: "conflict" };
     }
-    const identifiers = identifiersOf(pr);
+    const identifiers = findIdentifiers(pr, ctx.prefixes());
     if (!identifiers.length) return { ignored: `${prLabel(pr)} names no Paperclip issue` };
 
     const runs = why === "conflict" ? [] : await groupRuns(repo, pr.base?.ref, number);
@@ -197,7 +197,7 @@ export function createMergeQueueHandler({ ctx, state, github, identifiersOf, res
     if (records.has(key)) return { pr: number, drop: drop.kind, action: "skip", reason: "already handled for this merge group" };
     const out = { pr: number, drop: drop.kind, reason: payload.reason ?? null };
 
-    const target = await resolveTarget(pr, identifiers, drop.kind === "failed" ? {} : { own: true });
+    const target = await decisions.resolveTarget(pr, identifiers, drop.kind === "failed" ? {} : { own: true });
     if (!target) return { ...out, action: "skip", reason: `no Paperclip issue found for ${identifiers.join(", ")}` };
     const issue = target.issue;
     if (!target.waiting && CLOSED.has(issue.status)) return { ...out, action: "skip", reason: `${issue.identifier} is ${issue.status}` };
@@ -210,14 +210,14 @@ export function createMergeQueueHandler({ ctx, state, github, identifiersOf, res
 
     if (drop.kind === "failed") {
       const annotation = await firstAnnotation(repo, drop.jobs);
-      const result = await decide(pr, identifiers, "changes", failureBrief(pr, drop, annotation), target);
+      const result = await decisions.decide({ pr, identifiers, kind: "changes", comment: failureBrief(pr, drop, annotation), target });
       record(result);
       if (config.dryRun) return { ...out, ...result };
       stats.sentBack += 1;
       if (config.conflictPrComment) {
         const how = result.action === "changes" ? `${result.identifier} was returned to its agent with changes requested` : `a comment on ${result.identifier} asked its agent to fix it`;
         await github
-          .comment(repo, number, `${signed(`**Sent back: a merge-queue check failed.** ${how}. ${drop.run.html_url ?? ""}`.trim())}\n\n${HELPER_MARK}`)
+          .helperComment(repo, number, `**Sent back: a merge-queue check failed.** ${how}. ${drop.run.html_url ?? ""}`.trim())
           .catch((err) => log.warn("relay: could not comment on the PR", { repo, pr: number, error: err.message }));
       }
       return { ...out, identifier: result.identifier, action: result.action };

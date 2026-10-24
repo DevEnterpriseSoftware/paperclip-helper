@@ -1,12 +1,14 @@
 // Small units with no service around them: the state store's cap, the relay's
 // notes document, the price file, hold-release safety, answered cards, issue
-// paging, the GitHub client's retries, config ranges and usage counts.
+// paging, the GitHub client's retries, config ranges, usage counts, and the fake
+// Paperclip's own review decisions.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { tempDir } from "./helpers.mjs";
+import { setup, tempDir } from "./helpers.mjs";
+import { ids } from "./fake-paperclip.mjs";
 import { BoundedMap, createStateStore } from "../src/store.mjs";
 import { withEntry } from "../src/quiet-notes.mjs";
 import { loadPrices } from "../src/prices.mjs";
@@ -174,4 +176,34 @@ test("pch usage counts an interrupted run, as a failure", () => {
   const { rows } = summarize({ agents: [agent], runs: [run("succeeded"), run("interrupted"), run("running")], since: 0 });
   assert.equal(rows[0].runs, 2);
   assert.equal(rows[0].failed, 1);
+});
+
+test("the fake Paperclip decides a review as Paperclip does (issue-execution-policy.ts)", async (t) => {
+  const env = await setup();
+  t.after(env.close);
+  const { api } = env.ctx;
+  const stage = (extra = {}) => ({ status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user }, returnAssignee: { type: "agent", agentId: "a-impl" }, ...extra });
+  const issue = (n, executionState) => {
+    const row = { id: `i-${n}`, identifier: `ACM-${n}`, companyId: ids.company, status: "in_review", assigneeUserId: ids.user, executionState };
+    env.db.issues.push(row);
+    return row;
+  };
+
+  // The participant approves the last stage: done, and the review is complete.
+  const last = issue(1, stage());
+  await api.request("PATCH", "/api/issues/ACM-1", { status: "done", comment: "Approved." });
+  assert.equal(last.status, "done");
+  assert.equal(last.executionState.status, "completed");
+  assert.equal(last.executionState.lastDecisionOutcome, "approved");
+  // A decision needs a comment.
+  issue(2, stage());
+  await assert.rejects(api.request("PATCH", "/api/issues/ACM-2", { status: "done" }), /requires a comment/);
+  // Changes requested go back to the implementer.
+  const back = issue(3, stage());
+  await api.request("PATCH", "/api/issues/ACM-3", { status: "in_progress", comment: "Rename it." });
+  assert.deepEqual([back.status, back.assigneeAgentId, back.executionState.status], ["in_progress", "a-impl", "changes_requested"]);
+  // Anyone else moving it out of review decides nothing: the stage is gone.
+  const other = issue(4, stage({ currentStageType: "review", currentParticipant: { type: "agent", agentId: "a-qa" } }));
+  await api.request("PATCH", "/api/issues/ACM-4", { status: "todo" });
+  assert.deepEqual([other.status, other.executionState], ["todo", null]);
 });

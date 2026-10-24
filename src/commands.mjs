@@ -20,7 +20,7 @@ import {
   linkFacts,
 } from "./workspace.mjs";
 import { closeWorkspace, lastFailedOperation, survey } from "./worktrees.mjs";
-import { readUsage, render, summarize, usageOptions } from "./usage.mjs";
+import { readUsage, render, summarize } from "./usage.mjs";
 import { answerFor, findCard } from "./answer.mjs";
 export { why } from "./why.mjs";
 import { excerpt } from "./advice.mjs";
@@ -43,12 +43,12 @@ Decide and unblock
   changes ISSUE comment      request changes (the comment becomes the brief)
   comment ISSUE text         comment as you (wakes the assignee)
   answer ISSUE CARD text     answer a question card (CARD: its id, or the start of it)
-  release ISSUE [--apply] [--outcome=mixed|completed|not_performed]
+  release ISSUE [--apply] [--outcome mixed|completed|not_performed]
                              release an execution hold whose run can't prove it stopped
   workspace ISSUE [--apply]  give an issue linked to a closed (or another issue's) workspace its own
 
 Housekeeping
-  worktrees [--apply] [--min-days=N] [--include-untracked] [--include-unmerged]
+  worktrees [--apply] [--min-days N] [--include-untracked] [--include-unmerged]
                              close finished issues' workspaces, so Paperclip removes their worktrees
   models                     every agent's adapter, model and effort
   set-model FROM TO [--apply]
@@ -66,8 +66,11 @@ Setup
   update                     update to the latest release of this major version
   version                    print the version
 
-Commands with --apply only preview without it. Settings come from .env:
-https://github.com/DevEnterpriseSoftware/paperclip-helper`;
+Commands with --apply only preview without it. An option's value can follow it
+(--days 7) or be joined to it (--days=7). Text that starts with -- goes after a bare --:
+  pch comment ACM-1 -- --force is fine here
+
+Settings come from .env: https://github.com/DevEnterpriseSoftware/paperclip-helper`;
 
 // Lines go to the console, or to `sink` while a command collects its own output.
 let sink = null;
@@ -192,13 +195,8 @@ export async function blocked(ctx) {
 // Shows the hold and the held run; --apply records the board's reconciliation
 // (the run has stopped; what it did is unverified unless --outcome says
 // otherwise) and delivers the saved messages.
-export async function release(ctx, identifier, flags = []) {
-  if (!identifier || identifier.startsWith("--")) {
-    throw new Error("usage: pch release ISSUE [--apply] [--outcome=mixed|completed|not_performed]");
-  }
-  const apply = flags.includes("--apply");
-  const outcomeFlag = flags.find((f) => f.startsWith("--outcome="));
-  const actionOutcome = outcomeFlag ? outcomeFlag.slice("--outcome=".length) : "mixed";
+export async function release(ctx, identifier, { apply = false, outcome: actionOutcome = "mixed" } = {}) {
+  if (!identifier) throw new Error("usage: pch release ISSUE [--apply] [--outcome mixed|completed|not_performed]");
   if (!RELEASE_OUTCOMES.includes(actionOutcome)) {
     throw new Error(`--outcome must be one of ${RELEASE_OUTCOMES.join(", ")}`);
   }
@@ -234,7 +232,7 @@ export async function release(ctx, identifier, flags = []) {
     out(`--apply records, as the board, that this run has stopped and that what it did is ${actionOutcome === "mixed" ? "unverified (mixed)" : actionOutcome.replace("_", " ")},`);
     out(`moves ${identifier} to todo, and ${saved ? "delivers the saved messages" : "lets the next message start a run"}.`);
     out("Only do it if no agent process from that run is still running. Have the agent check the branch before it continues.");
-    out(`  pch release ${identifier} --apply${outcomeFlag ? ` ${outcomeFlag}` : ""}`);
+    out(`  pch release ${identifier} --apply${actionOutcome !== "mixed" ? ` --outcome ${actionOutcome}` : ""}`);
     return;
   }
   let result;
@@ -257,10 +255,9 @@ export async function release(ctx, identifier, flags = []) {
 // Shows the link; --apply gives the issue a new isolated workspace, like "New
 // isolated workspace" in its Workspace picker. With a closed workspace, the other
 // open issues still linked to it are fixed too: they'd fail the same way.
-export async function workspace(ctx, identifier, flags = []) {
-  if (!identifier || identifier.startsWith("--")) throw new Error("usage: pch workspace ISSUE [--apply]");
+export async function workspace(ctx, identifier, { apply = false } = {}) {
+  if (!identifier) throw new Error("usage: pch workspace ISSUE [--apply]");
   const { api } = ctx;
-  const apply = flags.includes("--apply");
   const facts = await linkFacts(api, identifier);
   const { issue } = facts;
   const label = (i) => i.identifier ?? String(i.id).slice(0, 8);
@@ -344,22 +341,13 @@ export async function workspace(ctx, identifier, flags = []) {
 
 // ---------------------------------------------------------------- worktrees
 
-const WORKTREE_FLAGS = ["--apply", "--include-untracked", "--include-unmerged"];
-
 // Workspaces of finished issues still on disk (see worktrees.mjs). Lists what
 // Paperclip would remove, what it would throw away work for, and what it
 // refuses; --apply closes the first group one by one, as the Close button does.
-export async function worktrees(ctx, flags = []) {
+export async function worktrees(ctx, { apply = false, minDays = 1, includeUntracked = false, includeUnmerged = false } = {}) {
   const { api } = ctx;
-  const unknown = flags.filter((f) => !WORKTREE_FLAGS.includes(f) && !f.startsWith("--min-days="));
-  if (unknown.length) {
-    throw new Error(`unknown option ${unknown[0]}. usage: pch worktrees [--apply] [--min-days=N] [--include-untracked] [--include-unmerged]`);
-  }
-  const apply = flags.includes("--apply");
-  const minFlag = flags.find((f) => f.startsWith("--min-days="));
-  const minDays = minFlag ? Number(minFlag.slice("--min-days=".length)) : 1;
   if (!Number.isFinite(minDays) || minDays < 0) throw new Error("--min-days must be a number of days, 0 or more");
-  const opts = { includeUntracked: flags.includes("--include-untracked"), includeUnmerged: flags.includes("--include-unmerged") };
+  const opts = { includeUntracked, includeUnmerged };
 
   const me = await ctx.identity();
   const now = ctx.now();
@@ -441,7 +429,8 @@ export async function worktrees(ctx, flags = []) {
     if (reviewCount && !(opts.includeUntracked && opts.includeUnmerged)) {
       out("--include-untracked also closes those with untracked files; --include-unmerged those with commits that aren't merged. Modified files are never closed.");
     }
-    out(`  pch worktrees --apply${flags.filter((f) => f !== "--apply").map((f) => ` ${f}`).join("")}`);
+    const same = [minDays !== 1 && `--min-days ${minDays}`, includeUntracked && "--include-untracked", includeUnmerged && "--include-unmerged"].filter(Boolean);
+    out(`  pch worktrees --apply${same.map((f) => ` ${f}`).join("")}`);
     return;
   }
 
@@ -533,9 +522,8 @@ export async function models(ctx) {
 
 // PATCH merges into adapterConfig, so only the model changes: effort, engine,
 // env and everything else stay as they are. Preview unless --apply is given.
-export async function setModel(ctx, from, to, flags = []) {
+export async function setModel(ctx, from, to, { apply = false } = {}) {
   if (!from || !to) throw new Error("usage: pch set-model FROM TO [--apply]");
-  const apply = flags.includes("--apply");
   const targets = (await listAgents(ctx)).filter((a) => a.adapterConfig?.model === from);
   if (!targets.length) {
     out(`No agent uses ${from}.`);
@@ -564,8 +552,9 @@ export async function setModel(ctx, from, to, flags = []) {
 
 // ---------------------------------------------------------------- usage
 
-export async function usage(ctx, args = []) {
-  const opts = usageOptions(args);
+export async function usage(ctx, { days = 7, agent = null } = {}) {
+  if (!(days > 0)) throw new Error("--days needs a number of days, e.g. --days 7");
+  const opts = { days, agent };
   const until = ctx.now();
   const since = until - opts.days * 24 * 60 * 60_000;
   const { companyIds = [] } = await ctx.identity();
@@ -586,13 +575,12 @@ export async function usage(ctx, args = []) {
 
 // ---------------------------------------------------------------- costs
 
-export async function costs(ctx, args = []) {
+export async function costs(ctx, { sessions = false, audit = false, days = 7, given = new Set() } = {}) {
+  if (sessions && audit) throw new Error("usage: pch costs [--sessions | --audit [--days N]] (one at a time)");
+  if (given.has("days") && !audit) throw new Error("--days goes with --audit: pch costs --audit --days N");
   const sync = createCostSync(ctx);
-  if (args.includes("--sessions")) return sync.sessions();
-  if (args.includes("--audit")) {
-    const i = args.findIndex((a) => a === "--days" || a.startsWith("--days="));
-    const value = i < 0 ? "7" : args[i].includes("=") ? args[i].split("=")[1] : args[i + 1];
-    const days = Number(value);
+  if (sessions) return sync.sessions();
+  if (audit) {
     if (!(days > 0)) throw new Error("usage: pch costs --audit [--days N]");
     return sync.audit({ days, print: out });
   }

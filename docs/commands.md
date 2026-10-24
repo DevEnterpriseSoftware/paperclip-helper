@@ -12,7 +12,7 @@
 | `pch changes ISSUE comment` | Requests changes. The comment is required and becomes the brief. |
 | `pch comment ISSUE text` | Comments as you, which wakes the assignee. |
 | `pch answer ISSUE CARD text` | Answers a question card as you, as the card's form would: `CARD` is its id or the start of it. A card with one question only: an option whose label (or id) is the text, else the text as a typed answer when the question takes one. Without a matching card it lists the pending ones. Quote the text to keep its spacing exactly. |
-| `pch release ISSUE [--apply] [--outcome=…]` | Releases an execution hold whose run can't prove it stopped, so messages and Interrupt stay saved behind it. It previews unless you pass `--apply`. See [`release`](#release-a-hold-messages-cant-clear). |
+| `pch release ISSUE [--apply] [--outcome …]` | Releases an execution hold whose run can't prove it stopped, so messages and Interrupt stay saved behind it. It previews unless you pass `--apply`. See [`release`](#release-a-hold-messages-cant-clear). |
 | `pch workspace ISSUE [--apply]` | Gives an issue linked to a closed workspace, or to another issue's live one, a new isolated workspace. It previews unless you pass `--apply`. See [`workspace`](#workspace-an-issue-linked-to-the-wrong-workspace). |
 | `pch worktrees [--apply]` | Closes the execution workspaces of finished issues, so Paperclip removes their git worktrees from disk. It previews unless you pass `--apply`. See [`worktrees`](#worktrees-finished-issues-worktrees-still-on-disk). |
 | `pch usage [--days N] [--agent NAME]` | Where the tokens go: per agent, its runs, tokens, cost, model and effort, what woke it, and the agents worth a look (one that polls, one that keeps failing, one using most of its provider's tokens). Read-only. See [`usage`](#usage-where-the-tokens-go). |
@@ -24,7 +24,9 @@
 | `pch login`, `pch revoke` | Create the helper's key; revoke and delete it. |
 | `pch secret` | Prints a random webhook secret. |
 | `pch update` | Updates the helper to the latest release of its major version, and restarts it (see [Upgrading](install.md#upgrading)). It doesn't update Paperclip. |
-| `pch version`, `pch help` | Version, and this list. |
+| `pch version`, `pch help` | Version, and this list. `pch <command> --help` prints that command's usage. |
+
+Options work the same for every command. A value can follow its option or be joined to it: `--days 7` and `--days=7`. An option the command doesn't have stops it with its usage line, so a typo never runs a command without what you meant, or posts the option as part of a comment. A comment's text is the rest of the words, or one quoted argument; a `--` within it stays. To start it with `--`, put a bare `--` before it: `pch comment ACM-1 -- --force is fine here` (PowerShell drops a bare `--`, so there write `'--'`). A quoted phrase works too, as long as it has a space: `pch comment ACM-1 "--force is fine here"`.
 
 ## `blocked`: what the blocked issues wait on
 
@@ -184,7 +186,7 @@ Each issue with an isolated workspace gets its own git worktree, and every one c
 
 Miss any one and the worktree stays. On a busy instance they pile up into hundreds of worktrees and tens of GB, inside a WSL or VM disk that doesn't shrink by itself.
 
-`pch worktrees` lists the open workspaces of issues finished at least a day ago (`--min-days=N` to change that), with what Paperclip's own close check (`close-readiness`) says about each:
+`pch worktrees` lists the open workspaces of issues finished at least a day ago (`--min-days N` to change that), with what Paperclip's own close check (`close-readiness`) says about each:
 
 ```text
 $ pch worktrees

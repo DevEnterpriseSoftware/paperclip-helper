@@ -48,7 +48,7 @@ async function showWorkspaceOps(api, identifier, out) {
 // Then a recommendation: what is going on, what to do, and whether the watchdog
 // does it by itself. With --prompt, the same as a prompt for an LLM chat.
 export async function why(ctx, identifier, { prompt = false, print = console.log } = {}) {
-  if (!identifier || identifier.startsWith("--")) throw new Error("usage: pch why ISSUE [--prompt]");
+  if (!identifier) throw new Error("usage: pch why ISSUE [--prompt]");
   const report = [];
   const facts = await whyReport(ctx, identifier, (line = "") => report.push(line));
   const advice = advise(facts);

@@ -6,11 +6,13 @@ import assert from "node:assert/strict";
 import { setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { startFakeGitHub } from "./fake-github.mjs";
-import { createRelay, decisionNote } from "../src/relay.mjs";
-import { HELPER_MARK } from "../src/conflicts.mjs";
+import { createRelay } from "../src/relay.mjs";
+import { decisionNote } from "../src/decisions.mjs";
+import { HELPER_MARK } from "../src/github.mjs";
 
 const RELAY_ENV = { GITHUB_WEBHOOK_SECRET: "test-secret", GITHUB_OWNER_LOGIN: "Owner", GITHUB_REPOS: "org/app", RELAY_PORT: "0" };
-const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user } };
+// A stage waiting on you remembers who handed the work in (returnAssignee), as Paperclip's does.
+const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user }, returnAssignee: { type: "agent", agentId: "a-implementer" } };
 const repository = { full_name: "Org/App" };
 const owner = { login: "owner" };
 
@@ -159,9 +161,9 @@ test("the note's own delivery back to the relay is ignored", async (t) => {
 test("decisionNote: recorded, already done, not found, several waiting", () => {
   const base = { kind: "changes", asked: "Your `/changes`", identifiers: ["ACM-1", "ACM-2"] };
   assert.equal(decisionNote({ ...base, result: { identifier: "ACM-1", action: "changes" } }), null);
-  assert.match(decisionNote({ ...base, kind: "approve", asked: "Your `/approve`", result: { identifier: "ACM-1", action: "none", reason: "issue already done" } }), /ACM-1 is already done\.[\s\S]*`pch approve <issue> "…"`/);
-  assert.match(decisionNote({ ...base, result: { identifiers: ["ACM-1", "ACM-2"], action: "none", reason: "no Paperclip issue found for the identifiers" } }), /None of the issues this PR names \(ACM-1, ACM-2\) was found in Paperclip\./);
-  const several = decisionNote({ ...base, result: { identifier: "ACM-1", action: "comment", reason: "several issues wait on you (ACM-1, ACM-2) and none lists this PR" } });
+  assert.match(decisionNote({ ...base, kind: "approve", asked: "Your `/approve`", result: { identifier: "ACM-1", action: "none", code: "already-done", reason: "issue already done" } }), /ACM-1 is already done\.[\s\S]*`pch approve <issue> "…"`/);
+  assert.match(decisionNote({ ...base, result: { identifiers: ["ACM-1", "ACM-2"], action: "none", code: "not-found", reason: "no Paperclip issue found for the identifiers" } }), /None of the issues this PR names \(ACM-1, ACM-2\) was found in Paperclip\./);
+  const several = decisionNote({ ...base, result: { identifier: "ACM-1", action: "comment", code: "ambiguous", waitingOn: ["ACM-1", "ACM-2"], reason: "several issues wait on you (ACM-1, ACM-2) and none lists this PR" } });
   assert.match(several, /ACM-1, ACM-2 all wait on you, and none of them lists this PR/);
   assert.match(several, /Your text was added to ACM-1 as a comment\./);
 });

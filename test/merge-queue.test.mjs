@@ -7,7 +7,8 @@ import { createRelay } from "../src/relay.mjs";
 import { classifyDrop, dropReason, latestGroupRuns, QUEUE_BOT } from "../src/merge-queue.mjs";
 
 const REPO = "org/app";
-const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user } };
+// A stage waiting on you remembers who handed the work in (returnAssignee), as Paperclip's does.
+const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user }, returnAssignee: { type: "agent", agentId: "a-implementer" } };
 let runId = 9000;
 
 // ACM-1 waits on the board's approval, as a queued PR's issue does: assigned to the board user.
@@ -68,7 +69,7 @@ test("a failed merge-group job sends the PR back to its implementer, with the fa
   // An older merge group for the same PR, which passed: only the newest counts.
   groupRun(env.gh, { sha: "mg-0", minutesAgo: 60 });
 
-  assert.deepEqual(await drop(env), { queued: "merge-queue drop" });
+  assert.deepEqual(await drop(env), { pr: 8, drop: "failed", reason: "CI_FAILURE", identifier: "ACM-1", action: "changes" });
   assert.equal(env.db.patches.length, 1);
   const { body } = env.db.patches[0];
   assert.equal(body.status, "in_progress");
@@ -222,7 +223,7 @@ test("dry run changes nothing on any path; RELAY_MERGE_QUEUE is on by default, a
   // Unset, with RELAY_FIX_CONFLICTS off: on.
   const byDefault = await queueEnv(t, { RELAY_MERGE_QUEUE: "", RELAY_FIX_CONFLICTS: "false" });
   groupRun(byDefault.gh, { conclusion: "failure", jobs: [["test", "failure"]] });
-  assert.equal((await drop(byDefault)).queued, "merge-queue drop");
+  assert.equal((await drop(byDefault)).action, "changes");
 
   const off = await queueEnv(t, { RELAY_MERGE_QUEUE: "false" });
   groupRun(off.gh, { conclusion: "failure", jobs: [["test", "failure"]] });
@@ -234,12 +235,10 @@ test("dry run changes nothing on any path; RELAY_MERGE_QUEUE is on by default, a
   assert.equal(noToken.logs.filter((l) => /merge-queue drops aren't handled: no GitHub token/.test(l.msg)).length, 1);
 });
 
-test("a failure in the background is logged with the PR, and the delivery can be redelivered", async (t) => {
+test("a drop that fails names the PR, so the delivery fails and can be redelivered", async (t) => {
   const env = await queueEnv(t);
   env.gh.fail["GET pull 8"] = 500;
-  await drop(env);
-  const err = env.logs.find((l) => l.msg === "relay: merge-queue drop failed");
-  assert.match(err.error, /^org\/app#8: /);
+  await assert.rejects(drop(env), /^Error: merge-queue drop of org\/app#8: /);
   assert.ok(env.relay.stats.mergeQueue.lastError);
 });
 

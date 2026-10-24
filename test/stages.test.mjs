@@ -11,7 +11,8 @@ const REPO = "org/app";
 const HOUR = 60 * 60_000;
 const iso = (ms) => new Date(ms).toISOString();
 const stages = [{ id: "s1", type: "review", participants: [{ type: "agent", agentId: "arch" }] }];
-const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user } };
+// A stage waiting on you remembers who handed the work in (returnAssignee), as Paperclip's does.
+const waitingOnMe = { status: "pending", currentStageType: "approval", currentParticipant: { type: "user", userId: ids.user }, returnAssignee: { type: "agent", agentId: "a-implementer" } };
 
 async function stagesEnv(t, extra = {}) {
   const gh = await startFakeGitHub();

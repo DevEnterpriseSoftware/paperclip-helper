@@ -17,11 +17,8 @@
 // and PRs whose issue is done or cancelled are skipped. A PR that merges cleanly
 // again starts from zero.
 
-// Ends every comment the helper writes on a PR, so the relay doesn't copy its
-// own comments back to Paperclip when GitHub delivers them as webhooks.
 import { CLOSED_STATUSES, prLabel, signed } from "./util.mjs";
-
-export const HELPER_MARK = "<!-- paperclip-helper -->";
+import { findIdentifiers } from "./identifiers.mjs";
 
 // GitHub works out `mergeable` in the background: null means "ask again".
 const MERGEABLE_TRIES = 5;
@@ -30,7 +27,7 @@ const MERGEABLE_WAIT_MS = 3000;
 const AFTER_MERGE_WAIT_MS = 5000;
 const CLOSED = CLOSED_STATUSES;
 
-export function createConflictSweep({ ctx, state, github, identifiersOf, resolveTarget, decide, sleep }) {
+export function createConflictSweep({ ctx, state, github, decisions, sleep }) {
   const { config, log } = ctx;
   const wait = sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const records = state.conflicts;
@@ -63,7 +60,7 @@ export function createConflictSweep({ ctx, state, github, identifiersOf, resolve
   async function commentOnPr(repo, pr, text) {
     if (!config.conflictPrComment) return false;
     try {
-      await github.comment(repo, pr.number, `${signed(text)}\n\n${HELPER_MARK}`);
+      await github.helperComment(repo, pr.number, text);
       return true;
     } catch (err) {
       // The send-back itself worked; a missing note isn't worth failing over.
@@ -77,7 +74,7 @@ export function createConflictSweep({ ctx, state, github, identifiersOf, resolve
     const key = `${repo}#${number}`;
     const skip = (reason) => ({ pr: number, action: "skip", reason });
     if (listed.draft) return skip("draft");
-    const identifiers = identifiersOf(listed);
+    const identifiers = findIdentifiers(listed, ctx.prefixes());
     if (!identifiers.length) return skip("names no Paperclip issue");
 
     const pr = await settled(repo, number);
@@ -115,12 +112,12 @@ export function createConflictSweep({ ctx, state, github, identifiersOf, resolve
       return { pr: number, action: "give up", attempts };
     }
 
-    const target = await resolveTarget(pr, identifiers);
+    const target = await decisions.resolveTarget(pr, identifiers);
     if (!target) return skip(`no Paperclip issue found for ${identifiers.join(", ")}`);
     const issueLabel = target.issue.identifier ?? target.issue.id;
     if (!target.waiting && CLOSED.has(target.issue.status)) return skip(`${issueLabel} is ${target.issue.status}`);
 
-    const result = await decide(pr, identifiers, "changes", brief(pr, after), target);
+    const result = await decisions.decide({ pr, identifiers, kind: "changes", comment: brief(pr, after), target });
     const out = { pr: number, attempt: attempts + 1, identifier: result.identifier, action: result.action };
     if (result.reason) out.reason = result.reason;
     if (config.dryRun) return out;

@@ -102,7 +102,7 @@ test("workspace --apply clears the dead link on every open issue linked to it", 
   const env = await setup();
   t.after(env.close);
   const { a, b, done, ws } = seed(env.db);
-  const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", ["--apply"]))).join("\n");
+  const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", { apply: true }))).join("\n");
   assert.deepEqual(env.db.patches.map((p) => p.identifier).sort(), ["ACM-415", "ACM-416"]);
   for (const p of env.db.patches) assert.deepEqual(p.body, ISOLATED, "the same change as the Workspace picker");
   for (const i of [a, b]) {
@@ -122,7 +122,7 @@ test("workspace --apply leaves a linked issue with a run in progress alone", asy
   t.after(env.close);
   const { agent, b, ws } = seed(env.db);
   env.db.issueRuns[b.id] = [{ runId: uuid(), agentId: agent.id, status: "queued", createdAt: minutesAgo(1) }];
-  const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", ["--apply"]))).join("\n");
+  const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", { apply: true }))).join("\n");
   assert.match(text, /ACM-416: left alone \(a run is queued on it\)/);
   assert.deepEqual(env.db.patches.map((p) => p.identifier), ["ACM-415"]);
   assert.equal(b.executionWorkspaceId, ws.id);
@@ -138,12 +138,12 @@ test("workspace refuses: its own live workspace, a run in progress, a done issue
   own.executionWorkspaceId = ownWs.id;
   env.db.executionWorkspaces.push(ownWs);
   env.db.issues.push(own);
-  const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-500", ["--apply"]))).join("\n");
+  const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-500", { apply: true }))).join("\n");
   assert.match(text, /its own workspace .* \(active, branch own\)[\s\S]*Nothing to clear/);
 
   env.db.issueRuns[b.id] = [{ runId: uuid(), agentId: agent.id, status: "running", createdAt: minutesAgo(1) }];
-  await assert.rejects(cmd.workspace(env.ctx, "ACM-416", ["--apply"]), /Not changing ACM-416: a run is running on it/);
-  await assert.rejects(cmd.workspace(env.ctx, "ACM-417", ["--apply"]), /Not changing ACM-417: it is done/);
+  await assert.rejects(cmd.workspace(env.ctx, "ACM-416", { apply: true }), /Not changing ACM-416: a run is running on it/);
+  await assert.rejects(cmd.workspace(env.ctx, "ACM-417", { apply: true }), /Not changing ACM-417: it is done/);
   assert.equal(env.db.patches.length, 0);
   assert.equal(done.executionWorkspaceId, ws.id);
 });
@@ -154,13 +154,13 @@ test("workspace says so when Paperclip ignores workspace changes", async (t) => 
   const { a, ws } = seed(env.db);
 
   env.db.experimental = { enableIsolatedWorkspaces: false };
-  await assert.rejects(cmd.workspace(env.ctx, "ACM-415", ["--apply"]), /Enable Isolated Workspaces" is off[\s\S]*Nothing changed/);
+  await assert.rejects(cmd.workspace(env.ctx, "ACM-415", { apply: true }), /Enable Isolated Workspaces" is off[\s\S]*Nothing changed/);
   assert.equal(env.db.patches.length, 0, "it doesn't send a change Paperclip would drop");
 
   // An older Paperclip without the settings endpoint, that drops the change anyway.
   env.db.experimental = null;
   env.fake.fail("PATCH", /^\/api\/issues\/[^/]+$/, 200, { times: 5, body: { ok: true } });
-  await assert.rejects(cmd.workspace(env.ctx, "ACM-415", ["--apply"]), /kept the link[\s\S]*Enable Isolated Workspaces/);
+  await assert.rejects(cmd.workspace(env.ctx, "ACM-415", { apply: true }), /kept the link[\s\S]*Enable Isolated Workspaces/);
   assert.equal(a.executionWorkspaceId, ws.id);
 });
 
@@ -181,7 +181,7 @@ test("a workspace whose row is gone is dead; a 404 from the workspace itself pro
   const text = (await captureOutput(() => cmd.why(env.ctx, "ACM-415"))).join("\n");
   assert.match(text, /Workspace: reuses workspace .{8} \(couldn't read it: not found, or not readable with this key\)/);
   assert.doesNotMatch(text, /runs can't start/);
-  await assert.rejects(cmd.workspace(env.ctx, "ACM-415", ["--apply"]), /couldn't be read/);
+  await assert.rejects(cmd.workspace(env.ctx, "ACM-415", { apply: true }), /couldn't be read/);
   assert.equal(env.db.patches.length, 0);
 
   ws.private = false;
@@ -202,7 +202,7 @@ test("workspace --apply keeps the issue's other workspace settings", async (t) =
     workspaceStrategy: { type: "git_worktree", existingBranch: "feature/x" },
     networkEgress: { allowFqdns: ["example.com"] },
   };
-  await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", ["--apply"]));
+  await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", { apply: true }));
   assert.deepEqual(a.executionWorkspaceSettings, {
     mode: "isolated_workspace",
     environmentId: envId,
@@ -217,10 +217,10 @@ test("workspace leaves alone a change already scheduled, and explains its own cl
   t.after(env.close);
   const { a, b, ws, owner } = seed(env.db);
   b.workspacePendingSelection = { selection: "isolated_workspace" };
-  const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", ["--apply"]))).join("\n");
+  const text = (await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", { apply: true }))).join("\n");
   assert.match(text, /ACM-416: left alone \(a workspace change is already scheduled for its next run\)/);
   assert.equal(b.executionWorkspaceId, ws.id);
-  await assert.rejects(cmd.workspace(env.ctx, "ACM-416", ["--apply"]), /already scheduled/);
+  await assert.rejects(cmd.workspace(env.ctx, "ACM-416", { apply: true }), /already scheduled/);
 
   // A finished issue reopened after its own workspace was closed.
   Object.assign(owner, { status: "todo", executionWorkspacePreference: "reuse_existing", assigneeAgentId: a.assigneeAgentId });
@@ -238,7 +238,7 @@ test("workspace --apply on a live workspace another issue owns changes only that
   assert.doesNotMatch(preview, /Also linked/, "a live workspace may be shared on purpose");
   assert.match(preview, /stop working on ACM-318's branch/);
 
-  await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", ["--apply"]));
+  await captureOutput(() => cmd.workspace(env.ctx, "ACM-415", { apply: true }));
   assert.deepEqual(env.db.patches.map((p) => p.identifier), ["ACM-415"]);
   assert.equal(a.executionWorkspaceId, null);
   assert.equal(b.executionWorkspaceId, ws.id);

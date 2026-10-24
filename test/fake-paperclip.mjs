@@ -66,7 +66,7 @@ function boardComment(issue, body, via, who) {
 
 export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
   const requests = [];
-  const failures = []; // { method, path (regex), status, body, times, hang }
+  const failures = []; // { method, path (regex), status, body, times, hang, delay }
 
   // Like Paperclip's PATCH /api/issues/:id and issue-comment-wakeup: a board user's
   // comment, or a move out of blocked or backlog to todo, wakes the assignee unless the
@@ -117,7 +117,9 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     if (failure) {
       if (failure.times > 0) failure.times -= 1;
       if (failure.hang) return; // never answer
-      return send(failure.status, failure.body ?? { error: "injected failure" });
+      if (failure.delay) await new Promise((resolve) => setTimeout(resolve, failure.delay));
+      // A slow answer (no status): answered as usual, only later.
+      if (failure.status != null) return send(failure.status, failure.body ?? { error: "injected failure" });
     }
 
     const who = actor(req);
@@ -339,21 +341,39 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         if (body.comment && issue.paused) return send(409, { error: "Task is paused. Resume it before sending a message." });
         db.patches.push({ issueId: issue.id, identifier: issue.identifier, body });
         const before = issue.status;
-        if (body.status === "done" && issue.nextStages?.length && issue.executionState?.status === "pending") {
-          // Like Paperclip's applyIssueExecutionStageTransition: approving a stage
-          // that isn't the last moves the issue to the next stage, still in review.
-          const next = issue.nextStages.shift();
-          issue.executionState = { status: "pending", currentStageType: next.type, currentParticipant: next.participant };
-          issue.status = "in_review";
-        } else if (body.status === "in_progress" && body.comment && issue.executionState?.status === "pending" && issue.executionState.returnAssignee?.agentId) {
-          // Like Paperclip's changes requested by the stage's participant: back to the
-          // implementer who submitted the work (returnAssignee), which wakes it.
-          issue.executionState = { ...issue.executionState, status: "changes_requested" };
-          Object.assign(issue, { status: "in_progress", assigneeAgentId: issue.executionState.returnAssignee.agentId, assigneeUserId: null });
-        } else if (body.status === "in_review" && issue.executionState?.status === "pending" && issue.executionState.currentParticipant?.type === "agent") {
-          // Like Paperclip's drifted-stage repair (applyIssueExecutionPolicyTransition): moving an
-          // issue back to review re-pends its stage and assigns it to the stage's participant.
-          Object.assign(issue, { status: "in_review", assigneeAgentId: issue.executionState.currentParticipant.agentId, assigneeUserId: null });
+        // Paperclip's applyIssueExecutionStageTransition (services/issue-execution-policy.ts):
+        // with a stage pending, its participant decides; anyone else on the board who
+        // moves the issue out of review dissolves the stage and decides nothing.
+        const stage = issue.executionState?.status === "pending" ? issue.executionState : null;
+        const decider = stage?.currentParticipant?.type === "user" && who?.userId && stage.currentParticipant.userId === who.userId;
+        if (stage && decider && ["done", "in_progress"].includes(body.status)) {
+          if (!String(body.comment ?? "").trim()) return send(422, { error: `${body.status === "done" ? "Approving a review or approval stage" : "Requesting changes"} requires a comment.` });
+          if (body.status === "done" && issue.nextStages?.length) {
+            // Approving a stage that isn't the last moves the issue to the next stage, still in review.
+            const next = issue.nextStages.shift();
+            issue.executionState = { status: "pending", currentStageType: next.type, currentParticipant: next.participant, returnAssignee: stage.returnAssignee ?? null };
+            issue.status = "in_review";
+          } else if (body.status === "done") {
+            // The last stage approved: the review is complete (buildCompletedState).
+            issue.executionState = {
+              ...stage, status: "completed", currentStageType: null, currentParticipant: null, reviewRequest: null, lastDecisionOutcome: "approved", changesRequestedCount: 0,
+            };
+            issue.status = "done";
+          } else {
+            // Changes requested: back to the implementer who submitted the work
+            // (returnAssignee), which the comment then wakes.
+            if (!stage.returnAssignee) return send(422, { error: "This execution stage has no return assignee" });
+            issue.executionState = { ...stage, status: "changes_requested", lastDecisionOutcome: "changes_requested", changesRequestedCount: 0 };
+            Object.assign(issue, { status: "in_progress", assigneeAgentId: stage.returnAssignee.agentId ?? null, assigneeUserId: stage.returnAssignee.userId ?? null });
+          }
+        } else if (stage && body.status && body.status !== "in_review") {
+          // A board override: the stage is gone, no decision is recorded, nothing returns.
+          issue.executionState = null;
+          issue.status = body.status;
+        } else if (body.status === "in_review" && stage?.currentParticipant?.type === "agent") {
+          // Like Paperclip's drifted-stage repair: moving an issue back to review re-pends
+          // its stage and assigns it to the stage's participant.
+          Object.assign(issue, { status: "in_review", assigneeAgentId: stage.currentParticipant.agentId, assigneeUserId: null });
         } else if (body.status) {
           // Like Paperclip's policy transition: leaving done or cancelled clears the execution state.
           if (["done", "cancelled"].includes(issue.status) && !["done", "cancelled"].includes(body.status)) issue.executionState = null;
@@ -557,6 +577,10 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     requests,
     fail(method, path, status, { times = 1, body, hang = false } = {}) {
       failures.push({ method, path: path instanceof RegExp ? path : new RegExp(`^${path}$`), status, times, body, hang });
+    },
+    // The next `times` matching requests are answered as usual, after `ms`.
+    slow(method, path, ms, { times = 1 } = {}) {
+      failures.push({ method, path: path instanceof RegExp ? path : new RegExp(`^${path}$`), status: null, times, delay: ms });
     },
     clearFailures() {
       failures.length = 0;
