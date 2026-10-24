@@ -71,6 +71,7 @@ jobs:
       - name: Smoke test
         run: |
           test "$(docker run --rm paperclip-helper:ci version)" = "ci"
-          docker run --rm paperclip-helper:ci help | grep -q "pch why ISSUE"
+          docker run --rm paperclip-helper:ci help | grep -q "why ISSUE"
+          docker run --rm --network none paperclip-helper:ci comment ACM-1 --apply hi 2>&1 | grep -q "has no option --apply"
           docker run --rm --network none paperclip-helper:ci wrapper sh | cmp - bin/pch.sh
           docker run --rm --user 1000:1000 paperclip-helper:ci probe http://127.0.0.1:1 | grep -q '"ok":false'
