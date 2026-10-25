@@ -41,6 +41,7 @@ export function emptyDb() {
     runEvents: {}, // runId → [{ seq, eventType, payload }], oldest first
     costEvents: [],
     costIdempotency: true, // false: a Paperclip before 2026.10, which drops idempotencyKey
+    costStatuses: COST_STATUSES, // OLD_COST_STATUSES: a Paperclip before "estimated" (2026.1012.0 and earlier)
     hangAfterRecording: 0, // the next N cost posts are recorded but never answered
     activity: [],
     budgets: { policies: [] },
@@ -62,6 +63,40 @@ function boardComment(issue, body, via, who) {
     id: uuid(), issueId: issue.id, identifier: issue.identifier, body, via,
     authorType: "user", authorUserId: who?.userId ?? null, authorAgentId: null, createdAt: new Date().toISOString(),
   };
+}
+
+// Paperclip's cost statuses: since paperclipai/paperclip#14997, and before it.
+export const COST_STATUSES = ["reported", "estimated", "unpriced"];
+export const OLD_COST_STATUSES = ["reported", "unpriced"];
+const BILLING_TYPES = ["metered_api", "subscription_included", "subscription_overage", "credits", "fixed", "unknown"];
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Zod's string().datetime(): UTC only, so a "Z" and no offset.
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$/;
+
+// Like Paperclip's createCostEventSchema (packages/shared/src/validators/cost.ts):
+// the issues, in Zod's shape, of a cost event it would refuse. Unknown fields are dropped, not refused.
+export function costEventIssues(body, statuses = COST_STATUSES) {
+  const issues = [];
+  const issue = (field, message, code = "invalid_type") => issues.push({ code, path: [field], message });
+  const b = body && typeof body === "object" ? body : {};
+  if (typeof b.agentId !== "string" || !GUID.test(b.agentId)) issue("agentId", "Invalid GUID", "invalid_format");
+  for (const f of ["issueId", "projectId", "goalId", "heartbeatRunId"]) {
+    if (b[f] != null && (typeof b[f] !== "string" || !GUID.test(b[f]))) issue(f, "Invalid GUID", "invalid_format");
+  }
+  for (const f of ["provider", "model"]) {
+    if (typeof b[f] !== "string" || !b[f]) issue(f, "Too small: expected string to have >=1 characters", "too_small");
+  }
+  if (b.biller !== undefined && (typeof b.biller !== "string" || !b.biller)) issue("biller", "Too small: expected string to have >=1 characters", "too_small");
+  const oneOf = (values) => `Invalid option: expected one of ${values.map((v) => JSON.stringify(v)).join("|")}`;
+  if (b.billingType !== undefined && !BILLING_TYPES.includes(b.billingType)) issue("billingType", oneOf(BILLING_TYPES), "invalid_value");
+  if (b.costStatus !== undefined && !statuses.includes(b.costStatus)) issues.push({ code: "invalid_value", values: statuses, path: ["costStatus"], message: oneOf(statuses) });
+  for (const f of ["inputTokens", "cachedInputTokens", "outputTokens", "costCents"]) {
+    if (b[f] === undefined && f !== "costCents") continue;
+    if (!Number.isInteger(b[f])) issue(f, "Invalid input: expected int");
+    else if (b[f] < 0) issue(f, "Too small: expected number to be >=0", "too_small");
+  }
+  if (typeof b.occurredAt !== "string" || !ISO_UTC.test(b.occurredAt)) issue("occurredAt", "Invalid ISO datetime", "invalid_format");
+  return issues;
 }
 
 export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
@@ -223,15 +258,15 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     if ((m = p.match(/^\/api\/companies\/([^/]+)\/heartbeat-runs$/))) {
       const limit = Math.min(Number(q.get("limit") ?? 1000), 1000);
       const list = db.heartbeatRuns
-        .filter((r) => r.companyId === m[1] && (!q.get("agentId") || r.agentId === q.get("agentId")))
+        // `unlisted`: a run past the latest 1,000 Paperclip lists, still there by its id.
+        .filter((r) => r.companyId === m[1] && !r.unlisted && (!q.get("agentId") || r.agentId === q.get("agentId")))
         .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
         .slice(0, limit);
       return send(200, list);
     }
     if ((m = p.match(/^\/api\/companies\/([^/]+)\/cost-events$/)) && req.method === "POST") {
-      if (!body.agentId || !body.provider || !body.model || !Number.isInteger(body.costCents)) {
-        return send(400, { error: "Validation error" });
-      }
+      const issues = costEventIssues(body, db.costStatuses);
+      if (issues.length) return send(400, { error: "Validation error", details: issues });
       if (body.issueId && !db.issues.some((i) => i.id === body.issueId)) return send(422, { error: "Issue not found" });
       // Paperclip 2026.10 records a receipt once per idempotencyKey: the same receipt
       // again returns the first, a different one is a 409. Older versions drop the key.

@@ -45,8 +45,8 @@ export const SPECS = {
   models: { usage: "models" },
   "set-model": { usage: "set-model FROM TO [--apply]", args: ["from", "to"], options: { apply: "boolean" } },
   costs: {
-    usage: "costs [--sessions | --audit [--days N] | --compare-days N]",
-    options: { sessions: "boolean", audit: "boolean", days: { type: "number", default: 7 }, "compare-days": "number" },
+    usage: "costs [--sessions | --audit [--days N] | --compare-days N | --retry-skipped]",
+    options: { sessions: "boolean", audit: "boolean", days: { type: "number", default: 7 }, "compare-days": "number", "retry-skipped": "boolean" },
   },
   login: { usage: "login" },
   revoke: { usage: "revoke" },

@@ -21,6 +21,7 @@
 | `pch costs --sessions` | Checks whether resumed sessions report cumulative costs (see [Compatibility](../README.md#compatibility)). |
 | `pch costs --audit [--days N]` | Checks the cost figures of the last N days (default 7): tokens, reported cost, what the tokens cost at list price, what cost sync posts, and duplicates. Changes nothing. See [cost sync](cost-sync.md#checking-the-figures). |
 | `pch costs --compare-days N` | The last N days against the N days before, each costed as cost sync posts it now and as it did before 1.12: how much of a change is usage, and how much the new costing. Changes nothing; after `--audit`, both. See [cost sync](cost-sync.md#comparing-two-periods). |
+| `pch costs --retry-skipped` | Lists the runs cost sync skipped and why, and queues those Paperclip rejected to be posted again on the service's next pass. See [cost sync](cost-sync.md#when-paperclip-rejects-a-cost-event). |
 | `pch models` | Every agent's adapter, model, effort and status. |
 | `pch set-model FROM TO [--apply]` | Moves every agent on model `FROM` to `TO`. It previews unless you pass `--apply`. |
 | `pch run` | Runs the service in the foreground, as its container does. It refuses to start while another helper is running on the same data directory (see [Troubleshooting](troubleshooting.md)). You don't need it with the installer's setup: the service already runs in its own container. |

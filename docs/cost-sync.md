@@ -8,7 +8,7 @@ For each finished subscription run, cost sync posts one extra cost event with th
   - A reported cost more than 10% below the token price is raised to it. With the ACP engine (Paperclip's default for Claude), a run's cost is the growth of its session's running cost; when the agent process restarted, its running cost restarted too, and the growth understates the run.
   - A run that stopped before Claude reported a cost (killed, timed out) is priced from its tokens, at its model's price.
   - A run Paperclip split by model (`usageByModel`) is priced model by model. A run that used several models without the split (`mixed`) keeps its reported cost, and isn't priced if it reported none: pricing a cheaper subagent model's tokens at the main model's price would overstate it.
-  - Raised and token-priced events are posted as `estimated`.
+  - Raised and token-priced events are posted as `estimated`. A Paperclip that has no such status (it came with Paperclip's durable accounting; 2026.1012.0 and the stable releases before it take only `reported` and `unpriced`) refuses that with a `400`; cost sync then posts the event again as `reported`, and keeps doing so until it restarts. `unpriced` would say no cost is known.
 - **Codex** (`codex_local`) reports only tokens. The cost is estimated from the run's model and OpenAI's list prices: fresh input, cache reads at the cached rate, cache writes (when the ACP engine reports them) at the write rate, output, and fast mode doubled.
   - Paperclip 2026.10 and later store Codex's input net of cache reads and mark such runs (`rawInputIncludesCached: false`); older runs, without the mark, included them. Both are handled.
 - The price table ([`src/prices.mjs`](../src/prices.mjs)) was checked on 2026-10-24 against [OpenAI's](https://developers.openai.com/api/docs/pricing) and [Anthropic's](https://platform.claude.com/docs/en/about-claude/pricing) published prices.
@@ -88,6 +88,35 @@ Acme: subscription runs, 2026-10-10 to 2026-10-17 against 2026-10-17 to 2026-10-
 - **costing** is what today's costing adds to the earlier period's runs. It is part of the change on the Costs page only for the runs that were posted before you upgraded: if 1.12 came in mid-period, the true split lies between the two lines.
 - "As before 1.12" is a reconstruction: Claude runs at their reported cost (nothing for one that reported none), Codex runs with the cache reads subtracted from their input a second time and cache writes as input, at today's prices.
 - Paperclip lists only the latest 1,000 runs per company; when that cuts the earlier period short, it says so, and fewer days help. `--audit --compare-days N` prints the audit, then the comparison.
+
+## When Paperclip rejects a cost event
+
+A post Paperclip refuses because of the event itself (`400`, `404`, `422`) wasn't recorded, and posting the same event again won't help, so cost sync skips that run rather than retrying it every pass. The log says what was wrong, once per run:
+
+```text
+{"level":"warn","msg":"cost sync: Paperclip's answer to a rejected cost event","run":"60e17fd8-…","status":400,
+ "response":{"error":"Validation error","details":[{"code":"invalid_value","values":["reported","unpriced"],"path":["costStatus"],"message":"Invalid option: expected one of \"reported\"|\"unpriced\""}]},
+ "fields":["idempotencyKey","agentId","heartbeatRunId","issueId","provider","biller","billingType","costStatus","model","inputTokens","cachedInputTokens","outputTokens","costCents","occurredAt"]}
+{"level":"error","msg":"cost sync: Paperclip rejected a cost event; skipping that run (`pch costs --retry-skipped` posts it again)","run":"60e17fd8-…",
+ "error":"POST /api/companies/…/cost-events → 400: Validation error (costStatus: Invalid option: expected one of \"reported\"|\"unpriced\")"}
+```
+
+`response` is Paperclip's answer as it came: for a `400`, Zod's issues, each with the path of the field it refused. `fields` names what the post carried, without the values. `pch status` lists the error among the latest problems.
+
+Once the cause is fixed (a Helper update, a price, Paperclip itself), post those runs again:
+
+```text
+$ pch costs --retry-skipped
+8 skipped runs are queued to be posted again:
+  60e17fd8-bbeb-4f13-9a6d-e5107c3436de   rejected: POST /api/companies/…/cost-events → 400: Validation error
+  …
+The service posts them on its next cost-sync pass (every 15 min); `pch status` shows the posts, and the log any rejection again.
+```
+
+- The command only leaves the list in `data/cost-retry.json`; the service, which keeps `data/cost-synced.json`, takes it at the start of its next pass and posts the runs as usual, with today's prices and the carried fractions. Nothing is posted by the command itself, so it can't race the service into posting a run twice.
+- A run Paperclip's run list no longer shows (it lists the latest 1,000) is read by its id, and `COST_SYNC_SINCE` doesn't hold back a run that was already looked at once.
+- A run skipped because its post's outcome was unknown (a timeout, a dropped connection) may have been recorded. It stays skipped unless Paperclip has shown it keeps idempotency keys, which make a second post of it harmless.
+- A run rejected again is skipped again, and the log says why.
 
 ## Cost sync settings
 

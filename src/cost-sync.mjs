@@ -20,12 +20,18 @@
 // careful: a run is recorded as "in flight" before its post and as synced after.
 // A post with an unknown outcome is posted again with the same idempotency key
 // while Paperclip honours keys (2026.10 and later), and never again otherwise.
+//
+// A post Paperclip rejects (a 4xx about the event itself) was not recorded, so
+// it is skipped rather than retried every pass; `pch costs --retry-skipped`
+// queues such runs (in cost-retry.json beside the state file, which only the
+// service writes) and the service's next pass posts them again.
 
 import fs from "node:fs";
+import path from "node:path";
 import { every, TERMINAL_RUN, UUID } from "./util.mjs";
 import { estimateUsd, loadPrices, normalizeModel, priceFor, splitTokens } from "./prices.mjs";
 import { readJson, writeJson } from "./store.mjs";
-import { companyAgents } from "./paperclip.mjs";
+import { companyAgents, describeIssues, validationIssues } from "./paperclip.mjs";
 
 const RUN_WINDOW = 1000; // Paperclip returns at most this many runs, newest first
 const PROVIDER_OF = { claude_local: "anthropic", codex_local: "openai" };
@@ -46,13 +52,31 @@ const FINAL_REJECTIONS = new Set([400, 404, 422]);
 // Cost events carry this key plus the run id, so Paperclip records each run once
 // even when a post is repeated (Paperclip 2026.10 and later honour it).
 export const IDEMPOTENCY_PREFIX = "pch-cost-sync:";
+// Skips whose post may have been recorded: posted again only while Paperclip honours idempotency keys.
+const UNKNOWN_OUTCOME = /^unknown outcome/;
+// The file `pch costs --retry-skipped` leaves for the service: { runs: [runId, …] }.
+export const retryFileOf = (config) => path.join(path.dirname(config.costStateFile), "cost-retry.json");
+
+// Whether Paperclip refused the event's costStatus. "estimated" came with
+// Paperclip's durable accounting (paperclipai/paperclip#14997); a release before
+// it (2026.1012.0 among them) takes only "reported" and "unpriced".
+const refusesCostStatus = (err) => err?.status === 400 && validationIssues(err.body).some((i) => Array.isArray(i.path) && i.path[0] === "costStatus");
+
+// Which skipped runs a retry may post again: one Paperclip rejected was never
+// recorded; one with an unknown outcome only while Paperclip honours keys.
+export function retryable(state, reason) {
+  const why = String(reason ?? "");
+  if (why.startsWith("rejected")) return true;
+  return UNKNOWN_OUTCOME.test(why) && state.idempotent === true;
+}
 
 // ------------------------------------------------------------------ state
 
 // { version: 2, companies: { [id]: { floor, synced: { runId: finishedAt } } },
 //   inflight: { runId: { at, companyId, finishedAt, body, carry } } (older files: { runId: at }),
 //   skipped: { runId: reason }, idempotent: Paperclip honours idempotency keys,
-//   carry: { "agent|provider|biller|model": fraction of a cent not yet posted } }
+//   carry: { "agent|provider|biller|model": fraction of a cent not yet posted },
+//   retry: { runId: when it was queued } (skipped runs to post again, see takeRetries) }
 function normalizeState(raw) {
   const state = raw && typeof raw === "object" ? raw : {};
   return {
@@ -61,6 +85,7 @@ function normalizeState(raw) {
     inflight: state.inflight ?? {},
     skipped: state.skipped ?? {},
     carry: state.carry && typeof state.carry === "object" ? state.carry : {},
+    retry: state.retry && typeof state.retry === "object" ? state.retry : {},
     idempotent: state.idempotent === true,
   };
 }
@@ -93,6 +118,12 @@ export function createCostSync(ctx) {
   const { config, api, log } = ctx;
   const stats = { ticks: 0, lastTickAt: null, posted: 0, postedCents: 0, lastError: null, unpriced: {} };
   const warnedModels = new Set();
+  // Runs whose rejection has been logged in full, so each is logged once.
+  const rejectionsLogged = new Set();
+  // Whether this Paperclip takes costStatus "estimated": null until a post shows it.
+  // Kept for the process only, so an upgraded Paperclip is noticed at the next start.
+  let takesEstimated = null;
+  const retryFile = retryFileOf(config);
 
   function loadState() {
     // A missing file and a corrupt one (readJson moves it aside) are both
@@ -354,14 +385,66 @@ export function createCostSync(ctx) {
     const cs = companyState(state, companyId);
     const floor = floorOf(state, companyId);
     const items = [];
-    for (const run of list) {
+    for (const run of [...list, ...(await queuedElsewhere(companyId, state, list))]) {
       if (cs.synced[run.id] !== undefined || state.inflight[run.id] || state.skipped[run.id]) continue;
-      if (floor && run.finishedAt && Date.parse(run.finishedAt) < Date.parse(floor)) continue;
+      // A run queued by --retry-skipped was looked at once already: the floor doesn't hold it back.
+      if (floor && !state.retry[run.id] && run.finishedAt && Date.parse(run.finishedAt) < Date.parse(floor)) continue;
       const agent = await agentOf(agents, run.agentId);
       const verdict = await evaluate(run, agent, table, nowMs);
       if (verdict) items.push({ run, agent, ...verdict });
+      else delete state.retry[run.id]; // not a subscription run of ours (any more): nothing to post
     }
     return { items, list, agents };
+  }
+
+  // Runs queued by --retry-skipped that Paperclip's run list no longer shows (it
+  // returns the latest 1,000): each is read on its own, and kept for this company
+  // when it is one of its runs. A run Paperclip no longer has leaves the queue.
+  async function queuedElsewhere(companyId, state, list) {
+    const listed = new Set(list.map((r) => r.id));
+    const out = [];
+    for (const runId of Object.keys(state.retry)) {
+      if (listed.has(runId)) continue;
+      const run = await recordOf(`/api/heartbeat-runs/${runId}`);
+      if (run === null) {
+        delete state.retry[runId];
+        log.warn("cost sync: a run queued to be posted again is gone from Paperclip; dropping it", { run: runId });
+      } else if (run && run.companyId === companyId) out.push(run);
+    }
+    return out;
+  }
+
+  // At the start of a pass: the runs `pch costs --retry-skipped` queued. The file
+  // is renamed before it is read, so a request written meanwhile waits for the next
+  // pass instead of being lost. Each run still skipped for a retryable reason leaves
+  // `skipped` for `retry`, which keeps it in the scan until it is synced or skipped again.
+  function takeRetries(state) {
+    const taken = `${retryFile}.taken-${process.pid}`;
+    try {
+      fs.renameSync(retryFile, taken);
+    } catch (err) {
+      if (err.code !== "ENOENT") log.warn("cost sync: could not read the runs queued to be posted again", { file: retryFile, error: err.message });
+      return;
+    }
+    const request = readJson(taken, null);
+    fs.rmSync(taken, { force: true });
+    const asked = Array.isArray(request?.runs) ? request.runs.filter((id) => typeof id === "string" && UUID.test(id)) : [];
+    let queued = 0;
+    for (const runId of asked) {
+      if (!state.skipped[runId] || !retryable(state, state.skipped[runId])) continue;
+      delete state.skipped[runId];
+      state.retry[runId] = new Date().toISOString();
+      queued += 1;
+    }
+    if (asked.length) log("cost sync: posting skipped runs again, as `pch costs --retry-skipped` asked", { runs: queued, ...(asked.length > queued ? { notRetryable: asked.length - queued } : {}) });
+  }
+
+  // A queued run leaves the queue once it is synced, in flight or skipped again.
+  function settleRetries(state) {
+    for (const runId of Object.keys(state.retry)) {
+      const synced = Object.values(state.companies).some((cs) => cs?.synced?.[runId] !== undefined);
+      if (synced || state.inflight[runId] || state.skipped[runId]) delete state.retry[runId];
+    }
   }
 
   // After a full pass: runs older than the oldest one Paperclip still shows
@@ -391,11 +474,31 @@ export function createCostSync(ctx) {
     return send(state, companyId, runId, item.post, item.carry, item.run.finishedAt);
   }
 
+  // The body as this Paperclip takes it: an estimated cost is posted as
+  // "reported" on a Paperclip without "estimated" (the only other status, "unpriced",
+  // means no cost is known). The in-flight entry keeps the body actually sent.
+  function compatible(state, runId, body) {
+    if (body.costStatus !== "estimated" || takesEstimated !== false) return body;
+    const sent = { ...body, costStatus: "reported" };
+    if (state.inflight[runId]) state.inflight[runId].body = sent;
+    return sent;
+  }
+
+  // Paperclip's whole answer to a rejected post, and the fields the post had, once per run.
+  function logRejection(runId, err, body) {
+    if (rejectionsLogged.has(runId)) return;
+    rejectionsLogged.add(runId);
+    log.warn("cost sync: Paperclip's answer to a rejected cost event", { run: runId, status: err.status, response: err.body ?? null, fields: Object.keys(body) });
+  }
+
   async function send(state, companyId, runId, first, carry, finishedAt) {
     let body = first;
-    for (let attempt = 1; ; attempt += 1) {
+    let withoutIssue = false;
+    for (;;) {
+      body = compatible(state, runId, body);
       try {
         const res = await api.request("POST", `/api/companies/${companyId}/cost-events`, body);
+        if (body.costStatus === "estimated") takesEstimated = true;
         // Re-checked on every post, so a Paperclip that stops keeping keys (downgraded, restored) is noticed.
         if (body.idempotencyKey) state.idempotent = res?.idempotencyKey === body.idempotencyKey;
         delete state.inflight[runId];
@@ -414,9 +517,21 @@ export function createCostSync(ctx) {
           log.warn("cost sync: Paperclip already has a cost event for this run; not posting another", { run: runId });
           return false;
         }
-        if ((err.status === 404 || err.status === 422) && body.issueId && attempt === 1) {
+        if (body.costStatus === "estimated" && refusesCostStatus(err)) {
+          // Nothing was recorded: post it again as this Paperclip takes it.
+          if (takesEstimated !== false) {
+            log('cost sync: this Paperclip doesn\'t take costStatus "estimated" (it came after 2026.1012); estimated costs are posted as "reported"', {
+              run: runId,
+              paperclip: describeIssues(validationIssues(err.body)),
+            });
+          }
+          takesEstimated = false;
+          continue;
+        }
+        if ((err.status === 404 || err.status === 422) && body.issueId && !withoutIssue) {
           const { issueId: _gone, ...rest } = body; // the issue may be gone: post without it
           body = rest;
+          withoutIssue = true;
           if (state.inflight[runId]) state.inflight[runId].body = body;
           continue;
         }
@@ -431,7 +546,8 @@ export function createCostSync(ctx) {
           delete state.inflight[runId];
           state.skipped[runId] = `rejected: ${err.message}`.slice(0, 300);
           saveState(state);
-          log.error("cost sync: Paperclip rejected a cost event; skipping that run", { run: runId, error: err.message });
+          logRejection(runId, err, body);
+          log.error("cost sync: Paperclip rejected a cost event; skipping that run (`pch costs --retry-skipped` posts it again)", { run: runId, error: err.message });
           return false;
         }
         if (err.status >= 500 || err.neverSent) {
@@ -489,6 +605,7 @@ export function createCostSync(ctx) {
     let posted = 0;
     let cents = 0;
     let complete = true;
+    if (!config.dryRun) takeRetries(state);
 
     try {
       await settleInflight(state, (c) => {
@@ -542,6 +659,7 @@ export function createCostSync(ctx) {
       stats.lastError = err.message;
       throw err;
     } finally {
+      settleRetries(state);
       if (!config.dryRun) saveState(state);
       stats.ticks += 1;
       stats.lastTickAt = new Date(started).toISOString();
@@ -603,6 +721,33 @@ export function createCostSync(ctx) {
       runs += postable.length;
     }
     if (companyIds.length > 1) print(`All companies: ${runs} runs, $${total.toFixed(2)}`);
+  }
+
+  // `costs --retry-skipped`: queues the skipped runs that can be posted again for
+  // the service's next pass. It writes only cost-retry.json, never the state file,
+  // which the running service rewrites on every pass. Returns { queued, kept }.
+  function queueRetries({ print = console.log } = {}) {
+    const { state } = loadState();
+    const skipped = Object.entries(state.skipped);
+    const again = skipped.filter(([, why]) => retryable(state, why));
+    const kept = skipped.filter(([, why]) => !retryable(state, why));
+    if (!skipped.length) print("No skipped runs: nothing to post again.");
+    if (again.length) {
+      const earlier = readJson(retryFile, null);
+      const runs = new Set(Array.isArray(earlier?.runs) ? earlier.runs : []);
+      for (const [runId] of again) runs.add(runId);
+      writeJson(retryFile, { requestedAt: new Date().toISOString(), runs: [...runs] });
+      print(`${again.length} skipped ${again.length === 1 ? "run is" : "runs are"} queued to be posted again:`);
+      for (const [runId, why] of again) print(`  ${runId}   ${why}`);
+    }
+    if (kept.length) {
+      print(`${kept.length} skipped ${kept.length === 1 ? "run stays" : "runs stay"} skipped:`);
+      for (const [runId, why] of kept) {
+        const note = UNKNOWN_OUTCOME.test(why) ? " (Paperclip may have recorded it, and hasn't shown it keeps idempotency keys, so posting it again could count it twice)" : "";
+        print(`  ${runId}   ${why}${note}`);
+      }
+    }
+    return { queued: again.length, kept: kept.length };
   }
 
   // For each active company or agent budget the posts fall in, show the spend
@@ -911,6 +1056,7 @@ export function createCostSync(ctx) {
   return {
     tick,
     preview,
+    queueRetries,
     sessions,
     audit,
     compare,

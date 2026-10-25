@@ -4,14 +4,29 @@
 // by `login`), so everything it does is recorded in Paperclip as done by you.
 
 export class PaperclipError extends Error {
-  constructor(message, { status = 0, code = "http", method, path } = {}) {
+  constructor(message, { status = 0, code = "http", method, path, body } = {}) {
     super(message);
     this.name = "PaperclipError";
     this.status = status;
     this.code = code;
     this.method = method;
     this.path = path;
+    this.body = body; // Paperclip's answer as it came, parsed when it was JSON
   }
+}
+
+// The issues of Paperclip's answer to a body its schema refused (a 400 whose
+// details are Zod's issues, each with a path and a message). Empty otherwise.
+export function validationIssues(body) {
+  const details = body && typeof body === "object" ? body.details : null;
+  return Array.isArray(details) ? details.filter((i) => i && typeof i === "object" && typeof i.message === "string") : [];
+}
+
+// "costStatus: Invalid option: …; model: Too small: …", at most three of them.
+export function describeIssues(issues) {
+  const shown = issues.slice(0, 3).map((i) => `${Array.isArray(i.path) && i.path.length ? i.path.join(".") : "(body)"}: ${i.message}`);
+  if (issues.length > 3) shown.push(`${issues.length - 3} more`);
+  return shown.join("; ");
 }
 
 // Connection failures where nothing reached Paperclip, so even a POST is safe to retry.
@@ -41,7 +56,9 @@ export function createPaperclip({ config, readToken = () => "", log, fetchImpl =
   })();
 
   function explain(method, apiPath, status, data, text, sentToken) {
-    const detail = data && typeof data === "object" && data.error ? String(data.error) : String(text ?? "").slice(0, 300);
+    let detail = data && typeof data === "object" && data.error ? String(data.error) : String(text ?? "").slice(0, 300);
+    const issues = validationIssues(data);
+    if (issues.length) detail += ` (${describeIssues(issues)})`;
     if (status === 403 && /hostname is not allowed|Missing Host header/i.test(detail)) {
       return new PaperclipError(
         `Paperclip refused the hostname "${hostname}" (its private-hostname guard, HTTP 403). ` +
@@ -57,7 +74,7 @@ export function createPaperclip({ config, readToken = () => "", log, fetchImpl =
         { status, code: "unauthorized", method, path: apiPath },
       );
     }
-    return new PaperclipError(`${method} ${apiPath} → ${status}: ${detail}`, { status, method, path: apiPath });
+    return new PaperclipError(`${method} ${apiPath} → ${status}: ${detail}`, { status, method, path: apiPath, body: data });
   }
 
   async function request(method, apiPath, body, { token, retry = true, timeoutMs: requestTimeoutMs } = {}) {

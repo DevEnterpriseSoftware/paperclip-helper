@@ -26,7 +26,7 @@ import os from "node:os";
 import path from "node:path";
 import { createContext } from "../../src/context.mjs";
 import { createStateStore } from "../../src/store.mjs";
-import { companyAgents, companyPrefixes, listIssues } from "../../src/paperclip.mjs";
+import { companyAgents, companyPrefixes, listIssues, validationIssues } from "../../src/paperclip.mjs";
 import { createWatchdog } from "../../src/watchdog.mjs";
 import { createRelay } from "../../src/relay.mjs";
 import { createCostSync } from "../../src/cost-sync.mjs";
@@ -696,6 +696,41 @@ if (!BASE) {
       );
       const budgets = await s.ctx.api.request("GET", `/api/companies/${s.company.id}/budgets/overview`);
       assert.ok(Array.isArray(budgets.policies));
+    });
+
+    test("cost sync: an estimated cost is taken as \"estimated\", or refused on costStatus alone, as the fallback to \"reported\" expects", async () => {
+      const runs = await s.ctx.api.request("GET", `/api/companies/${s.company.id}/heartbeat-runs?limit=1000`);
+      const run = runs.find((r) => r.status === "succeeded" && r.contextSnapshot?.issueId);
+      // Exactly the body cost-sync.mjs posts for a cost it estimated from tokens (a Codex run).
+      const body = {
+        idempotencyKey: `pch-cost-sync:compat-estimated-${run.id}`,
+        agentId: run.agentId,
+        heartbeatRunId: run.id,
+        issueId: run.contextSnapshot.issueId,
+        provider: "openai",
+        biller: "chatgpt",
+        billingType: "subscription_included",
+        costStatus: "estimated",
+        model: "compat-model",
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        costCents: 2,
+        occurredAt: new Date(run.finishedAt).toISOString(),
+      };
+      const path = `/api/companies/${s.company.id}/cost-events`;
+      let event;
+      try {
+        event = await s.ctx.api.request("POST", path, body);
+        if (event.costStatus !== undefined) assert.equal(event.costStatus, "estimated");
+      } catch (err) {
+        // A release before "estimated" (2026.1012.0 and earlier): a 400 whose Zod issues name
+        // costStatus and nothing else is what makes cost sync post the event again as "reported".
+        assert.equal(err.status, 400, err.message);
+        assert.deepEqual(validationIssues(err.body).map((i) => i.path), [["costStatus"]], err.message);
+        event = await s.ctx.api.request("POST", path, { ...body, costStatus: "reported" });
+      }
+      assert.equal(Number(event.costCents), 2);
     });
 
     test("cost sync: a pass over real runs completes and posts nothing for runs that aren't subscription runs", async () => {

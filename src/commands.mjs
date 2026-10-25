@@ -65,6 +65,7 @@ Costs
   costs --audit [--days N]   check the last N days' cost figures (default 7; changes nothing)
   costs --compare-days N     the last N days' costs against the N days before: how much of the
                              change is usage, and how much 1.12's costing (changes nothing)
+  costs --retry-skipped      post the runs Paperclip rejected again, on the service's next pass
 
 Setup
   run                        run the service in the foreground, as its container does
@@ -641,13 +642,26 @@ export async function usage(ctx, { days = 7, agent = null } = {}) {
 
 // ---------------------------------------------------------------- costs
 
-export async function costs(ctx, { sessions = false, audit = false, days = 7, compareDays = null, given = new Set() } = {}) {
+export async function costs(ctx, { sessions = false, audit = false, days = 7, compareDays = null, retrySkipped = false, given = new Set() } = {}) {
   const compare = given.has("compareDays");
-  if (sessions && (audit || compare)) throw new Error("usage: pch costs [--sessions | --audit [--days N] | --compare-days N] (one at a time)");
+  if ([sessions, audit || compare, retrySkipped].filter(Boolean).length > 1) {
+    throw new Error("usage: pch costs [--sessions | --audit [--days N] | --compare-days N | --retry-skipped] (one at a time; --audit and --compare-days go together)");
+  }
   if (given.has("days") && !audit) throw new Error("--days goes with --audit: pch costs --audit --days N");
   if (compare && !(compareDays > 0)) throw new Error("usage: pch costs --compare-days N   (N: the days in each period, e.g. 7 for week on week)");
   const sync = createCostSync(ctx);
   if (sessions) return sync.sessions();
+  if (retrySkipped) {
+    const { queued } = sync.queueRetries({ print: out });
+    if (!queued) return;
+    const s = readStatus(ctx.config);
+    const minutes = Math.round(ctx.config.costSyncIntervalSec / 60);
+    if (!ctx.config.costSync) out("COST_SYNC is off: they are posted once you turn it on and restart the service.");
+    else if (ctx.config.dryRun) out("DRY_RUN is on: the service only logs what it would post, so they stay queued until you turn it off.");
+    else if (serviceLive(s)) out(`The service posts them on its next cost-sync pass (every ${minutes} min); \`pch status\` shows the posts, and the log any rejection again.`);
+    else out("The service isn't running: they are posted on its first pass once it starts.");
+    return;
+  }
   if (audit) {
     if (!(days > 0)) throw new Error("usage: pch costs --audit [--days N]");
     await sync.audit({ days, print: out });
