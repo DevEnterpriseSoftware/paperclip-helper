@@ -558,13 +558,52 @@ if (!BASE) {
       assert.deepEqual(failed, [], "no per-issue check failed against the real API");
     });
 
-    test("watchdog: a hold Paperclip can't release by itself is released, and the saved message starts the owner", async () => {
+    test("watchdog: a hold Paperclip can't release by itself is released, and the saved message starts the owner", async (t) => {
       // An agent whose command doesn't exist fails before any process starts, so its
-      // run records no process id: Paperclip holds the issue for reconciliation and
-      // can never release it by itself (the same hold a run cut off at a hand-off leaves).
-      const broken = await agent("Broken", "", { command: "pch-compat-no-such-command", args: [] });
+      // run records no process id. Up to 2026.1012.0 Paperclip holds the issue for
+      // reconciliation and can never release it by itself (the same hold a run cut off
+      // at a hand-off leaves). From 2026.1023.0 the process adapter reports that no
+      // provider work started (paperclipai/paperclip#14991), and nothing is held.
+      // The agent is created working and broken afterwards: from 2026.1023.0 a new
+      // agent is tested before it is ready (paperclipai/paperclip#15631), and one
+      // whose command doesn't exist stays paused, so its runs never start.
+      const broken = await agent("Broken", 'console.log("broken")');
+      await until("the new agent to be ready", async () => {
+        const a = await ok("GET", `/api/agents/${broken.id}`);
+        assert.ok(!a.lifecycleError, `Paperclip couldn't make the agent ready: ${a.lifecycleError}`);
+        return !("lifecycleState" in a) || a.lifecycleState === "ready";
+      });
+      await ok("PATCH", `/api/agents/${broken.id}`, { adapterConfig: { command: "pch-compat-no-such-command", args: [] } });
+      const fix = () => ok("PATCH", `/api/agents/${broken.id}`, { adapterConfig: { command: NODE, args: ["-e", 'console.log("fixed")'] } });
       const held = await issue({ title: "Held", status: "todo", assigneeAgentId: broken.id });
-      const hold = await until("Paperclip to hold the issue", async () => (await ok("GET", `/api/issues/${held.id}`)).executionBlocker);
+      const failed = await until("the broken agent's run to end", async () =>
+        (await runsOf(held.id)).find((r) => r.agentId === broken.id && !ACTIVE_RUN.has(r.status)));
+      // The hold, if any, comes with the run's end; allow a moment for it to show.
+      let hold = null;
+      for (let look = 0; look < 10 && !hold; look += 1) {
+        hold = (await ok("GET", `/api/issues/${held.id}`)).executionBlocker;
+        if (!hold) await sleep(500);
+      }
+
+      if (!hold) {
+        // Nothing to release: the owner is started the ordinary way, and the watchdog
+        // has nothing to do here.
+        const run = await s.ctx.api.request("GET", `/api/heartbeat-runs/${failed.runId ?? failed.id}`);
+        assert.equal(run.processPid, null, "the run never started a process");
+        await fix();
+        await s.ctx.api.request("POST", `/api/issues/${held.id}/comments`, { body: "compat: please continue" });
+        await until("the comment to start the owner", async () =>
+          (await runsOf(held.id)).some((r) => r.agentId === broken.id && r.status === "succeeded"));
+        await settled(held.id);
+        const watchdog = createWatchdog(s.ctx, s.state);
+        s.skew = 10 * 60_000;
+        await watchdog.tick();
+        s.skew = 0;
+        assert.equal(watchdog.stats.releases, 0, "the watchdog releases nothing on an issue Paperclip never held");
+        assert.equal(watchdog.stats.lastError, null);
+        return t.skip("this Paperclip doesn't hold a run that never started a process, so there was no hold to release");
+      }
+
       assert.equal(hold.cause, "legacy_execution_requires_reconciliation", "a run that never started a process is held for reconciliation");
       hasKeys(hold, ["recoveryActionId", "runId", "agentId", "cause", "nextAction"], "an execution hold");
       const source = await s.ctx.api.request("GET", `/api/heartbeat-runs/${hold.runId}`);
@@ -575,7 +614,7 @@ if (!BASE) {
       // delivered message has something that can run.
       await s.ctx.api.request("POST", `/api/issues/${held.id}/comments`, { body: "compat: please continue" });
       await until("the message to be saved", async () => (await ok("GET", `/api/issues/${held.id}/queued-comments`)).entries?.length);
-      await ok("PATCH", `/api/agents/${broken.id}`, { adapterConfig: { command: NODE, args: ["-e", 'console.log("fixed")'] } });
+      await fix();
 
       const watchdog = createWatchdog(s.ctx, s.state);
       await watchdog.tick();
@@ -608,12 +647,16 @@ if (!BASE) {
       assert.ok((await commentsOf(reviewed.id)).some((c) => c.body.includes("Approved: PR #11 merged")), "the decision's comment is on the issue");
     });
 
-    test("relay: Request changes sends the issue back, and a new PR is linked by a comment", async () => {
+    test("relay: Request changes sends the issue back, and a new PR is noted in the issue's Pull requests document", async () => {
       const reviewed = await inReview("Changes requested");
       const relay = createRelay(s.ctx, s.state);
 
+      // RELAY_QUIET_NOTES (on by default): the note goes in a document, which wakes
+      // nobody, rather than a comment, which would wake the engineer.
       const opened = await relay.handle("pull_request", gh({ action: "opened", pull_request: pr(reviewed.identifier, 12, { merged: false }) }));
-      assert.deepEqual(opened, { identifier: reviewed.identifier, action: "comment" });
+      assert.deepEqual(opened, { identifier: reviewed.identifier, action: "note" }, "Paperclip took the Pull requests document, so the relay didn't fall back to a comment");
+      const notes = await ok("GET", `/api/issues/${reviewed.id}/documents/pull-requests`);
+      assert.ok(String(notes.body).includes("https://github.com/acme/app/pull/12") && String(notes.body).includes("opened"), `the PR's URL is in the document: ${notes.body}`);
 
       const result = await relay.handle(
         "pull_request_review",
@@ -629,7 +672,7 @@ if (!BASE) {
       assert.notEqual(back.status, "done");
       assert.equal(back.assigneeAgentId, s.alice.id, "it is back with the engineer");
       const bodies = (await commentsOf(reviewed.id)).map((c) => c.body);
-      assert.ok(bodies.some((b) => b.includes("https://github.com/acme/app/pull/12") && b.includes("opened")), "the PR's URL was posted");
+      assert.ok(!bodies.some((b) => b.includes("opened by @")), "the PR's note isn't a comment");
       assert.ok(bodies.some((b) => b.includes("compat: please rename it")), "the review text became the comment");
     });
 
