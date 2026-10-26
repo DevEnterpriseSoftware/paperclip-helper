@@ -151,6 +151,7 @@ The recommendation names what is going on, gives the steps as commands you can p
 - a run that is working, about to start, or has sat queued for more than ten minutes;
 - a link to a closed workspace, which fails every run at setup;
 - a review Paperclip escalated to you after its review-round limit, or a review or approval waiting on you;
+- builds an agent reports failing with "Unsupported repository extension 'relativeworktrees'" (in its comment or its last run's error): the check and the guarded removal of `extensions.relativeWorktrees`, which git leaves behind after a relative-link repair;
 - runs Paperclip refuses at setup because it can't verify the workspace (`workspace_validation_failed`): the reason and reason code it recorded, what it couldn't prove, and Paperclip's own next action; for relative worktree links (`source_registration_unproven`), the check, the repair for the issue's project checkout and the retry (see [`worktrees --links`](#worktrees---links-every-run-fails-at-setup-on-relative-worktree-links));
 - an execution hold: one left by a run an agent's pause cancelled ("Queued wakes held by an unreconciled run from a pause: …", with the wakes it holds and the two steps that lift it), or any other;
 - a last run that hit its plan's usage limit (Claude or Codex, with the reset time);
@@ -270,6 +271,7 @@ ACM: 2 issues fail every run at setup: Paperclip can't prove their worktrees lin
     git -C "$B" worktree list --porcelain | sed -n 's/^worktree //p' | tail -n +2 | tr '\n' '\0' | xargs -0 -r git -C "$B" worktree repair --no-relative-paths
     git -C "$B" worktree list --porcelain | sed -n 's/^worktree //p' | tail -n +2 | sed 's|$|/.git|' | tr '\n' '\0' | xargs -0 -r grep -L '^gitdir: /' | wc -l     # 0: every worktree links to the checkout by absolute path
     grep -L '^/' "$B"/.git/worktrees/*/gitdir | wc -l     # 0: the checkout links to every worktree by absolute path
+    [ "$(git -C "$B" worktree list --porcelain | … | wc -l)" -eq 0 ] && [ "$(grep -L '^/' "$B"/.git/worktrees/*/gitdir | wc -l)" -eq 0 ] && { git -C "$B" config --unset extensions.relativeWorktrees || [ $? -eq 5 ]; }     # only once both counts are 0: .NET SourceLink and libgit2 refuse the extension git leaves behind
   Every worktree in the checkout is repaired, not only these: any other with relative links fails on its next run.
 
 Once the repair has run on the host:
@@ -278,6 +280,8 @@ Once the repair has run on the host:
 
 - **The check** prints the worktree's own link: `gitdir: ../../../.git/worktrees/…` (relative) confirms the cause. A folder instead of a file means the worktree was replaced by a separate clone, which the repair doesn't fix.
 - **The repair** sets `worktree.useRelativePaths false` in that repository's own config, so worktrees Paperclip creates there from now on get absolute links whatever the user's global setting says, and rewrites the links of every worktree git lists for the checkout as absolute paths. For Paperclip's own layout that is `git -C "$B" worktree repair --no-relative-paths "$B"/.paperclip/worktrees/*/`, the form that fixed it on a live instance; going by `git worktree list` also catches a worktree a branch name with a slash nests a level down, and never another repository's. Run it as the user Paperclip runs as, so the files keep their owner. Both counts must print 0. It needs GNU `xargs` (`-r`), as on any Linux host.
+- **The last line** removes `extensions.relativeWorktrees` from the checkout's config. Git turns that repository extension on when it writes relative links, and `git worktree repair --no-relative-paths` leaves it on. Git and Paperclip don't mind it, but tools with their own git reader refuse the whole repository: .NET SourceLink fails every `dotnet build` with "Unsupported repository extension 'relativeworktrees'", and libgit2-based tools can fail the same way. It runs only when both counts are 0, so a half-finished repair never leaves relative links without the extension git needs to read them; a key that is already gone (`git config --unset` exits 5) counts as done. (`pch` prints the counting pipeline in full where this shows `…`.)
+- **Repaired with 1.14.0, and builds now fail** with "Unsupported repository extension 'relativeworktrees'": run only that last line (with `B` set to the checkout). `pch why` recommends it when an agent's comment or its last run's error carries that message.
 - **For worktrees outside Paperclip's own layout** (a project whose workspace strategy sets `worktreeParentDir`), the checkout can't be told from the path, so the first line asks git for it.
 - **Other reasons** (`source_repository_mismatch`, a missing worktree, …) are listed under "Also parked on workspace validation, for other reasons"; `pch why ISSUE` says what each needs.
 

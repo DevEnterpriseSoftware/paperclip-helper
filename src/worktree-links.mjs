@@ -126,27 +126,57 @@ export const linkCheck = (paths) => `cat ${shq(`${paths.worktree ?? "<worktree>"
 // the links say, and wherever they are: a branch name with a slash nests one a level down).
 const LIST = `git -C "$B" worktree list --porcelain | sed -n 's/^worktree //p' | tail -n +2`;
 
+// The two counts of links that are still relative: the worktrees' own (.git files) and
+// the checkout's (gitdir files). Both 0 means every link is absolute.
+const RELATIVE_WORKTREE_LINKS = `${LIST} | sed 's|$|/.git|' | tr '\\n' '\\0' | xargs -0 -r grep -L '^gitdir: /' | wc -l`;
+const RELATIVE_CHECKOUT_LINKS = `grep -L '^/' "$B"/.git/worktrees/*/gitdir | wc -l`;
+
+// When git writes relative worktree links (worktree.useRelativePaths, git 2.48 or newer)
+// it also turns on a repository extension in the checkout's shared config,
+// extensions.relativeWorktrees, and `git worktree repair --no-relative-paths` leaves it
+// on. Git and Paperclip don't mind it; a tool with its own git reader refuses the whole
+// repository: .NET SourceLink (Microsoft.Build.Tasks.Git) fails every build with
+// "Unsupported repository extension 'relativeworktrees'", and libgit2-based tools can
+// fail the same way. Removing it is safe once every link is absolute, and the
+// repository's own worktree.useRelativePaths false keeps new links absolute.
+export const EXTENSION = "extensions.relativeWorktrees";
+export const EXTENSION_ERROR = /Unsupported repository extension '?relativeworktrees'?/i;
+
+// The unset, run only when both counts are 0, so a half-finished repair never leaves
+// relative links without the extension git needs to read them. `git config --unset`
+// exits 5 when the key isn't there: already done, not an error.
+export const UNSET_EXTENSION =
+  `[ "$(${RELATIVE_WORKTREE_LINKS})" -eq 0 ] && [ "$(${RELATIVE_CHECKOUT_LINKS})" -eq 0 ] && ` +
+  `{ git -C "$B" config --unset ${EXTENSION} || [ $? -eq 5 ]; }     # only once both counts are 0: .NET SourceLink and libgit2 refuse the extension git leaves behind`;
+
+// The line that sets $B: the checkout from the path, or, outside Paperclip's own layout,
+// from git (which still reads relative links).
+const checkoutLine = (paths) =>
+  paths.checkout
+    ? `B=${shq(paths.checkout)}`
+    : `B="$(dirname "$(git -C ${shq(paths.worktree ?? "<worktree>")} rev-parse --path-format=absolute --git-common-dir)")"`;
+
 // The host commands for one project checkout, ready to paste: this repository's own
 // worktree.useRelativePaths false (the user's global setting stays), the repair over
 // every worktree git lists for it (any other with relative links fails on its next run),
-// and the two counts that should both print 0. For Paperclip's own layout this repairs
-// what `"$B"/.paperclip/worktrees/*/` names, the form that fixed it on a live instance.
+// the two counts that should both print 0, and then, only if they do, the removal of
+// the extension git leaves behind. For Paperclip's own layout this repairs what
+// `"$B"/.paperclip/worktrees/*/` names, the form that fixed it on a live instance.
 export function repairCommands(paths) {
-  const lines = [];
-  if (paths.checkout) {
-    lines.push(`B=${shq(paths.checkout)}`);
-  } else {
-    // Outside Paperclip's own layout the checkout can't be told from the path; git
-    // still reads relative links, so it can name it.
-    lines.push(`B="$(dirname "$(git -C ${shq(paths.worktree ?? "<worktree>")} rev-parse --path-format=absolute --git-common-dir)")"`);
-  }
-  lines.push(
+  return [
+    checkoutLine(paths),
     `git -C "$B" config --local worktree.useRelativePaths false`,
     `${LIST} | tr '\\n' '\\0' | xargs -0 -r git -C "$B" worktree repair --no-relative-paths`,
-    `${LIST} | sed 's|$|/.git|' | tr '\\n' '\\0' | xargs -0 -r grep -L '^gitdir: /' | wc -l     # 0: every worktree links to the checkout by absolute path`,
-    `grep -L '^/' "$B"/.git/worktrees/*/gitdir | wc -l     # 0: the checkout links to every worktree by absolute path`,
-  );
-  return lines;
+    `${RELATIVE_WORKTREE_LINKS}     # 0: every worktree links to the checkout by absolute path`,
+    `${RELATIVE_CHECKOUT_LINKS}     # 0: the checkout links to every worktree by absolute path`,
+    UNSET_EXTENSION,
+  ];
+}
+
+// For a checkout already repaired without the last step: the check, then the same
+// guarded unset (which also confirms no link is relative any more).
+export function extensionCommands(paths) {
+  return [checkoutLine(paths), `git -C "$B" config --get ${EXTENSION}     # true: the extension is still on`, UNSET_EXTENSION];
 }
 
 // Codes whose cause is in Paperclip's own records (the issue moved project, its project
@@ -171,7 +201,9 @@ export function validationAdvice(v, { identifier, who, comment, nextAction = nul
       steps: [
         `Check, on the Paperclip host: ${linkCheck(paths)}   (a gitdir: that doesn't start with / confirms it. A folder instead of a file is a separate clone, ` +
           `and a worktree \`git worktree list\` doesn't show fails the same way: the repair won't help those; ${NEW_WORKSPACE})`,
-        `Repair, on the Paperclip host as the user Paperclip runs as (this repository only; the user's global git setting stays):\n${cmds}\n     Every worktree in the checkout is repaired, not only this one: any other with relative links fails on its next run.`,
+        `Repair, on the Paperclip host as the user Paperclip runs as (this repository only; the user's global git setting stays):\n${cmds}\n` +
+          "     Every worktree in the checkout is repaired, not only this one: any other with relative links fails on its next run. " +
+          `The last line removes ${EXTENSION}, which git turned on with the relative links and leaves behind: .NET SourceLink and libgit2 refuse a repository that has it.`,
         `Then retry: pch worktrees --links --retry   (comments on every issue still parked this way, which is Paperclip's retry; or ${comment(`${who}, the worktree links are repaired. Please continue this issue.`)})`,
       ],
       watchdog: "manual",
@@ -205,6 +237,25 @@ export function validationAdvice(v, { identifier, who, comment, nextAction = nul
       ...extra,
       ...(meaning ? [] : [`pch why ${identifier} --prompt   (Paperclip's reason isn't one the helper knows: the prompt carries it for an LLM chat)`]),
       `${fix}: ${comment(`${who}, the workspace is fixed. Please continue this issue.`)}`,
+    ],
+    watchdog: "manual",
+  };
+}
+
+// What `pch why` recommends when the assignee's builds fail on the extension git left
+// behind (EXTENSION_ERROR in its last comments or its last run's error): the agent
+// reports it, Paperclip doesn't, so it shows up nowhere else.
+export function extensionAdvice({ who, comment, paths = {} }) {
+  const cmds = extensionCommands(paths).map((l) => `       ${l}`).join("\n");
+  return {
+    what:
+      `${who}'s builds fail with "Unsupported repository extension 'relativeworktrees'": the project checkout still has ${EXTENSION}, ` +
+      "which git turned on when it wrote relative worktree links and which `git worktree repair --no-relative-paths` leaves behind. " +
+      "Git and Paperclip don't mind it, but tools with their own git reader refuse the repository: .NET SourceLink (every `dotnet build`), and libgit2-based tools.",
+    steps: [
+      `On the Paperclip host, as the user Paperclip runs as:\n${cmds}\n` +
+        "     The unset runs only once no link is relative (both counts 0); if it doesn't run, the repair isn't finished: `pch worktrees --links` prints all of it.",
+      `Then: ${comment(`${who}, the repository extension that broke the build is removed. Please run the build again and continue this issue.`)}`,
     ],
     watchdog: "manual",
   };

@@ -11,7 +11,7 @@ import { issueActivity, stagesWipe } from "./stages.mjs";
 import { runRefs, waitingOn } from "./ci-runs.mjs";
 import { PAUSE_CANCEL, RECONCILIATION_CAUSE } from "./release.mjs";
 import { describeWakes } from "./paused-holds.mjs";
-import { codeLabel, hostPaths, meaningOf, readWorkspace, RECOVERY_KIND, VALIDATION_FAILED, validationOf } from "./worktree-links.mjs";
+import { codeLabel, EXTENSION_ERROR, hostPaths, meaningOf, readWorkspace, RECOVERY_KIND, VALIDATION_FAILED, validationOf } from "./worktree-links.mjs";
 import { ts } from "./util.mjs";
 
 // A blocker counts as "finalizing" until the latest operation on its execution
@@ -260,6 +260,17 @@ async function whyReport(ctx, identifier, out) {
     if (meaning) out(`  Meaning: ${meaning}`);
     if (paths.worktree) out(`  Worktree: ${paths.worktree}${paths.checkout ? ` (project checkout ${paths.checkout})` : ""}`);
   }
+  // Builds failing on the repository extension git leaves behind after relative worktree
+  // links (worktree-links.mjs): an agent says so in a comment, or its run's error has it.
+  // Paperclip's own run errors don't, so nothing else points at it.
+  let extensionError = null;
+  const agentSaid = (Array.isArray(comments) ? comments : []).find((c) => c.authorAgentId && EXTENSION_ERROR.test(c.body ?? ""));
+  const runSaid = EXTENSION_ERROR.test(String(detail?.error ?? "")) ? lastOwnRun : null;
+  if (agentSaid || runSaid) {
+    const ws = await readWorkspace(api, full?.executionWorkspaceId, full);
+    extensionError = { paths: hostPaths(ws), in: agentSaid ? `${(await nameOf(agentSaid.authorAgentId)) ?? "an agent"}'s comment` : "the last run's error" };
+    out(`Build error: Unsupported repository extension 'relativeworktrees' (in ${extensionError.in})`);
+  }
   // A usage-limit pause by the watchdog (watchdog 16), from its state file.
   const records = readJson(ctx.config.stateFile, {})?.nudges ?? {};
   let limitPause = null;
@@ -304,6 +315,7 @@ async function whyReport(ctx, identifier, out) {
     link,
     deadLinkRun,
     workspaceValidation,
+    extensionError,
     lastFailure,
     limitPause,
     participant,

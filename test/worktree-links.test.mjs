@@ -9,7 +9,7 @@ import { advise } from "../src/advice.mjs";
 import { createWatchdog } from "../src/watchdog.mjs";
 import { createStateStore } from "../src/store.mjs";
 import {
-  hostPaths, meaningOf, nextRunOutcome, REASON_CODES, RELATIVE_LINKS, repairCommands, shq, stoppedByClassifier, validationOf,
+  extensionCommands, hostPaths, meaningOf, nextRunOutcome, REASON_CODES, RELATIVE_LINKS, repairCommands, shq, stoppedByClassifier, UNSET_EXTENSION, validationOf,
 } from "../src/worktree-links.mjs";
 
 const CONFLICT = "persisted_workspace_source_conflict";
@@ -95,11 +95,33 @@ test("the checkout comes from Paperclip's worktree layout; other layouts ask git
     `${list} | tr '\\n' '\\0' | xargs -0 -r git -C "$B" worktree repair --no-relative-paths`,
     `${list} | sed 's|$|/.git|' | tr '\\n' '\\0' | xargs -0 -r grep -L '^gitdir: /' | wc -l     # 0: every worktree links to the checkout by absolute path`,
     `grep -L '^/' "$B"/.git/worktrees/*/gitdir | wc -l     # 0: the checkout links to every worktree by absolute path`,
+    UNSET_EXTENSION,
   ]);
   const custom = repairCommands(hostPaths({ cwd: "/data/trees/ACM-12" }));
   assert.equal(custom[0], `B="$(dirname "$(git -C '/data/trees/ACM-12' rev-parse --path-format=absolute --git-common-dir)")"`);
-  assert.equal(custom.length, 5);
+  assert.equal(custom.length, 6);
   assert.equal(shq("/srv/it's here"), `'/srv/it'\\''s here'`);
+});
+
+test("the repair ends by removing extensions.relativeWorktrees, only once both counts are 0", () => {
+  const lines = repairCommands(hostPaths({ cwd: "/srv/app/.paperclip/worktrees/ACM-12-work" }));
+  const repair = lines.findIndex((l) => l.includes("worktree repair --no-relative-paths"));
+  const unset = lines.findIndex((l) => l.includes("config --unset extensions.relativeWorktrees"));
+  assert.equal(unset, lines.length - 1, "the last line");
+  assert.ok(unset > repair, "after the repair");
+  // Guarded by the same two counts the repair prints, recomputed: a half-finished repair
+  // never loses the extension git needs to read relative links.
+  const [worktreeCount, checkoutCount] = [lines[3], lines[4]].map((l) => l.replace(/\s+# .*$/, ""));
+  assert.ok(UNSET_EXTENSION.startsWith(`[ "$(${worktreeCount})" -eq 0 ] && [ "$(${checkoutCount})" -eq 0 ] && `));
+  // Exit status 5 (the key isn't there) counts as done.
+  assert.match(UNSET_EXTENSION, /\{ git -C "\$B" config --unset extensions\.relativeWorktrees \|\| \[ \$\? -eq 5 \]; \}/);
+  assert.match(UNSET_EXTENSION, /# only once both counts are 0: \.NET SourceLink and libgit2 refuse the extension git leaves behind$/);
+  // For a checkout repaired without it: the check, then the same guarded unset.
+  assert.deepEqual(extensionCommands(hostPaths({ cwd: "/srv/app/.paperclip/worktrees/ACM-12-work" })), [
+    "B='/srv/app'",
+    'git -C "$B" config --get extensions.relativeWorktrees     # true: the extension is still on',
+    UNSET_EXTENSION,
+  ]);
 });
 
 test("a retry's next run: past setup, the same failure, or not started yet; a refusal is recognised", () => {
@@ -161,6 +183,7 @@ test("why: relative worktree links get the check, the repair for the checkout an
   assert.match(advice.steps[0], /^Check, on the Paperclip host: cat '\/srv\/app\/\.paperclip\/worktrees\/ACM-12-work\/\.git'   \(a gitdir: that doesn't start with \/ confirms it/);
   for (const line of repairCommands(hostPaths(ws))) assert.ok(advice.steps[1].includes(line), line);
   assert.match(advice.steps[2], /^Then retry: pch worktrees --links --retry/);
+  assert.match(advice.steps[1], /The last line removes extensions\.relativeWorktrees, which git turned on with the relative links and leaves behind: \.NET SourceLink and libgit2 refuse a repository that has it\.$/);
   // It comes before the hold and recovery rules: nothing else helps until the host is fixed.
   const held = advise(facts({ reason: CONFLICT, reasonCode: RELATIVE_LINKS }, ws, { issue: { id: "i1", status: "blocked", assigneeAgentId: "a1", executionBlocker: { cause: "x", nextAction: "y" } } }));
   assert.equal(held.what, advice.what);
@@ -178,6 +201,7 @@ test("pch why on a parked issue prints the reason code, the relative-link check 
   assert.match(text, /cat '\/srv\/app\/\.paperclip\/worktrees\/ACM-11-work\/\.git'/);
   assert.match(text, /^ {7}B='\/srv\/app'$/m);
   assert.match(text, /^ {7}git -C "\$B" worktree list --porcelain .* \| xargs -0 -r git -C "\$B" worktree repair --no-relative-paths$/m);
+  assert.match(text, /^ {7}\[ "\$\(.*\)" -eq 0 \] && \[ "\$\(.*\)" -eq 0 \] && \{ git -C "\$B" config --unset extensions\.relativeWorktrees \|\| \[ \$\? -eq 5 \]; \}/m);
   assert.match(text, /pch worktrees --links --retry/);
   assert.doesNotMatch(text, /raw error text is withheld/);
 
@@ -222,6 +246,49 @@ test("pch why reads the reason from the recovery action when the run doesn't car
   assert.match(text, new RegExp(`Paperclip's own next action: ${NEXT_ACTION.replace(/[.,]/g, "\\$&")}`));
 });
 
+test("why: builds failing on the extension git left behind get the check and the guarded unset", () => {
+  const ws = { cwd: "/srv/app/.paperclip/worktrees/ACM-12-work" };
+  const advice = advise({
+    identifier: "ACM-12", issue: { id: "i1", status: "blocked", assigneeAgentId: "a1" }, assignee: { name: "Builder", status: "idle" },
+    extensionError: { paths: hostPaths(ws), in: "Builder's comment" }, config: {},
+  });
+  assert.match(advice.what, /^Builder's builds fail with "Unsupported repository extension 'relativeworktrees'": the project checkout still has extensions\.relativeWorktrees/);
+  assert.match(advice.what, /\.NET SourceLink \(every `dotnet build`\), and libgit2-based tools\.$/);
+  for (const line of extensionCommands(hostPaths(ws))) assert.ok(advice.steps[0].includes(line), line);
+  assert.equal(advice.steps[1], 'Then: pch comment ACM-12 "Builder, the repository extension that broke the build is removed. Please run the build again and continue this issue."');
+  assert.equal(advice.watchdog, "manual");
+});
+
+test("pch why finds the build error in an agent's comment or its last run, and not in a board user's", async (t) => {
+  const e = await env(t);
+  const ws = { id: uuid(), companyId: ids.company, status: "active", cwd: "/srv/app/.paperclip/worktrees/ACM-30-work", providerRef: "/srv/app/.paperclip/worktrees/ACM-30-work" };
+  const issue = { id: uuid(), identifier: "ACM-30", companyId: ids.company, status: "blocked", title: "Build", assigneeAgentId: e.builder.id, executionWorkspaceId: ws.id, updatedAt: minutesAgo(5) };
+  e.db.executionWorkspaces.push(ws);
+  e.db.issues.push(issue);
+  const error = "error : Unsupported repository extension 'relativeworktrees'. [/srv/app/.paperclip/worktrees/ACM-30-work/src/App.csproj]";
+  // A board user quoting it isn't the agent reporting it.
+  e.db.comments.push({ id: uuid(), issueId: issue.id, body: `Saw ${error}`, authorUserId: ids.user, authorAgentId: null, createdAt: minutesAgo(4) });
+  let text = (await captureOutput(() => cmd.why(e.ctx, issue.identifier))).join("\n");
+  assert.doesNotMatch(text, /^Build error:/m);
+
+  e.db.comments.push({ id: uuid(), issueId: issue.id, body: `Blocked: dotnet build fails.\n\n${error}`, authorAgentId: e.builder.id, authorUserId: null, createdAt: minutesAgo(3) });
+  text = (await captureOutput(() => cmd.why(e.ctx, issue.identifier))).join("\n");
+  assert.match(text, /^Build error: Unsupported repository extension 'relativeworktrees' \(in Builder's comment\)$/m);
+  assert.match(text, /^Recommendation: Builder's builds fail with "Unsupported repository extension 'relativeworktrees'"/m);
+  assert.match(text, /^ {7}B='\/srv\/app'$/m);
+  assert.match(text, /config --unset extensions\.relativeWorktrees/);
+
+  // In the last run's error instead.
+  e.db.comments = e.db.comments.filter((c) => c.authorAgentId == null);
+  const run = { id: uuid(), companyId: ids.company, agentId: e.builder.id, status: "failed", errorCode: "adapter_failed", error, createdAt: minutesAgo(2), finishedAt: minutesAgo(2) };
+  run.runId = run.id;
+  e.db.issueRuns[issue.id] = [run];
+  e.db.heartbeatRuns.push(run);
+  text = (await captureOutput(() => cmd.why(e.ctx, issue.identifier))).join("\n");
+  assert.match(text, /^Build error: Unsupported repository extension 'relativeworktrees' \(in the last run's error\)$/m);
+  assert.equal(e.db.comments.filter((c) => c.authorUserId === ids.user && c.body.startsWith("Builder,")).length, 0, "read-only");
+});
+
 // ---------------------------------------------------------------- pch worktrees --links
 
 test("worktrees --links groups the parked issues by checkout, with the host commands, and changes nothing", async (t) => {
@@ -243,6 +310,9 @@ test("worktrees --links groups the parked issues by checkout, with the host comm
   assert.match(text, /^ {4}B='\/srv\/other'$/m);
   assert.equal(lines.filter((l) => l.includes("worktree repair --no-relative-paths")).length, 2, "one repair per checkout");
   assert.match(text, /Every worktree in the checkout is repaired, not only these/);
+  const unsets = lines.map((l, i) => [l, i]).filter(([l]) => l.includes("config --unset extensions.relativeWorktrees"));
+  assert.equal(unsets.length, 2, "one per checkout");
+  for (const [, i] of unsets) assert.match(lines[i - 1], /gitdir \| wc -l {5}# 0: the checkout links to every worktree/, "straight after the counts");
   assert.match(text, new RegExp(`Also parked on workspace validation, for other reasons .*: ${mismatch.issue.identifier} \\(persisted_workspace_source_conflict, source_repository_mismatch\\)`));
   assert.doesNotMatch(text, /ACM-90/);
   assert.match(text, /^ {2}pch worktrees --links --retry$/m);

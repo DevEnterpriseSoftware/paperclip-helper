@@ -18,7 +18,7 @@ import { escalatedReview } from "./board-held.mjs";
 import { PARTICIPANT_RECOVERY_CAUSE } from "./resume.mjs";
 import { pausedHoldWhy } from "./paused-holds.mjs";
 import { CONVERSATION_ADAPTERS } from "./release.mjs";
-import { validationAdvice } from "./worktree-links.mjs";
+import { extensionAdvice, validationAdvice } from "./worktree-links.mjs";
 
 const ASLEEP = new Set(["paused", "terminated", "pending_approval"]);
 const QUEUED_TOO_LONG_MS = 10 * 60_000;
@@ -58,6 +58,7 @@ export function advise(facts) {
     ciRun = null, // the CI run the assignee's latest comments say it waits on: "repo#id" or the bare id
     pauseHold = null, // the hold is from a run a pause cancelled (watchdog 18): { ownerName, runId, waiting, held }
     workspaceValidation = null, // Paperclip refused the assignee's runs at setup on the workspace (worktree-links.mjs): { reason, reasonCode, paths, repoUrl, nextAction }
+    extensionError = null, // an agent's build fails on extensions.relativeWorktrees (worktree-links.mjs): { paths, in }
     config = {},
     now = Date.now(),
   } = facts;
@@ -209,6 +210,10 @@ export function advise(facts) {
       repoUrl: workspaceValidation.repoUrl ?? null,
     });
   }
+
+  // Builds that fail on the repository extension git left behind after relative
+  // worktree links: whatever else holds the issue, its agent can't build until it's gone.
+  if (extensionError) return extensionAdvice({ who, comment, paths: extensionError.paths ?? {} });
 
   const hold = issue.executionBlocker;
   // A run a pause cancelled holds every agent's wakes on the issue (watchdog 18).
@@ -566,6 +571,8 @@ export function llmPrompt({ identifier, report, advice, lastComments = [] }) {
     "and `workspace_validation_failed` means Paperclip refused the run before the agent started because it couldn't verify",
     "the workspace's git checkout: its `reasonCode` says what it couldn't prove (`source_registration_unproven` is most often",
     "worktree links git wrote as relative paths, `worktree.useRelativePaths`), and every retry fails the same way until it's fixed on the host.",
+    "A build that fails with \"Unsupported repository extension 'relativeworktrees'\" is the `extensions.relativeWorktrees` git leaves",
+    "in the checkout's config after those links are repaired: .NET SourceLink and libgit2 refuse it, and unsetting it fixes the build.",
     "",
     "## pch why",
     report,
