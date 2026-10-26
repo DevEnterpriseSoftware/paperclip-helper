@@ -76,9 +76,9 @@ export class BoundedMap {
 // for merge conflicts, so a restart neither re-processes a delivery, re-nudges
 // an issue nor sends a PR back twice.
 // Watchdog records that stand for something still going on, not a count of what was
-// done: forgetting one would route a card again, miss an agent's resume, or leave
-// agents paused at a usage limit. Kept past the cap.
-const LIVE_RECORD = /^(agent-paused|agent-resumed|limit):/;
+// done: forgetting one would route a card again, miss an agent's resume, leave
+// agents paused at a usage limit, or tell the board about a checkout twice. Kept past the cap.
+const LIVE_RECORD = /^(agent-paused|agent-resumed|limit|worktree-links):/;
 const keepRecord = (key, value) => LIVE_RECORD.test(key) || (key.startsWith("question:") && value?.relayId && !value.settled);
 
 export function createStateStore(file, { now = () => Date.now() } = {}) {

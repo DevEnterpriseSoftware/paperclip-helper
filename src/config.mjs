@@ -238,6 +238,9 @@ export function loadConfig(env = process.env) {
     // Tell the board when an issue reaches your approval stage with its PR approved by
     // every reviewer, clean and green: ready to queue (needs a GitHub token). Off by default.
     watchdogReportReadyToMerge: bool("WATCHDOG_REPORT_READY_TO_MERGE", false),
+    // Tell the board, once per project checkout, when issues are parked because their git
+    // worktree links are relative (watchdog 20). Notes only: nothing is commented or changed.
+    watchdogWorktreeLinks: bool("WATCHDOG_WORKTREE_LINKS", true),
 
     // cost-sync.mjs: API-equivalent cost of subscription runs
     costSync: bool("COST_SYNC", true),

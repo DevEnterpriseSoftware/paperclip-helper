@@ -471,6 +471,24 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           }
           return send(201, { id: comment.id, body: body.body });
         }
+        // Paperclip's comment reopen (routes/issues.ts, 2026.1023.0): a board user's comment on
+        // a blocked issue with no unresolved blocker moves it to todo and wakes the assignee
+        // (issue_reopened_via_comment). Modelled for an issue its recovery parked on a workspace
+        // validation, where that comment is the board's explicit retry; `db.onReopen(issue, run)`
+        // lets a test decide what the new run does.
+        const parked = db.recoveryActions[issue.id];
+        if (issue.status === "blocked" && parked?.kind === "workspace_validation" && !/^agent/.test(db.meSource ?? "board_key")) {
+          issue.status = "todo";
+          const owner = db.agents.find((a) => a.id === issue.assigneeAgentId);
+          if (owner && !["paused", "terminated", "pending_approval"].includes(owner.status)) {
+            const run = { id: uuid(), runId: null, companyId: issue.companyId, agentId: owner.id, status: "queued", reason: "issue_reopened_via_comment", createdAt: new Date().toISOString() };
+            run.runId = run.id;
+            (db.issueRuns[issue.id] ??= []).unshift(run);
+            db.heartbeatRuns.push(run);
+            db.onReopen?.(issue, run);
+          }
+          return send(201, { id: comment.id, body: body.body });
+        }
         wakeAssignee(issue, "issue_commented");
         return send(201, { id: comment.id, body: body.body });
       }

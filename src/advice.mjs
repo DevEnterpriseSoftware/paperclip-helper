@@ -18,6 +18,7 @@ import { escalatedReview } from "./board-held.mjs";
 import { PARTICIPANT_RECOVERY_CAUSE } from "./resume.mjs";
 import { pausedHoldWhy } from "./paused-holds.mjs";
 import { CONVERSATION_ADAPTERS } from "./release.mjs";
+import { validationAdvice } from "./worktree-links.mjs";
 
 const ASLEEP = new Set(["paused", "terminated", "pending_approval"]);
 const QUEUED_TOO_LONG_MS = 10 * 60_000;
@@ -56,6 +57,7 @@ export function advise(facts) {
     stagesWipedBy = null, // in review with no stage: who removed its stages (watchdog 17), when the activity log shows it
     ciRun = null, // the CI run the assignee's latest comments say it waits on: "repo#id" or the bare id
     pauseHold = null, // the hold is from a run a pause cancelled (watchdog 18): { ownerName, runId, waiting, held }
+    workspaceValidation = null, // Paperclip refused the assignee's runs at setup on the workspace (worktree-links.mjs): { reason, reasonCode, paths, repoUrl, nextAction }
     config = {},
     now = Date.now(),
   } = facts;
@@ -193,6 +195,19 @@ export function advise(facts) {
       ],
       watchdog: "manual",
     };
+  }
+
+  // Paperclip refuses every run at setup until it can verify the workspace's git
+  // checkout: no retry, comment or hold release helps before that is fixed on the host.
+  if (workspaceValidation) {
+    return validationAdvice(workspaceValidation, {
+      identifier,
+      who,
+      comment,
+      nextAction: workspaceValidation.nextAction ?? issue.executionBlocker?.nextAction ?? null,
+      paths: workspaceValidation.paths ?? {},
+      repoUrl: workspaceValidation.repoUrl ?? null,
+    });
   }
 
   const hold = issue.executionBlocker;
@@ -547,7 +562,10 @@ export function llmPrompt({ identifier, report, advice, lastComments = [] }) {
     "`deferred_issue_execution` is parked behind an earlier run; a run cancelled with `issue_reassigned` was",
     "cut off by a hand-off; `execution_reconciliation_required` means Paperclip refused the run before it started;",
     "a run cancelled with `agent_paused` was stopped by a pause; Paperclip never counts a cancelled blocker as resolved;",
-    "and a run that failed on a usage limit fails again on every retry until the limit resets.",
+    "a run that failed on a usage limit fails again on every retry until the limit resets;",
+    "and `workspace_validation_failed` means Paperclip refused the run before the agent started because it couldn't verify",
+    "the workspace's git checkout: its `reasonCode` says what it couldn't prove (`source_registration_unproven` is most often",
+    "worktree links git wrote as relative paths, `worktree.useRelativePaths`), and every retry fails the same way until it's fixed on the host.",
     "",
     "## pch why",
     report,

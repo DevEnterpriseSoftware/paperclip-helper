@@ -182,6 +182,16 @@
 //    PR is open, not a draft and clean on GitHub, gets one note saying so, and
 //    whether its reviewers can be paused again. `pch ready` lists them.
 //
+// 20. Relative worktree links (worktree-links.mjs). With worktree.useRelativePaths set
+//    (git 2.48 or newer) for the user Paperclip runs as, git writes a worktree's links as
+//    relative paths, Paperclip can't prove the worktree belongs to its project checkout,
+//    and it refuses every run at setup (workspace_validation_failed,
+//    source_registration_unproven); its recovery parks the issue for the board. With
+//    WATCHDOG_WORKTREE_LINKS on, the board is told once per project checkout, naming
+//    `pch worktrees --links`, which prints the repair to run on the host. The issues
+//    are never commented on: before the repair, a comment only fails the same way.
+//    6 leaves these issues to that note.
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
@@ -200,6 +210,7 @@ import { createResumeSweep, PARTICIPANT_RECOVERY_CAUSE, reviewParticipantOf } fr
 import { createPausedHoldCheck, pausedHoldSteps, pausedHoldWhy } from "./paused-holds.mjs";
 import { noteToBoard } from "./board-note.mjs";
 import { createReadyCheck } from "./ready.mjs";
+import { createWorktreeLinksCheck, RECOVERY_KIND as WORKSPACE_VALIDATION, RELATIVE_LINKS, validationOf } from "./worktree-links.mjs";
 
 const WATCHED_STATUSES = "todo,in_progress,in_review";
 const OPEN_STATUSES = "backlog,todo,in_progress,in_review,blocked";
@@ -266,7 +277,7 @@ export function createWatchdog(ctx, state, deps = {}) {
   const stats = {
     ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, questions: 0,
     ciReports: 0, ciReruns: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, pausedHolds: 0,
-    runnerProblems: 0, readyNotes: 0, lastError: null,
+    runnerProblems: 0, readyNotes: 0, worktreeLinkNotes: 0, lastError: null,
   };
   const stallMs = config.watchdogStallSec * 1000;
   const liveWorkspaces = new Map(); // workspaceId → when it was last seen live
@@ -278,6 +289,8 @@ export function createWatchdog(ctx, state, deps = {}) {
   const now = () => ctx.now();
   const limits = createLimitCheck({ api, config, log, records, state, now, stats, dryRunSeen });
   // 15. Issues blocked while their agent was paused (resume.mjs). 6 and 2 leave its issues to it.
+  // 20. Relative worktree links: one note per project checkout.
+  const worktreeLinks = createWorktreeLinksCheck({ ctx, records, state, stats, dryRunSeen, noteToBoard });
   const resumes = createResumeSweep({ ctx, records, state, stats, dryRunSeen, record, onSettled: (companyId) => pausedHolds.scanSoon(companyId) });
 
   async function agentFor(id, agents) {
@@ -566,6 +579,9 @@ export function createWatchdog(ctx, state, deps = {}) {
       return;
     }
     if (action.kind !== "stranded_assigned_issue" || action.ownerType !== "board") {
+      // Relative worktree links: 20 tells the board once per checkout instead.
+      const validation = action.kind === WORKSPACE_VALIDATION ? validationOf(action) : null;
+      if (validation?.reasonCode === RELATIVE_LINKS && config.watchdogWorktreeLinks) return;
       // Paperclip is asking for a judgement (a stalled review, an uncertain action): not ours to make.
       const key = record.parkedReported(issue, action.id);
       if (records.has(key)) return;
@@ -575,6 +591,7 @@ export function createWatchdog(ctx, state, deps = {}) {
         issue: who,
         kind: action.kind ?? action.cause ?? null,
         owner: action.ownerType ?? null,
+        ...(validation ? { reason: validation.reason, reasonCode: validation.reasonCode } : {}),
         nextAction: action.nextAction ?? null,
         hint: `See \`pch why ${who}\` for what to do.`,
       });
@@ -1329,6 +1346,7 @@ export function createWatchdog(ctx, state, deps = {}) {
         if (config.watchdogCiRuns) await run("CI runs", companyId, () => ciRunsCheck.check(companyId, agents));
         if (config.watchdogStagesWipe) await run("review stages", companyId, () => stagesCheck.check(companyId, agents));
         if (config.watchdogReportReadyToMerge) await run("ready to queue", companyId, () => readyCheck.check(companyId, agents));
+        if (config.watchdogWorktreeLinks) await run("worktree links", companyId, () => worktreeLinks.check(companyId));
       }
       stats.lastError = failure;
     } catch (err) {
@@ -1367,6 +1385,7 @@ export function createWatchdog(ctx, state, deps = {}) {
           : false,
         stagesWipe: config.watchdogStagesWipe ? (github ? true : "on, without the open-PR part: no GitHub token") : false,
         reportReadyToMerge: config.watchdogReportReadyToMerge ? (github ? true : "off: no GitHub token (GITHUB_TOKEN or GITHUB_TOKEN_FILE)") : false,
+        worktreeLinks: config.watchdogWorktreeLinks,
         resumeSweep: config.watchdogResumeSweep,
         // Runs at once per agent, for the sweep's restores and 6's nudges.
         runsPerAgent: config.watchdogResumeSweepLimit || "the agent's maxConcurrentRuns",

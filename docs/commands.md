@@ -16,6 +16,7 @@
 | `pch release ISSUE [--apply] [--outcome …]` | Releases an execution hold whose run can't prove it stopped, so messages and Interrupt stay saved behind it. It previews unless you pass `--apply`. See [`release`](#release-a-hold-messages-cant-clear). |
 | `pch workspace ISSUE [--apply]` | Gives an issue linked to a closed workspace, or to another issue's live one, a new isolated workspace. It previews unless you pass `--apply`. See [`workspace`](#workspace-an-issue-linked-to-the-wrong-workspace). |
 | `pch worktrees [--apply]` | Closes the execution workspaces of finished issues, so Paperclip removes their git worktrees from disk. It previews unless you pass `--apply`. See [`worktrees`](#worktrees-finished-issues-worktrees-still-on-disk). |
+| `pch worktrees --links [--retry]` | The issues whose every run fails at setup because Paperclip can't follow their worktrees' git links (`workspace_validation_failed`, `source_registration_unproven`), grouped by project checkout, with the commands that repair the links on Paperclip's host. `--retry`, once you've run them, comments on each issue still parked that way and reports its next run. See [`worktrees --links`](#worktrees---links-every-run-fails-at-setup-on-relative-worktree-links). |
 | `pch usage [--days N] [--agent NAME]` | Where the tokens go: per agent, its runs, tokens, cost, model and effort, what woke it, and the agents worth a look (one that polls, one that keeps failing, one using most of its provider's tokens). Read-only. See [`usage`](#usage-where-the-tokens-go). |
 | `pch costs` | Previews what cost sync would post, and what it does to budgets. |
 | `pch costs --sessions` | Checks whether resumed sessions report cumulative costs (see [Compatibility](../README.md#compatibility)). |
@@ -150,6 +151,7 @@ The recommendation names what is going on, gives the steps as commands you can p
 - a run that is working, about to start, or has sat queued for more than ten minutes;
 - a link to a closed workspace, which fails every run at setup;
 - a review Paperclip escalated to you after its review-round limit, or a review or approval waiting on you;
+- runs Paperclip refuses at setup because it can't verify the workspace (`workspace_validation_failed`): the reason and reason code it recorded, what it couldn't prove, and Paperclip's own next action; for relative worktree links (`source_registration_unproven`), the check, the repair for the issue's project checkout and the retry (see [`worktrees --links`](#worktrees---links-every-run-fails-at-setup-on-relative-worktree-links));
 - an execution hold: one left by a run an agent's pause cancelled ("Queued wakes held by an unreconciled run from a pause: …", with the wakes it holds and the two steps that lift it), or any other;
 - a last run that hit its plan's usage limit (Claude or Codex, with the reset time);
 - a review blocked because its participant couldn't be woken, and any other issue Paperclip's recovery parked;
@@ -247,6 +249,41 @@ What it leaves alone:
 - **An issue a run still holds.**
 
 The helper changes nothing on disk itself; Paperclip does the removal and records each step in the workspace's operations. To have Paperclip's reaper keep up by itself, shorten its cooldown with `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS` in Paperclip's environment. Reclaiming the freed space from a WSL or VM disk is a separate step (on WSL: `fstrim`, then compact the `.vhdx`).
+
+## `worktrees --links`: every run fails at setup on relative worktree links
+
+Every run on an issue fails within seconds, before the agent starts, with `workspace_validation_failed` and "The selected execution workspace's original repository could not be verified", and Paperclip's recovery blocks the issue for a board decision. `pch why` shows the reason Paperclip recorded. With `source_registration_unproven`, Paperclip couldn't prove that the worktree links back to its project checkout. The usual cause is git's `worktree.useRelativePaths` (git 2.48 or newer) set for the user Paperclip runs as: git then writes both of a worktree's links as relative paths, which git is happy with and Paperclip can't follow, so every worktree created after that fails. See [watchdog 20](watchdog.md#20-relative-worktree-links) and [Paperclip internals](paperclip-internals.md).
+
+`pch worktrees --links` lists the issues parked that way, grouped by project checkout (the part of the workspace's path before `/.paperclip/worktrees/`), with each issue's assignee and worktree, then the commands to run on Paperclip's host for that checkout:
+
+```text
+$ pch worktrees --links
+ACM: 2 issues fail every run at setup: Paperclip can't prove their worktrees link back to the project checkout (source_registration_unproven)
+
+  Project checkout /srv/app: 2 issues
+    ACM-12     Builder        /srv/app/.paperclip/worktrees/ACM-12-login
+    ACM-14     Reviewer       /srv/app/.paperclip/worktrees/ACM-14-tests
+  Check: cat '/srv/app/.paperclip/worktrees/ACM-12-login/.git'   (a gitdir: that doesn't start with / confirms relative links)
+  On the Paperclip host, as the user Paperclip runs as (this repository only; the user's global git setting stays):
+    B='/srv/app'
+    git -C "$B" config --local worktree.useRelativePaths false
+    git -C "$B" worktree list --porcelain | sed -n 's/^worktree //p' | tail -n +2 | tr '\n' '\0' | xargs -0 -r git -C "$B" worktree repair --no-relative-paths
+    git -C "$B" worktree list --porcelain | sed -n 's/^worktree //p' | tail -n +2 | sed 's|$|/.git|' | tr '\n' '\0' | xargs -0 -r grep -L '^gitdir: /' | wc -l     # 0: every worktree links to the checkout by absolute path
+    grep -L '^/' "$B"/.git/worktrees/*/gitdir | wc -l     # 0: the checkout links to every worktree by absolute path
+  Every worktree in the checkout is repaired, not only these: any other with relative links fails on its next run.
+
+Once the repair has run on the host:
+  pch worktrees --links --retry
+```
+
+- **The check** prints the worktree's own link: `gitdir: ../../../.git/worktrees/…` (relative) confirms the cause. A folder instead of a file means the worktree was replaced by a separate clone, which the repair doesn't fix.
+- **The repair** sets `worktree.useRelativePaths false` in that repository's own config, so worktrees Paperclip creates there from now on get absolute links whatever the user's global setting says, and rewrites the links of every worktree git lists for the checkout as absolute paths. For Paperclip's own layout that is `git -C "$B" worktree repair --no-relative-paths "$B"/.paperclip/worktrees/*/`, the form that fixed it on a live instance; going by `git worktree list` also catches a worktree a branch name with a slash nests a level down, and never another repository's. Run it as the user Paperclip runs as, so the files keep their owner. Both counts must print 0. It needs GNU `xargs` (`-r`), as on any Linux host.
+- **For worktrees outside Paperclip's own layout** (a project whose workspace strategy sets `worktreeParentDir`), the checkout can't be told from the path, so the first line asks git for it.
+- **Other reasons** (`source_repository_mismatch`, a missing worktree, …) are listed under "Also parked on workspace validation, for other reasons"; `pch why ISSUE` says what each needs.
+
+The helper never touches the disk, and usually runs where it can't see Paperclip's, so the repair is yours to run. Then `--retry` comments, as you, on each issue still parked with `source_registration_unproven`: a board comment is the retry Paperclip waits for (it moves the issue to `todo` and wakes the assignee). It then waits up to a minute and reports each issue's next run: past setup (finished, or running with its adapter started: a run is `running` from the moment it is claimed, before the workspace check), the same failure again, a setup failure for another reason now, or not started yet; either failure fails the command. The same failure again means the links are still relative, or the worktree isn't one the repair fixes: a separate clone (its `.git` is a folder), or one `git worktree list` doesn't show. It leaves alone an issue that is no longer parked that way, is also blocked by an unresolved issue (a comment wouldn't reopen it), has a review stage pending (set it back to In review instead, which wakes the stage's participant), has a run queued or going, or whose agent is paused, terminated or awaiting approval, and one whose last run that reached the model was stopped by the model's safety classifier: that stays your call. It never cancels or pauses a run.
+
+[The watchdog](watchdog.md#20-relative-worktree-links) tells the board once per checkout when issues are parked this way (`WATCHDOG_WORKTREE_LINKS`), and names this command. It doesn't comment on the issues: before the repair, a comment only fails the same way.
 
 ## Debugging with an LLM
 

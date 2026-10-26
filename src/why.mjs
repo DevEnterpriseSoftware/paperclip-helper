@@ -11,6 +11,8 @@ import { issueActivity, stagesWipe } from "./stages.mjs";
 import { runRefs, waitingOn } from "./ci-runs.mjs";
 import { PAUSE_CANCEL, RECONCILIATION_CAUSE } from "./release.mjs";
 import { describeWakes } from "./paused-holds.mjs";
+import { codeLabel, hostPaths, meaningOf, readWorkspace, RECOVERY_KIND, VALIDATION_FAILED, validationOf } from "./worktree-links.mjs";
+import { ts } from "./util.mjs";
 
 // A blocker counts as "finalizing" until the latest operation on its execution
 // workspace is a successful workspace_finalize. Show the last few operations.
@@ -205,9 +207,10 @@ async function whyReport(ctx, identifier, out) {
   const lastOwnRun = runList.find((r) => r.agentId === full?.assigneeAgentId && r.status !== "cancelled");
   let deadLinkRun = null;
   let lastFailure = null;
+  let detail = null;
   if (lastOwnRun?.status === "failed") {
     const runId = lastOwnRun.runId ?? lastOwnRun.id;
-    const detail = await api.request("GET", `/api/heartbeat-runs/${runId}`).catch(() => null);
+    detail = await api.request("GET", `/api/heartbeat-runs/${runId}`).catch(() => null);
     if (lastOwnRun.errorCode === "setup_failed") {
       const wsId = deadLinkWorkspaceId(detail?.error);
       if (wsId) deadLinkRun = { runId, workspaceId: wsId };
@@ -223,6 +226,39 @@ async function whyReport(ctx, identifier, out) {
       };
       if (verdict.kind === "limit") out(`Usage limit: ${lastFailure.label} ${verdict.what}${lastFailure.resetAt ? `, resets ${lastFailure.resetAt}` : ""}`);
     }
+  }
+  // A run Paperclip refused at setup because it couldn't verify the workspace: the
+  // reason it recorded, from the run itself or from the recovery action that parked
+  // the issue. The wake diagnostics withhold it ("raw error text is withheld").
+  // A failed run's reason is only advice while nothing has tried since: no wake for the
+  // assignee after it (a retry, say), and the issue still on the same workspace. An
+  // active recovery action of that kind is current by itself.
+  let workspaceValidation = null;
+  const fromRecovery = recovery?.kind === RECOVERY_KIND ? validationOf(recovery) : null;
+  const fromRun = lastOwnRun?.status === "failed" && lastOwnRun.errorCode === VALIDATION_FAILED ? validationOf(detail) : null;
+  const failedAt = ts(lastOwnRun?.finishedAt ?? lastOwnRun?.createdAt);
+  const triedSince = (wakes?.events ?? []).some(
+    (e) => e.kind === "wake_request" && (e.agentId == null || e.agentId === full?.assigneeAgentId) && ts(e.requestedAt) > failedAt,
+  );
+  const movedOn = fromRun?.executionWorkspaceId && full?.executionWorkspaceId && full.executionWorkspaceId !== fromRun.executionWorkspaceId;
+  const v = fromRecovery ?? fromRun;
+  const current = Boolean(fromRecovery) || (Boolean(fromRun) && !triedSince && !movedOn);
+  if (v) {
+    const ws = await readWorkspace(api, v.executionWorkspaceId ?? full?.executionWorkspaceId, full);
+    const paths = hostPaths(ws, v);
+    if (current) workspaceValidation = {
+      ...v,
+      paths,
+      repoUrl: ws?.repoUrl ?? null,
+      nextAction: recovery?.kind === RECOVERY_KIND ? recovery.nextAction ?? null : null,
+    };
+    out(
+      `${current ? "Workspace validation" : "Last run's workspace validation"}: ${codeLabel(v)}${v.executionWorkspaceId ? ` (workspace ${v.executionWorkspaceId.slice(0, 8)})` : ""}` +
+        `${current ? "" : movedOn ? "; the issue is on another workspace since" : "; something has woken the issue since"}`,
+    );
+    const meaning = meaningOf(v);
+    if (meaning) out(`  Meaning: ${meaning}`);
+    if (paths.worktree) out(`  Worktree: ${paths.worktree}${paths.checkout ? ` (project checkout ${paths.checkout})` : ""}`);
   }
   // A usage-limit pause by the watchdog (watchdog 16), from its state file.
   const records = readJson(ctx.config.stateFile, {})?.nudges ?? {};
@@ -267,6 +303,7 @@ async function whyReport(ctx, identifier, out) {
     runs: runList,
     link,
     deadLinkRun,
+    workspaceValidation,
     lastFailure,
     limitPause,
     participant,

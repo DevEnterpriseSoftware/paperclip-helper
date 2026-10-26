@@ -24,6 +24,7 @@ src/
   questions.mjs     watchdog 10: question cards addressed to a teammate
   release.mjs       watchdog 7 and `pch release`: holds Paperclip can't release
   workspace.mjs     watchdog 8, 9 and `pch workspace`: workspace links
+  worktree-links.mjs  watchdog 20, `pch worktrees --links` and `pch why`: runs refused on the workspace (workspace validation)
   resume.mjs        watchdog 15: issues blocked while their agent was paused
   limits.mjs        watchdog 16: usage limits (a recogniser per adapter)
   stages.mjs        watchdog 17: wiped review stages
@@ -92,7 +93,7 @@ To run it against a Paperclip you started yourself, set `PAPERCLIP_COMPAT_API`. 
 
 The same suite runs in CI on every push, and daily against Paperclip's latest release (`.github/workflows/compat.yml`). When a new Paperclip passes, add its version to that workflow's list. When the helper calls a new endpoint, the suite's last test fails until you add it to `HELPER_ENDPOINTS` (or, for one Paperclip serves but leaves out of its OpenAPI document, `UNDOCUMENTED_ENDPOINTS`).
 
-What it can't reproduce are failures that need real infrastructure: an environment lease that is refused, a failed `workspace_finalize`, a recovery hold, and subscription runs with usage. Those stay covered by the fake server's tests and by `pch why` on a live instance.
+What it can't reproduce are failures that need real infrastructure: an environment lease that is refused, a failed `workspace_finalize`, a recovery hold, a workspace validation that fails (git worktrees under a project checkout), and subscription runs with usage. Those stay covered by the fake server's tests and by `pch why` on a live instance.
 
 To try a local image with the installer, set `PCH_IMAGE=paperclip-helper:dev`; the installer uses a local image when it can't pull one.
 

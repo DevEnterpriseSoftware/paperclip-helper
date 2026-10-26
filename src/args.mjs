@@ -39,8 +39,16 @@ export const SPECS = {
   },
   workspace: { usage: "workspace ISSUE [--apply]", args: ["issue"], options: { apply: "boolean" } },
   worktrees: {
-    usage: "worktrees [--apply] [--min-days N] [--include-untracked] [--include-unmerged]",
-    options: { apply: "boolean", "min-days": { type: "number", default: 1 }, "include-untracked": "boolean", "include-unmerged": "boolean" },
+    usage: "worktrees [--apply] [--min-days N] [--include-untracked] [--include-unmerged] | worktrees --links [--retry]",
+    options: {
+      apply: "boolean", "min-days": { type: "number", default: 1 }, "include-untracked": "boolean", "include-unmerged": "boolean",
+      links: "boolean", retry: "boolean",
+    },
+    // The two forms don't mix.
+    validate: (o, given) =>
+      o.retry && !o.links ? "--retry goes with --links."
+        : o.links && ["apply", "minDays", "includeUntracked", "includeUnmerged"].some((k) => given.has(k)) ? "--links takes only --retry."
+        : null,
   },
   models: { usage: "models" },
   "set-model": { usage: "set-model FROM TO [--apply]", args: ["from", "to"], options: { apply: "boolean" } },
@@ -146,5 +154,7 @@ export function parseCommandLine(command, words) {
     args[name] = value ?? null;
   }
   if (positionals.length) fail(`pch ${command} doesn't take "${positionals[0]}".`);
+  const invalid = spec.validate?.(options, given);
+  if (invalid) fail(invalid);
   return { help: false, usage, args, options, given };
 }

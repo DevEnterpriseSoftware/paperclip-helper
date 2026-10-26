@@ -809,6 +809,20 @@ if (!BASE) {
       assert.ok((await commentsOf(s.work.id)).some((c) => c.body.startsWith("compat: comment by command")));
     });
 
+    test("pch worktrees --links reads blocked issues and their recovery actions, and posts nothing", async () => {
+      // A workspace validation that fails needs git worktrees under a project checkout, which
+      // these process agents don't have, so the failure itself isn't reproduced here. Paperclip
+      // 2026.1023.0 (commit 1b4c8038) refused every run on worktrees git had linked by relative
+      // path (worktree.useRelativePaths) with workspace_validation_failed and
+      // source_registration_unproven: what this command lists and `pch why` names. What is
+      // checked is the reading: the company's blocked issues, each one's recovery actions (or a
+      // list row's activeRecoveryAction), and that --retry with nothing parked posts nothing.
+      const before = (await commentsOf(s.work.id)).length;
+      const lines = await captureOutput(() => commands.worktrees(s.ctx, { links: true, retry: true }));
+      assert.ok(lines.length > 0 && lines.every((l) => /: no issue is parked on its worktree links\.$/.test(l)), lines.join("\n"));
+      assert.equal((await commentsOf(s.work.id)).length, before);
+    });
+
     test("pch set-model changes only the model: PATCH merges into adapterConfig", async () => {
       const newModel = `${s.oldModel}-new`;
       const lines = await captureOutput(() => commands.setModel(s.ctx, s.oldModel, newModel, { apply: true }));

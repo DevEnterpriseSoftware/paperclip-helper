@@ -183,7 +183,7 @@ async function main() {
     answer: () => cmd.answer(ctx, a.issue, a.card, a.text),
     release: () => cmd.release(ctx, a.issue, o),
     workspace: () => cmd.workspace(ctx, a.issue, o),
-    worktrees: () => cmd.worktrees(ctx, o),
+    worktrees: () => cmd.worktrees(ctx, { ...o, given }),
     costs: () => cmd.costs(ctx, { ...o, given }),
     usage: () => cmd.usage(ctx, o),
     models: () => cmd.models(ctx),

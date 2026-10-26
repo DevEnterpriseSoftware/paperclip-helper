@@ -6,7 +6,7 @@ import path from "node:path";
 import { readStatus, serviceLive } from "./instance.mjs";
 import { createGitHub, tokenSource } from "./github.mjs";
 import { companyAgents, companyPrefixes } from "./paperclip.mjs";
-import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, plural, signed } from "./util.mjs";
+import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, pausedRefusal, plural, signed } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
 import { blocked as blockedReport } from "./blocked.mjs";
 import {
@@ -22,6 +22,9 @@ import {
   linkFacts,
 } from "./workspace.mjs";
 import { closeWorkspace, lastFailedOperation, survey } from "./worktrees.mjs";
+import {
+  awaitNextRuns, byCheckout, codeLabel, linkCheck, parkedOnValidation, RELATIVE_LINKS, repairCommands, retryProblem,
+} from "./worktree-links.mjs";
 import { readUsage, render, summarize } from "./usage.mjs";
 import { answerFor, findCard } from "./answer.mjs";
 export { why } from "./why.mjs";
@@ -55,6 +58,9 @@ Decide and unblock
 Housekeeping
   worktrees [--apply] [--min-days N] [--include-untracked] [--include-unmerged]
                              close finished issues' workspaces, so Paperclip removes their worktrees
+  worktrees --links [--retry]
+                             issues whose every run fails at setup on relative worktree links: the
+                             repair to run on the host (--retry: then wake them)
   models                     every agent's adapter, model and effort
   set-model FROM TO [--apply]
                              move every agent on model FROM to TO
@@ -411,8 +417,14 @@ export async function workspace(ctx, identifier, { apply = false } = {}) {
 // Workspaces of finished issues still on disk (see worktrees.mjs). Lists what
 // Paperclip would remove, what it would throw away work for, and what it
 // refuses; --apply closes the first group one by one, as the Close button does.
-export async function worktrees(ctx, { apply = false, minDays = 1, includeUntracked = false, includeUnmerged = false } = {}) {
+export async function worktrees(ctx, { apply = false, minDays = 1, includeUntracked = false, includeUnmerged = false, links = false, retry = false, given = new Set(), ...rest } = {}) {
   const { api } = ctx;
+  if (retry && !links) throw new Error("--retry goes with --links: pch worktrees --links --retry");
+  if (links) {
+    const others = ["apply", "minDays", "includeUntracked", "includeUnmerged"].filter((k) => given.has(k) || (k === "apply" && apply));
+    if (others.length) throw new Error("--links takes only --retry: usage: pch worktrees --links [--retry]");
+    return worktreeLinks(ctx, { retry, ...rest });
+  }
   if (!Number.isFinite(minDays) || minDays < 0) throw new Error("--min-days must be a number of days, 0 or more");
   const opts = { includeUntracked, includeUnmerged };
 
@@ -526,6 +538,121 @@ export async function worktrees(ctx, { apply = false, minDays = 1, includeUntrac
   out("");
   out(`Closed ${plural(closed, "workspace")}.${failed.length ? ` ${failed.length} didn't close cleanly; their worktrees may still be on disk.` : ""}`);
   if (failed.length) process.exitCode = 1;
+}
+
+// ---------------------------------------------------------------- worktree links
+
+// Issues whose every run Paperclip refuses at setup because it can't prove their
+// worktree links back to the project checkout (source_registration_unproven; see
+// worktree-links.mjs), grouped by checkout, with the commands that repair the links
+// on Paperclip's host. The helper never touches the disk. --retry, once you have run
+// them, comments on each issue still parked this way, as you: the retry Paperclip
+// waits for. Then it reports each issue's next run.
+export async function worktreeLinks(ctx, { retry = false, waitMs = 60_000, pollMs = 3_000 } = {}) {
+  const { api } = ctx;
+  const me = await ctx.identity();
+  const label = (i) => i.identifier ?? String(i.id).slice(0, 8);
+  const agents = new Map();
+  const agentOf = async (id) => {
+    if (!id) return null;
+    if (!agents.has(id)) agents.set(id, await api.request("GET", `/api/agents/${id}`).catch(() => null));
+    return agents.get(id);
+  };
+  const targets = [];
+  for (const companyId of me.companyIds ?? []) {
+    const company = await api.request("GET", `/api/companies/${companyId}`).catch(() => ({}));
+    const name = company.issuePrefix ?? company.name ?? companyId;
+    const parked = await parkedOnValidation(api, companyId);
+    const relative = parked.filter((p) => p.validation.reasonCode === RELATIVE_LINKS);
+    const other = parked.filter((p) => p.validation.reasonCode !== RELATIVE_LINKS);
+    if (!relative.length) {
+      out(`${name}: no issue is parked on its worktree links.`);
+    } else {
+      out(`${name}: ${plural(relative.length, "issue")} fail${relative.length === 1 ? "s" : ""} every run at setup: Paperclip can't prove their worktrees link back to the project checkout (${RELATIVE_LINKS})`);
+      for (const group of await byCheckout(api, relative)) {
+        out("");
+        out(`  ${group.paths.checkout ? `Project checkout ${group.paths.checkout}` : `Worktrees in ${group.key}`}: ${plural(group.items.length, "issue")}`);
+        for (const item of group.items) {
+          const who = (await agentOf(item.issue.assigneeAgentId))?.name ?? "nobody";
+          out(`    ${label(item.issue).padEnd(10)} ${String(who).padEnd(14)} ${item.paths.worktree ?? `workspace ${String(item.validation.executionWorkspaceId ?? "?").slice(0, 8)}`}`);
+        }
+        const sample = group.items.find((i) => i.paths.worktree)?.paths ?? group.paths;
+        out(`  Check: ${linkCheck(sample)}   (a gitdir: that doesn't start with / confirms relative links)`);
+        out("  On the Paperclip host, as the user Paperclip runs as (this repository only; the user's global git setting stays):");
+        for (const line of repairCommands(sample)) out(`    ${line}`);
+        out("  Every worktree in the checkout is repaired, not only these: any other with relative links fails on its next run.");
+        targets.push(...group.items);
+      }
+    }
+    if (other.length) {
+      out(`  Also parked on workspace validation, for other reasons (\`pch why ISSUE\` says what each needs): ${other.map((p) => `${label(p.issue)} (${codeLabel(p.validation)})`).join(", ")}`);
+    }
+  }
+  if (!targets.length) return;
+  if (!retry) {
+    out("");
+    out("Once the repair has run on the host:");
+    out("  pch worktrees --links --retry");
+    out("It comments, as you, on each issue still parked this way (the retry Paperclip waits for), then reports each issue's next run.");
+    out("Before the repair, a retry only fails the same way.");
+    return;
+  }
+
+  out("");
+  const retried = [];
+  for (const item of targets) {
+    const id = item.issue.id;
+    const [issue, recovery, runs, blockers] = await Promise.all([
+      api.request("GET", `/api/issues/${id}`).catch(() => null),
+      api.request("GET", `/api/issues/${id}/recovery-actions`).catch(() => null),
+      api.request("GET", `/api/issues/${id}/runs`).catch(() => null),
+      api.request("GET", `/api/issues/${id}/diagnostics/blockers`).catch(() => null),
+    ]);
+    if (!issue || !recovery || !runs || !blockers) {
+      out(`${label(item.issue)}: left alone (couldn't read ${!issue ? "it" : !recovery ? "its recovery actions" : !runs ? "its runs" : "its blockers"}).`);
+      continue;
+    }
+    const agent = await agentOf(issue.assigneeAgentId);
+    const problem = await retryProblem(issue, recovery.active ?? null, runs, {
+      agent,
+      blockers,
+      detailOf: (r) => api.request("GET", `/api/heartbeat-runs/${r.runId ?? r.id}`),
+    });
+    if (problem) {
+      out(`${label(issue)}: left alone (${problem}).`);
+      continue;
+    }
+    const who = agent?.name;
+    const text = `${who ? `${who}, the` : "The"} worktree links are repaired: Paperclip can verify this issue's workspace again. Please continue this issue.`;
+    try {
+      await api.request("POST", `/api/issues/${id}/comments`, { body: signed(text, COMMAND_SIGNATURE) });
+    } catch (err) {
+      out(`${label(issue)}: not retried: ${pausedRefusal(err) ? "the task is paused; resume it first" : err.message}`);
+      process.exitCode = 1;
+      continue;
+    }
+    const list = Array.isArray(runs) ? runs : [];
+    retried.push({ issue, known: new Set(list.map((r) => r.runId ?? r.id)) });
+    out(`${label(issue)}: retried (a comment as you).`);
+  }
+  if (!retried.length) return;
+  out("");
+  out(`Their next runs (waiting up to ${Math.round(waitMs / 1000)}s):`);
+  const outcomes = await awaitNextRuns(api, retried, { waitMs, pollMs });
+  let again = 0;
+  let other = 0;
+  for (const { issue } of retried) {
+    const o = outcomes.get(issue.id);
+    if (o?.kind === "again") again += 1;
+    if (o?.kind === "other") other += 1;
+    out(`  ${label(issue).padEnd(10)} ${o?.text ?? "?"}${o?.kind === "waiting" || o?.kind === "other" ? `: \`pch why ${label(issue)}\`` : ""}`);
+  }
+  if (again) {
+    out("");
+    out(`${plural(again, "issue")} failed the same way. Either the links are still relative (run the repair above on the host; both counts must print 0),`);
+    out("or the worktree isn't one the repair fixes: a separate clone (its .git is a folder), or one `git worktree list` doesn't show. `pch why ISSUE` has the check.");
+  }
+  if (again || other) process.exitCode = 1;
 }
 
 // ---------------------------------------------------------------- decisions
@@ -742,6 +869,7 @@ export async function status(ctx) {
         counted(w.pausedHolds, "hold from a paused run lifted", "holds from a paused run lifted"),
         counted(w.runnerProblems, "broken runner reported", "broken runners reported"),
         counted(w.readyNotes, "PR ready to queue reported", "PRs ready to queue reported"),
+        counted(w.worktreeLinkNotes, "checkout with relative worktree links reported", "checkouts with relative worktree links reported"),
       ].filter(Boolean);
       out(`  Since start: ${done.length ? done.join(", ") : "nothing needed doing"}.`);
       if (w.stuck) out(`  ${plural(w.stuck, "issue")} stuck behind a deferred wake: see the log.`);

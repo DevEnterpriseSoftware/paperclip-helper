@@ -45,6 +45,7 @@ export const COUNTERS = [
   { key: "wipes", label: "wiped review stages reported", minutes: 10, from: (s) => s.watchdog?.wipes },
   { key: "runnerProblems", label: "broken runners reported", minutes: 15, from: (s) => s.watchdog?.runnerProblems },
   { key: "readyNotes", label: "PRs reported ready to queue", minutes: 2, from: (s) => s.watchdog?.readyNotes },
+  { key: "worktreeLinkNotes", label: "project checkouts with relative worktree links reported", minutes: 15, from: (s) => s.watchdog?.worktreeLinkNotes },
   { key: "stuck", label: "wakes stuck behind a stopped run, reported", from: (s) => s.watchdog?.stuck },
   // cost sync
   { key: "costPosts", label: "run costs posted", from: (s) => s.costSync?.posted },
