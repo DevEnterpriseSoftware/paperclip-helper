@@ -640,6 +640,7 @@ main() {
   # shellcheck disable=SC2034  # written to .env by write_env
   WATCHDOG_STAGES_WIPE="$(pick WATCHDOG_STAGES_WIPE true)"
   WATCHDOG_REPORT_READY_TO_MERGE="$(pick WATCHDOG_REPORT_READY_TO_MERGE false)"
+  # shellcheck disable=SC2034  # written to .env by write_env
   WATCHDOG_WORKTREE_LINKS="$(pick WATCHDOG_WORKTREE_LINKS true)"
   say "Paperclip loses track of work in a few known ways: a hand-off whose wake is dropped, blockers that"
   say "finish without anything picking the issue up, holds nobody can release. Every minute the watchdog"
