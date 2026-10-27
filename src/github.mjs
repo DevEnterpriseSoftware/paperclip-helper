@@ -25,13 +25,17 @@ import { signed } from "./util.mjs";
 export const HELPER_MARK = "<!-- paperclip-helper -->";
 
 export class GitHubError extends Error {
-  constructor(message, { status = 0, method, path, retryAfter = null } = {}) {
+  constructor(message, { status = 0, method, path, retryAfter = null, summary = null, tokenAge = null } = {}) {
     super(message);
     this.name = "GitHubError";
     this.status = status;
     this.retryAfter = retryAfter;
     this.method = method;
     this.path = path;
+    // What GitHub answered, without the helper's guess at why ("GET /repos/o/r/pulls/8 → 404: Not Found").
+    this.summary = summary ?? message;
+    // How long ago GITHUB_TOKEN_FILE was written ("40 seconds"), when a token file is used.
+    this.tokenAge = tokenAge;
   }
 }
 
@@ -68,6 +72,18 @@ function minutesSinceWritten(file) {
   }
 }
 
+// "40 seconds" or "12 minutes": how long ago the token file was written, or null.
+export function writtenAgo(file) {
+  let sec;
+  try {
+    sec = Math.max(0, Math.round((Date.now() - fs.statSync(file).mtimeMs) / 1000));
+  } catch {
+    return null;
+  }
+  if (sec < 120) return `${sec} ${sec === 1 ? "second" : "seconds"}`;
+  return `${Math.round(sec / 60)} minutes`;
+}
+
 // A read GitHub may answer on a second try: a dropped connection, a 5xx, or a
 // secondary rate limit that names a short wait (Retry-After, in seconds).
 const RETRY_WAIT_MS = 1_000;
@@ -82,7 +98,9 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch, sleep 
 
   function explain(method, path, res, data, text) {
     const detail = data && typeof data === "object" && data.message ? String(data.message) : String(text ?? "").slice(0, 300);
-    const meta = { status: res.status, method, path, retryAfter: res.headers.get("retry-after") };
+    const summary = `${method} ${path} → ${res.status}: ${detail}`;
+    const tokenAge = config.githubTokenFile ? writtenAgo(config.githubTokenFile) : null;
+    const meta = { status: res.status, method, path, retryAfter: res.headers.get("retry-after"), summary, tokenAge };
     if (res.status === 401) {
       if (config.githubTokenFile) {
         const age = minutesSinceWritten(config.githubTokenFile);
@@ -107,12 +125,18 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch, sleep 
             : /^\/repos\/[^/]+\/[^/]+$/.test(path)
               ? "Metadata"
               : "Pull requests";
+      if (res.status === 403) {
+        return new GitHubError(`${summary}. ${source} needs "${scope}: ${need}" on this repository.`, meta);
+      }
+      // GitHub answers 404 both for what isn't there and for what the token can't see,
+      // so a missing permission is only one possible reason.
+      const age = tokenAge ? ` The token file was written ${tokenAge} ago.` : "";
       return new GitHubError(
-        `${method} ${path} → ${res.status}: ${detail}. ${source} needs "${scope}: ${need}" on this repository.`,
+        `${summary}. Either it isn't there, or ${source} can't see it: then it needs "${scope}: ${need}" on this repository, and the repository must be one the token is limited to (\`pch check\` tests both).${age}`,
         meta,
       );
     }
-    return new GitHubError(`${method} ${path} → ${res.status}: ${detail}`, meta);
+    return new GitHubError(summary, meta);
   }
 
   async function request(method, path, body) {

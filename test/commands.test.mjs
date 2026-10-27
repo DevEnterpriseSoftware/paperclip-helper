@@ -6,6 +6,7 @@ import { captureOutput, setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import * as cmd from "../src/commands.mjs";
 import { writeJson } from "../src/store.mjs";
+import { pull, startFakeGitHub } from "./fake-github.mjs";
 
 function agents(db) {
   const make = (name, adapterConfig, extra = {}) => {
@@ -165,6 +166,39 @@ test("check shows the key, its companies and prefixes", async (t) => {
   assert.match(lines, /Key belongs to: Operator <operator@example.com>/);
   assert.match(lines, /Company: Acme \(issue prefix ACM\)/);
   assert.ok(path.isAbsolute(env.ctx.config.tokenFile));
+});
+
+test("check reads each repository's PRs as a list and one on its own, and says which failed", async (t) => {
+  const gh = await startFakeGitHub();
+  t.after(gh.close);
+  const env = await setup({
+    env: {
+      GITHUB_WEBHOOK_SECRET: "s",
+      GITHUB_OWNER_LOGIN: "Owner",
+      GITHUB_REPOS: "org/app,org/empty",
+      RELAY_PORT: "0",
+      RELAY_FIX_CONFLICTS: "true",
+      GITHUB_TOKEN: gh.token,
+      GITHUB_API: gh.url,
+    },
+  });
+  t.after(env.close);
+  gh.pulls["org/app"] = [pull(41), pull(42)];
+  const original = process.exitCode;
+  t.after(() => {
+    process.exitCode = original;
+  });
+
+  let lines = (await captureOutput(() => cmd.check(env.ctx))).join("\n");
+  assert.match(lines, /GitHub: GITHUB_TOKEN reads org\/app \(2 open PRs; PR #41 read on its own too\)/);
+  assert.match(lines, /GitHub: GITHUB_TOKEN reads org\/empty \(0 open PRs\)/);
+  assert.ok(gh.requests.some((r) => r.path === "/repos/org/app/pulls/41"));
+  assert.ok(!process.exitCode);
+
+  gh.fail["GET pull 41"] = 404;
+  lines = (await captureOutput(() => cmd.check(env.ctx))).join("\n");
+  assert.match(lines, /GitHub: GITHUB_TOKEN lists org\/app's PRs \(2 open PRs\), but reading PR #41 on its own failed: GET \/repos\/org\/app\/pulls\/41 → 404: Not Found$/m);
+  assert.equal(process.exitCode, 1);
 });
 
 test("update explains that it runs on the host, and how to get there", async () => {

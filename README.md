@@ -179,7 +179,7 @@ Paperclip records $0 for runs billed to a subscription. Cost sync posts one cost
 | Command | What it does |
 |---|---|
 | `pch status` | What the service is doing, its last checks and counts, Paperclip's version and build commit, and when the key expires; then all-time figures (what the helper has done, roughly how much hand work it saved) and its latest warnings and errors. |
-| `pch check [ISSUE]` | Who the key belongs to, its companies and prefixes. With an issue, its stage, current participant, and whether a merge would approve it. |
+| `pch check [ISSUE]` | Who the key belongs to, its companies and prefixes. With an issue, its stage, current participant, and whether a merge would approve it. With `RELAY_FIX_CONFLICTS` on, also whether the GitHub token can read each repository's PRs. |
 | `pch why ISSUE` | Why nobody is working on an issue, and what to do about it. `--prompt` prints it as a prompt for an LLM chat. |
 | `pch blocked` | Why each blocked issue is blocked, which issues the chains of blocked issues end at and what those wait on, and every question card that is waiting. |
 | `pch ready` | The PRs ready to queue, in queue order: approved by every reviewer, open, not a draft, clean and green on GitHub. |

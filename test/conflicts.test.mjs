@@ -7,7 +7,7 @@ import { ids, uuid } from "./fake-paperclip.mjs";
 import { pull, startFakeGitHub } from "./fake-github.mjs";
 import { createRelay } from "../src/relay.mjs";
 import { createStateStore } from "../src/store.mjs";
-import { HELPER_MARK } from "../src/github.mjs";
+import { HELPER_MARK, createGitHub } from "../src/github.mjs";
 import { redact } from "../src/log.mjs";
 
 const RELAY_ENV = {
@@ -211,6 +211,71 @@ test("the helper's own PR comment is not copied back to Paperclip, and one faili
   const results = await relay.sweepConflicts(REPO);
   assert.deepEqual(results.map((r) => r.action), ["error", "comment"]);
   assert.match(relay.stats.conflicts.lastError, /pulls\/8 → 500/);
+});
+
+test("a listed PR that answers 404 is asked again, and sent back once GitHub answers", async (t) => {
+  const { relay, db, open, gh, waits } = await sweepEnv(t);
+  const { review } = seed(db);
+  open.push(pull(8, { mergeable: false }));
+  gh.fail["GET pull 8"] = [404, 404];
+  const results = await relay.sweepConflicts(REPO);
+  assert.equal(results[0].action, "changes");
+  assert.equal(db.patches[0].issueId, review.id);
+  assert.equal(gh.requests.filter((r) => r.path === "/repos/org/app/pulls/8").length, 3);
+  assert.equal(waits.length, 2);
+});
+
+test("a listed PR that keeps answering 404 is not blamed on a permission, and is tried again next sweep", async (t) => {
+  const dir = tempDir();
+  const file = path.join(dir, "token");
+  fs.writeFileSync(file, "ghs_filetoken0123456789abcdef");
+  const env = await sweepEnv(t, { GITHUB_TOKEN: "", GITHUB_TOKEN_FILE: file });
+  env.gh.current.token = "ghs_filetoken0123456789abcdef";
+  seed(env.db);
+  env.open.push(pull(8, { mergeable: false }), pull(9, { title: "ACM-5: x", mergeable: false }));
+  env.gh.fail["GET pull 8"] = 404;
+
+  const results = await env.relay.sweepConflicts(REPO);
+  assert.deepEqual(results.map((r) => r.action), ["error", "comment"]);
+  const error = results[0].error;
+  assert.match(error, /^GET \/repos\/org\/app\/pulls\/8 → 404: Not Found 5 times, though the same token \(the token file was written \d+ seconds? ago\) listed this PR moments before, so it isn't a missing permission\. The PR is checked again on the next sweep\.$/);
+  assert.doesNotMatch(error, /needs "Pull requests/);
+  assert.equal(env.relay.stats.conflicts.lastError, error);
+  assert.equal(env.logs.find((l) => l.msg === "relay: conflict check failed").error, error);
+  assert.equal(env.state.conflicts.get("org/app#8"), undefined);
+
+  // Nothing was recorded for it, so the next sweep looks at it again.
+  delete env.gh.fail["GET pull 8"];
+  assert.equal((await env.relay.sweepConflicts(REPO))[0].action, "changes");
+});
+
+test("a 404 says it may not be there or the token can't see it; a 403 names the permission", async (t) => {
+  const { ctx, gh, open } = await sweepEnv(t);
+  const github = createGitHub({ config: ctx.config, log: ctx.log });
+  await assert.rejects(github.pull(REPO, 404), (err) => {
+    assert.equal(err.status, 404);
+    assert.equal(err.summary, "GET /repos/org/app/pulls/404 → 404: Not Found");
+    assert.match(err.message, /Either it isn't there, or GITHUB_TOKEN can't see it: then it needs "Pull requests: read" on this repository, and the repository must be one the token is limited to \(`pch check` tests both\)\.$/);
+    assert.equal(err.tokenAge, null);
+    return true;
+  });
+  open.push(pull(8));
+  gh.fail["GET pull 8"] = 403;
+  await assert.rejects(github.pull(REPO, 8), (err) => {
+    assert.match(err.message, /→ 403: Server Error\. GITHUB_TOKEN needs "Pull requests: read" on this repository\.$/);
+    assert.doesNotMatch(err.message, /isn't there/);
+    return true;
+  });
+
+  const dir = tempDir();
+  const file = path.join(dir, "token");
+  fs.writeFileSync(file, gh.token);
+  const fromFile = createGitHub({ config: { ...ctx.config, githubToken: "", githubTokenFile: file }, log: ctx.log });
+  await assert.rejects(fromFile.pull(REPO, 404), (err) => {
+    assert.match(err.message, /the token in GITHUB_TOKEN_FILE \(.*\) can't see it: .* The token file was written \d+ seconds? ago\.$/);
+    assert.match(err.tokenAge, /^\d+ seconds?$/);
+    return true;
+  });
 });
 
 test("without RELAY_FIX_CONFLICTS a merge sweeps nothing, and a bad token is explained", async (t) => {

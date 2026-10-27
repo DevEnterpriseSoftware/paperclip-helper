@@ -180,7 +180,21 @@ export async function check(ctx, identifier) {
     for (const repo of ctx.config.repos) {
       try {
         const pulls = await github.openPulls(repo);
-        out(`GitHub: ${tokenSource(ctx.config)} reads ${repo} (${pulls.length} open ${pulls.length === 1 ? "PR" : "PRs"})`);
+        const count = `${pulls.length} open ${pulls.length === 1 ? "PR" : "PRs"}`;
+        if (!pulls.length) {
+          out(`GitHub: ${tokenSource(ctx.config)} reads ${repo} (${count})`);
+          continue;
+        }
+        // The conflict sweep also reads each PR on its own (only that says whether it
+        // merges), which is a different call from the list: try it on the oldest one.
+        const number = pulls[0].number;
+        try {
+          await github.pull(repo, number);
+          out(`GitHub: ${tokenSource(ctx.config)} reads ${repo} (${count}; PR #${number} read on its own too)`);
+        } catch (err) {
+          out(`GitHub: ${tokenSource(ctx.config)} lists ${repo}'s PRs (${count}), but reading PR #${number} on its own failed: ${err.summary ?? err.message}`);
+          process.exitCode = 1;
+        }
       } catch (err) {
         out(`GitHub: ${err.message}`);
         process.exitCode = 1;

@@ -151,7 +151,7 @@ The relay needs a token to read pull requests and comment on them. A **fine-grai
    GITHUB_TOKEN=github_pat_…
    ```
 
-8. Run `pch check`. It prints `GitHub: GITHUB_TOKEN reads owner/repo (3 open PRs)` for each repository, or what GitHub refused.
+8. Run `pch check`. It prints `GitHub: GITHUB_TOKEN reads owner/repo (3 open PRs; PR #12 read on its own too)` for each repository, or what GitHub refused. It lists the open PRs and reads the oldest on its own, the two calls the conflict sweep makes.
 
 A **classic** token works too: [generate one](https://github.com/settings/tokens/new) with the `repo` scope (`public_repo` for public repositories only). It reaches every repository you can, so prefer the fine-grained one.
 
@@ -175,7 +175,8 @@ A token file at `~/.cache/paperclip-github-app/token`, where the `paperclip-gith
 
 - **The App needs Pull requests: Read and write** on the repositories in `GITHUB_REPOS` (Read-only with `RELAY_CONFLICT_PR_COMMENT=false`), and the token mustn't be limited to fewer of them. For the watchdog's CI-run check it also needs **Actions: Read** (Read and write to re-run flaky jobs).
 - **The PR comments are written by the App** (`your-app[bot]`), so they stand apart from yours.
-- **`pch check`** prints `GitHub: the token in GITHUB_TOKEN_FILE (/run/github-token/token) reads owner/repo (3 open PRs)`. If the program that renews the file stops, the log says how many minutes ago the file was written.
+- **`pch check`** prints `GitHub: the token in GITHUB_TOKEN_FILE (/run/github-token/token) reads owner/repo (3 open PRs; PR #12 read on its own too)`. It runs in the helper's container, so the path is the one inside it; on the host the file is wherever `GITHUB_TOKEN_HOST_FILE` says. If the program that renews the file stops, the log says how many minutes ago the file was written.
+- **A 404 isn't always a permission.** GitHub answers 404 both for what isn't there and for what the token can't see, so the message says both and, with a token file, how long ago it was written. A 403 names the permission. When the conflict sweep has just listed a PR with the same token, a 404 on reading it on its own can't be a permission: the sweep asks again a few times, and if it still fails it says so and checks the PR on the next sweep.
 - Set one of `GITHUB_TOKEN` and `GITHUB_TOKEN_FILE`, not both: the helper refuses to start with both.
 
 The PR comments are written by the token's account. With your own token they appear under your name; a token from a separate bot account that can read the repositories makes them stand out.

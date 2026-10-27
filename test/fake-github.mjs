@@ -73,7 +73,13 @@ export async function startFakeGitHub({ token = "ghp_testtoken0123456789abcdef" 
       if (m && req.method === "GET") {
         const found = (pulls[m[1]] ?? []).find((p) => p.number === Number(m[2]));
         if (!found) return send(res, 404, { message: "Not Found" });
-        if (fail[`GET pull ${m[2]}`]) return send(res, fail[`GET pull ${m[2]}`], { message: "Server Error" });
+        // A status fails every read; an array fails one read per entry, then reads succeed.
+        const key = `GET pull ${m[2]}`;
+        if (fail[key]) {
+          const status = Array.isArray(fail[key]) ? fail[key].shift() : fail[key];
+          if (Array.isArray(fail[key]) && !fail[key].length) delete fail[key];
+          return send(res, status, { message: status === 404 ? "Not Found" : "Server Error" });
+        }
         const mergeable = Array.isArray(found.mergeable)
           ? found.mergeable.length > 1
             ? found.mergeable.shift()

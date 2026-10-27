@@ -34,14 +34,32 @@ export function createConflictSweep({ ctx, state, github, decisions, sleep }) {
   const stats = { sweeps: 0, sentBack: 0, lastSweepAt: null, lastError: null };
 
   // The PR in full once GitHub knows whether it merges; null if it never said.
+  // The PR was just listed with the same token, and a PR can't be deleted, so a
+  // 404 here is GitHub not answering for it yet: it is asked again like a null.
   async function settled(repo, number) {
     for (let i = 0; i < MERGEABLE_TRIES; i += 1) {
-      const full = await github.pull(repo, number);
+      let full;
+      try {
+        full = await github.pull(repo, number);
+      } catch (err) {
+        if (err?.status !== 404 || i === MERGEABLE_TRIES - 1) throw err;
+        log.debug?.("relay: a listed PR answered 404, asking again", { repo, pr: number });
+        await wait(MERGEABLE_WAIT_MS);
+        continue;
+      }
       if (typeof full?.mergeable === "boolean") return full;
       if (full?.state && full.state !== "open") return full;
       if (i < MERGEABLE_TRIES - 1) await wait(MERGEABLE_WAIT_MS);
     }
     return null;
+  }
+
+  // A listed PR that still answers 404 can't be a missing permission: the same token
+  // has just listed it. Say that, rather than the 404's usual guess.
+  function failure(err) {
+    if (err?.status !== 404 || !/\/pulls\/\d+$/.test(err.path ?? "")) return err.message;
+    const age = err.tokenAge ? ` (the token file was written ${err.tokenAge} ago)` : "";
+    return `${err.summary} ${MERGEABLE_TRIES} times, though the same token${age} listed this PR moments before, so it isn't a missing permission. The PR is checked again on the next sweep.`;
   }
 
   function brief(pr, after) {
@@ -148,9 +166,10 @@ export function createConflictSweep({ ctx, state, github, decisions, sleep }) {
       try {
         results.push(await checkPull(repo, pr, after));
       } catch (err) {
-        stats.lastError = err.message;
-        results.push({ pr: pr.number, action: "error", error: err.message });
-        log.error("relay: conflict check failed", { repo, pr: pr.number, error: err.message });
+        const error = failure(err);
+        stats.lastError = error;
+        results.push({ pr: pr.number, action: "error", error });
+        log.error("relay: conflict check failed", { repo, pr: pr.number, error });
       }
     }
     if (!base) {
