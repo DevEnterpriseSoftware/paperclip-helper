@@ -243,7 +243,7 @@ test("pch why reads the reason from the recovery action when the run doesn't car
   const text = (await captureOutput(() => cmd.why(e.ctx, issue.identifier))).join("\n");
   assert.match(text, /^Workspace validation: git_worktree_not_reusable, git_inspection_failed/m);
   assert.match(text, /\(nonzero_exit, exit 128\)/);
-  assert.match(text, new RegExp(`Paperclip's own next action: ${NEXT_ACTION.replace(/[.,]/g, "\\$&")}`));
+  assert.match(text, new RegExp(`Paperclip's own next action: ${NEXT_ACTION.replace(/[\\.,]/g, "\\$&")}`));
 });
 
 test("why: builds failing on the extension git left behind get the check and the guarded unset", () => {

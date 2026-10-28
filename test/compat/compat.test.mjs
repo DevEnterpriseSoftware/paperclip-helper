@@ -656,7 +656,10 @@ if (!BASE) {
       const opened = await relay.handle("pull_request", gh({ action: "opened", pull_request: pr(reviewed.identifier, 12, { merged: false }) }));
       assert.deepEqual(opened, { identifier: reviewed.identifier, action: "note" }, "Paperclip took the Pull requests document, so the relay didn't fall back to a comment");
       const notes = await ok("GET", `/api/issues/${reviewed.id}/documents/pull-requests`);
-      assert.ok(String(notes.body).includes("https://github.com/acme/app/pull/12") && String(notes.body).includes("opened"), `the PR's URL is in the document: ${notes.body}`);
+      const body = String(notes.body);
+      const links = [...body.matchAll(/https?:\/\/[^\s)"'<>]+/g)].map((m) => new URL(m[0]));
+      assert.ok(links.some((u) => u.origin === "https://github.com" && u.pathname === "/acme/app/pull/12"), `the PR's URL is in the document: ${body}`);
+      assert.ok(body.includes("opened"), `the document says the PR was opened: ${body}`);
 
       const result = await relay.handle(
         "pull_request_review",
