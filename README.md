@@ -15,6 +15,10 @@ Self-hosted [Paperclip](https://github.com/paperclipai/paperclip) has gaps that 
 - **You can see where the tokens go.** `pch usage` shows each agent's runs, tokens and what woke it; cost sync puts subscription runs on the Costs page; `pch why` and `pch blocked` say what's holding the work.
 - **Safe by default.** Everything happens through Paperclip's API under your name, `DRY_RUN=true` previews it all, and the Helper never merges, pushes or deletes anything.
 
+`pch status` shows what each part is doing, what the watchdog's last check cost, and what the helper has done since it was first started:
+
+![pch status: the relay and watchdog on, cost sync off, the watchdog's last check with its slowest parts and requests, and the all-time figures with the latest warnings and errors](docs/images/pch-status.png)
+
 ## Contents
 
 - [What Paperclip leaves you with, and what the helper does about it](#what-paperclip-leaves-you-with-and-what-the-helper-does-about-it)
