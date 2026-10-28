@@ -4,7 +4,7 @@
 
 | Command | What it does |
 |---|---|
-| `pch status` | What the service is doing, its last checks and counts, Paperclip's version and build commit, and when the key expires. Then the all-time figures: what the helper has done since it was first started (agents woken, holds released, decisions relayed, …), roughly how much hand work that saved, how many warnings and errors it has logged, and the latest ten. See [all-time figures](#all-time-figures-in-pch-status). |
+| `pch status` | What the service is doing, its last checks and counts (for the watchdog, what its last check cost: requests to Paperclip, its slowest parts and kinds of request; see [how long a check takes](watchdog.md#how-long-a-check-takes)), Paperclip's version and build commit, and when the key expires. Then the all-time figures: what the helper has done since it was first started (agents woken, holds released, decisions relayed, …), roughly how much hand work that saved, how many warnings and errors it has logged, and the latest ten. See [all-time figures](#all-time-figures-in-pch-status) and [colour](#colour-and-spacing-in-pch-status). |
 | `pch check [ISSUE]` | Who the key belongs to, its companies and prefixes. With an issue, its stage, current participant, and whether a merge would approve it. With `RELAY_FIX_CONFLICTS` on, also whether the GitHub token (`GITHUB_TOKEN`, or the one in `GITHUB_TOKEN_FILE`) can read each repository: it lists the open PRs and reads the oldest on its own, as the conflict sweep does. |
 | `pch why ISSUE` | Why nobody is working on an issue, and what to do about it: Paperclip's own diagnosis (wakes, blockers, workspace clean-ups, runs and leases, recovery), then a recommendation. `--prompt` prints it all as a prompt for an LLM chat. |
 | `pch blocked` | Why each blocked issue is blocked, which issues the chains of blocked issues end at and what those wait on, and every question card that is waiting. See [`blocked`](#blocked-what-the-blocked-issues-wait-on). |
@@ -32,6 +32,20 @@
 | `pch version`, `pch help` | Version, and this list. `pch <command> --help` prints that command's usage. |
 
 Options work the same for every command. A value can follow its option or be joined to it: `--days 7` and `--days=7`. An option the command doesn't have stops it with its usage line, so a typo never runs a command without what you meant, or posts the option as part of a comment. A comment's text is the rest of the words, or one quoted argument; a `--` within it stays. To start it with `--`, put a bare `--` before it: `pch comment ACM-1 -- --force is fine here` (PowerShell drops a bare `--`, so there write `'--'`). A quoted phrase works too, as long as it has a space: `pch comment ACM-1 "--force is fine here"`.
+
+## Colour and spacing in `pch status`
+
+`pch status` puts a blank line between its sections (the service, relay, watchdog, cost sync, all-time figures, Paperclip) and around the whole. On a terminal it is in colour:
+
+| Colour | For |
+|---|---|
+| Green | A running service, and each component that is on. |
+| Yellow | A component that is off, a dry run, issues stuck behind a deferred wake, unpriced models, a key that expires within 30 days, warnings, and slow timings. |
+| Red | A stopped service, `Last error` lines, failed deliveries, errors, an expired key, and very slow timings. |
+
+Timings: the watchdog's last check is green below half of `WATCHDOG_INTERVAL_SEC`, yellow from there, red past the whole interval (it then delays the next check). A part of the check is yellow from a sixth of the interval and red from half. A kind of request is yellow from 250 ms on average and red from 1 s; its longest, from 1 s and 5 s. A last check long overdue (three times the interval, or the last check's own time when longer) is yellow, and red at ten times.
+
+There is no colour when the output goes to a file or a pipe, with `NO_COLOR` set, or with `TERM=dumb`; `FORCE_COLOR=1` turns it on anywhere.
 
 ## All-time figures in `pch status`
 

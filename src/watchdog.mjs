@@ -196,6 +196,7 @@
 // by the stall window. Their counts are kept in the state file across restarts.
 
 import { companyAgents, listIssues } from "./paperclip.mjs";
+import { createTickReads } from "./tick-reads.mjs";
 import { ACTIVE_RUN, agentMention, asleep, every, mapLimit, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 import { holdFacts, pausedHold, releaseHold, releaseProblems, RECONCILIATION_CAUSE, unprovable } from "./release.mjs";
 import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
@@ -224,6 +225,9 @@ const CONCURRENCY = 4;
 const PROVIDER_FAILURE = /^(provider_quota|[a-z]+_transient_upstream|transient_upstream)$/;
 const PROVIDER_FAILURE_HOLD_MS = 6 * 60 * 60_000;
 const DAY_MS = 24 * 60 * 60_000;
+// How long an issue the hand-off check found settled goes without its runs being read
+// again while nothing about it changes (at least five stall windows).
+const SETTLED_RECHECK_MS = 15 * 60_000;
 const latestRun = (runs) =>
   runs.reduce((a, r) => (!a || ts(r.finishedAt ?? r.createdAt) > ts(a.finishedAt ?? a.createdAt) ? r : a), null);
 // Plain text, no URL: Paperclip links every github.com pull-request URL in a
@@ -271,13 +275,20 @@ const record = {
   readyToQueue: (issue, pr) => `ready:${issue.id}:${pr.repo}#${pr.number}:${pr.sha}`, // the board's note that a PR is ready to queue
 };
 
-export function createWatchdog(ctx, state, deps = {}) {
+export function createWatchdog(outerCtx, state, deps = {}) {
+  // Every check reads Paperclip through one client that shares a tick's reads between
+  // them, and times each check (tick-reads.mjs).
+  const reads = createTickReads(outerCtx.api);
+  const ctx = { ...outerCtx, api: reads.api };
   const { config, api, log } = ctx;
   const records = state.nudges;
   const stats = {
     ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, questions: 0,
     ciReports: 0, ciReruns: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, pausedHolds: 0,
     runnerProblems: 0, readyNotes: 0, worktreeLinkNotes: 0, lastError: null,
+    // The last tick's requests, how many were answered from what the tick had already
+    // read, its slowest checks and its slowest kinds of request (for `pch status`).
+    lastTick: null,
   };
   const stallMs = config.watchdogStallSec * 1000;
   const liveWorkspaces = new Map(); // workspaceId → when it was last seen live
@@ -285,6 +296,7 @@ export function createWatchdog(ctx, state, deps = {}) {
   const questionScanAt = new Map(); // companyId → when its cards were last looked at
   const hasGitHubToken = Boolean(config.githubToken || config.githubTokenFile);
   const github = deps.github ?? (hasGitHubToken ? createGitHub({ config, log }) : null);
+  if (github?.stats) stats.github = github.stats; // reads, and GitHub's 304s to them
   const stagesCheck = createStagesCheck({ ctx, records, state, stats, dryRunSeen, github, identifiersOf: (pr) => findIdentifiers(pr, ctx.prefixes()) });
   const now = () => ctx.now();
   const limits = createLimitCheck({ api, config, log, records, state, now, stats, dryRunSeen });
@@ -665,13 +677,31 @@ export function createWatchdog(ctx, state, deps = {}) {
     return runs.filter((r) => !(neverStarted(r) && asked.has(r.agentId) && ts(r.createdAt) >= asked.get(r.agentId)));
   }
 
+  // Issues the hand-off check found settled: never worked on, or the owner's own run
+  // the latest and successful. Neither changes without the issue changing (a new
+  // owner, a comment, a run, each of which moves updatedAt or takes it off the
+  // candidate list), so such an issue's runs, the costliest read Paperclip has, aren't
+  // read again until it does, or SETTLED_RECHECK_MS has passed. issueId → { companyId, updatedAt, assignee, at }.
+  const settledHandOffs = new Map();
+  const settledRecheckMs = Math.max(SETTLED_RECHECK_MS, 5 * stallMs);
+  const settle = (issue) =>
+    settledHandOffs.set(issue.id, { companyId: issue.companyId, updatedAt: issue.updatedAt, assignee: issue.assigneeAgentId, at: now() });
+  const stillSettled = (issue) => {
+    const s = settledHandOffs.get(issue.id);
+    return Boolean(s && s.updatedAt === issue.updatedAt && s.assignee === issue.assigneeAgentId && now() - s.at < settledRecheckMs);
+  };
+
   async function stalledHandOff(issue, agents) {
     const assignee = issue.assigneeAgentId;
     const agent = await agentFor(assignee, agents);
     if (asleep(agent)) return null;
+    if (stillSettled(issue)) return null;
 
     const runs = await cardWakesLeftOut(issue, await api.request("GET", `/api/issues/${issue.id}/runs`));
-    if (!Array.isArray(runs) || runs.length === 0) return null; // never worked on: not a hand-off
+    if (!Array.isArray(runs) || runs.length === 0) {
+      if (Array.isArray(runs)) settle(issue);
+      return null; // never worked on: not a hand-off
+    }
     if (runs.some((r) => r.agentId === assignee && ACTIVE_RUN.has(r.status))) return null;
     const newest = (list) => list.reduce((a, b) => (ts(b.createdAt) > ts(a.createdAt) ? b : a));
     // A run Paperclip cancelled before it started, because the issue was held for
@@ -684,6 +714,7 @@ export function createWatchdog(ctx, state, deps = {}) {
     if (latest.agentId === assignee) {
       // The owner's own run ended without finishing; Paperclip may hold the issue for it.
       if (latest.status !== "succeeded" && !ACTIVE_RUN.has(latest.status)) await releaseUnprovableHold(issue, agents);
+      else if (latest.status === "succeeded") settle(issue);
       return null; // the owner has run since the hand-off
     }
     if (ACTIVE_RUN.has(latest.status)) return null; // the previous owner is still finishing
@@ -844,6 +875,10 @@ export function createWatchdog(ctx, state, deps = {}) {
 
   async function checkHandOffs(companyId, agents) {
     const issues = (await listIssues(api, companyId, WATCHED_STATUSES)).filter(candidate);
+    // An issue off the list (running, moved on, or another company's: those are
+    // looked at in their own pass) is looked at afresh when it is back.
+    const listed = new Set(issues.map((i) => i.id));
+    for (const [id, s] of settledHandOffs) if ((s.companyId ?? companyId) === companyId && !listed.has(id)) settledHandOffs.delete(id);
     await mapLimit(issues, CONCURRENCY, async (issue) => {
       try {
         if (pausedHolds.actedOn(issue.id)) return;
@@ -1311,12 +1346,13 @@ export function createWatchdog(ctx, state, deps = {}) {
     // that company: the others still run, and the tick says what failed.
     const run = async (name, companyId, fn) => {
       try {
-        await fn();
+        await reads.within(name, fn);
       } catch (err) {
         failure ??= `${name}: ${err.message}`;
         log.warn("watchdog: a check failed this tick", { check: name, company: companyId, error: err.message });
       }
     };
+    reads.begin();
     try {
       const { companyIds = [] } = await ctx.identity();
       resumes.startTick();
@@ -1357,6 +1393,7 @@ export function createWatchdog(ctx, state, deps = {}) {
       stats.ticks += 1;
       stats.lastTickAt = new Date(started).toISOString();
       stats.lastTickMs = now() - started;
+      stats.lastTick = reads.end();
       state.save();
     }
   }

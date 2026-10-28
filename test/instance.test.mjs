@@ -104,13 +104,13 @@ test("status and health: a helper marked stopped is not running, even with a rec
     watchdog: { on: false },
     costSync: { on: false },
   });
-  const lines = await captureOutput(() => cmd.status(env.ctx));
+  const lines = (await captureOutput(() => cmd.status(env.ctx))).filter(Boolean);
   process.exitCode = 0;
   assert.match(lines[0], /^Paperclip Helper 9\.9\.9: NOT RUNNING\. It stopped at \d{4}-\d\d-\d\d \d\d:\d\d UTC/);
   await assert.rejects(cmd.health(env.ctx), /the service has stopped/);
 
   writeJson(env.ctx.config.statusFile, { version: "9.9.9", startedAt: ago(3_600_000, now), heartbeatAt: ago(10_000, now), relay: { on: false } });
-  const running = await captureOutput(() => cmd.status(env.ctx));
+  const running = (await captureOutput(() => cmd.status(env.ctx))).filter(Boolean);
   process.exitCode = 0;
   assert.match(running[0], /^Paperclip Helper 9\.9\.9: running since /);
 });

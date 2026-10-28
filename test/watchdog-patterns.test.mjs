@@ -806,19 +806,20 @@ test("an issue you decided on meanwhile isn't returned", async (t) => {
   const env = await watchdogEnv(t, {}, { github: false });
   const { issue } = answeredOnReview(env);
   // You approve while the watchdog is looking: the re-read before the decision sees it.
+  // The question-card scan reads the cards first, and this check is handed that
+  // answer (the tick shares it), so you approve as the card scan reads them.
   const original = env.db.interactions[issue.id];
   let reads = 0;
   Object.defineProperty(env.db.interactions, issue.id, {
     get() {
       reads += 1;
-      // Read once by the question-card scan, then by this check: approve right after.
-      if (reads === 2) issue.status = "done";
+      if (reads === 1) issue.status = "done";
       return original;
     },
     configurable: true,
   });
   await env.watchdog.tick();
-  assert.equal(reads, 2, "the check got as far as the cards");
+  assert.equal(reads, 1, "the cards were read once, for both checks");
   assert.ok(env.logs.some((l) => /changed before it could be returned/.test(l.msg)));
   assert.equal(env.db.patches.length, 0);
 });

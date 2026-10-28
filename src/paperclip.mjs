@@ -147,8 +147,15 @@ export function createPaperclip({ config, readToken = () => "", log, fetchImpl =
 }
 
 // Every issue in a company with one of the given statuses, page by page
-// (keyset paging on id, the only stable order Paperclip offers).
-export async function listIssues(api, companyId, statuses, { pageSize = 500, maxPages = 50 } = {}) {
+// (keyset paging on id, the only stable order Paperclip offers). During a watchdog
+// tick the client shares one listing of every open status between its checks
+// (tick-reads.mjs).
+export async function listIssues(api, companyId, statuses, options = {}) {
+  if (typeof api.sharedListing === "function") return api.sharedListing(companyId, statuses, (s) => fetchIssues(api, companyId, s, options));
+  return fetchIssues(api, companyId, statuses, options);
+}
+
+async function fetchIssues(api, companyId, statuses, { pageSize = 500, maxPages = 50 } = {}) {
   const out = [];
   let afterId = null;
   for (let page = 0; page < maxPages; page += 1) {

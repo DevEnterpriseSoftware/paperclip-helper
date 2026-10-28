@@ -880,13 +880,62 @@ test("a dry run doesn't spend a deferred wake's retries", async (t) => {
 });
 
 test("one check failing (a listing Paperclip refuses) leaves the other checks to run, and the tick says what failed", async (t) => {
-  const env = await watchdogEnv(t);
+  // The done issues are listed by the review-stages check alone (with a GitHub token).
+  const env = await watchdogEnv(t, { GITHUB_TOKEN: "test" });
   const { issue, reviewer } = droppedHandOff(env.db);
-  env.fake.fail("GET", /\/issues\?status=blocked/, 500, { times: -1 });
+  env.fake.fail("GET", /\/issues\?status=done&/, 422, { times: -1 });
   await env.watchdog.tick();
   const nudge = env.db.comments.find((c) => c.issueId === issue.id);
   assert.ok(nudge, "the hand-off check still ran");
   assert.ok(nudge.body.startsWith(`[@Reviewer](agent://${reviewer.id})`));
-  assert.match(env.watchdog.stats.lastError, /^blocked issues: /);
-  assert.equal(env.logs.filter((l) => l.msg === "watchdog: a check failed this tick" && l.check === "blocked issues").length, 1);
+  assert.match(env.watchdog.stats.lastError, /^review stages: /);
+  assert.equal(env.logs.filter((l) => l.msg === "watchdog: a check failed this tick" && l.check === "review stages").length, 1);
+});
+
+test("an issue whose owner ran last isn't read again every tick until it changes; a hand-off after that is still caught", async (t) => {
+  let clock = Date.now();
+  const env = await watchdogEnv(t, {}, () => clock);
+  const { issue, engineer, reviewer } = droppedHandOff(env.db);
+  // The reviewer has run since the hand-off: nothing to do.
+  env.db.issueRuns[issue.id].push({ runId: uuid(), agentId: reviewer.id, status: "succeeded", createdAt: minutesAgo(8), finishedAt: minutesAgo(5) });
+  const runReads = () => env.fake.requests.filter((r) => r.method === "GET" && r.path === `/api/issues/${issue.id}/runs`).length;
+
+  await env.watchdog.tick();
+  assert.equal(runReads(), 1);
+  assert.equal(env.watchdog.stats.lastTick.checks.find((c) => c.name === "hand-offs")?.requests, 1);
+  await env.watchdog.tick();
+  await env.watchdog.tick();
+  assert.equal(runReads(), 1, "settled: its runs aren't read again");
+
+  // Read again after a while, in case something changed that the issue doesn't show.
+  clock += 16 * 60_000;
+  await env.watchdog.tick();
+  assert.equal(runReads(), 2);
+
+  // Handed back to the engineer, who never starts: the issue changed, so it is looked at, and nudged.
+  issue.assigneeAgentId = engineer.id;
+  issue.updatedAt = new Date(clock - 10 * 60_000).toISOString();
+  await env.watchdog.tick();
+  assert.equal(runReads(), 3);
+  const nudge = env.db.comments.find((c) => c.issueId === issue.id);
+  assert.ok(nudge?.body.startsWith(`[@Engineer](agent://${engineer.id}) this issue is yours now`));
+});
+
+test("a tick reads each issue once for all its checks, and says what it cost", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue, reviewer } = droppedHandOff(env.db);
+  // Nothing to do (a nudge, a change, drops what the tick read).
+  env.db.issueRuns[issue.id].push({ runId: uuid(), agentId: reviewer.id, status: "succeeded", createdAt: minutesAgo(8), finishedAt: minutesAgo(5) });
+  await env.watchdog.tick();
+  const issueReads = env.fake.requests.filter((r) => r.method === "GET" && r.path === `/api/issues/${issue.id}`).length;
+  // Without sharing, the paused-hold scan, the CI check and the stages check each read it.
+  assert.ok(issueReads <= 1, `read ${issueReads} times`);
+  const listings = env.fake.requests.filter((r) => r.method === "GET" && /\/companies\/[^/]+\/issues\?/.test(r.path)).length;
+  assert.equal(listings, 1, "one listing of the open issues for every check");
+  const last = env.watchdog.stats.lastTick;
+  assert.ok(last.requests > 0 && last.shared > 0);
+  // The five slowest parts, slowest first, each with its time and requests.
+  assert.ok(last.checks.length > 0 && last.checks.length <= 5);
+  assert.ok(last.checks.every((c, i) => typeof c.name === "string" && c.ms >= (last.checks[i + 1]?.ms ?? 0) && c.requests >= 0));
+  assert.ok(last.slowest.every((k) => !/[0-9a-f]{8}-/.test(k.kind)), "no ids in the kinds");
 });

@@ -84,6 +84,14 @@ export function writtenAgo(file) {
   return `${Math.round(sec / 60)} minutes`;
 }
 
+// Reads are made conditional: GitHub's answer carries an ETag, and a read sent with
+// it (If-None-Match) is answered 304 Not Modified when nothing changed. That answer
+// is quick and isn't counted against the token's rate limit, and the answer kept
+// from before is used. The watchdog and the relay read the same pull requests,
+// workflow runs and branches every few minutes, and most haven't changed. The most
+// recent ETAG_CACHE_SIZE answers are kept, in memory.
+export const ETAG_CACHE_SIZE = 500;
+
 // A read GitHub may answer on a second try: a dropped connection, a 5xx, or a
 // secondary rate limit that names a short wait (Retry-After, in seconds).
 const RETRY_WAIT_MS = 1_000;
@@ -95,6 +103,8 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch, sleep 
   const source = tokenSource(config);
   // github.com serves GraphQL at /graphql; GitHub Enterprise Server at /api/graphql, beside /api/v3.
   const graphqlUrl = /\/api\/v3\/?$/.test(base) ? base.replace(/\/api\/v3\/?$/, "/api/graphql") : `${base}/graphql`;
+  const kept = new Map(); // url → { etag, data }, least recently used first
+  const stats = { reads: 0, notModified: 0 };
 
   function explain(method, path, res, data, text) {
     const detail = data && typeof data === "object" && data.message ? String(data.message) : String(text ?? "").slice(0, 300);
@@ -170,10 +180,13 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch, sleep 
       "user-agent": `paperclip-helper/${config.version || "dev"}`,
     };
     if (body !== undefined) headers["content-type"] = "application/json";
+    const url = /^https?:/.test(path) ? path : `${base}${path}`;
+    const prior = method === "GET" ? kept.get(url) : null;
+    if (prior) headers["if-none-match"] = prior.etag;
     let res;
     let text;
     try {
-      res = await fetchImpl(/^https?:/.test(path) ? path : `${base}${path}`, {
+      res = await fetchImpl(url, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -184,19 +197,36 @@ export function createGitHub({ config, log, fetchImpl = globalThis.fetch, sleep 
       const why = err?.name === "TimeoutError" ? `no answer within ${config.timeoutSec}s` : (err?.cause?.code ?? err?.code ?? "network");
       throw new GitHubError(`cannot reach GitHub at ${base} for ${method} ${path} (${why})`, { method, path });
     }
+    if (method === "GET") stats.reads += 1;
+    if (res.status === 304 && prior) {
+      stats.notModified += 1;
+      kept.delete(url);
+      kept.set(url, prior); // most recently used
+      return structuredClone(prior.data);
+    }
     let data = null;
     try {
       data = text ? JSON.parse(text) : null;
     } catch {
       data = text;
     }
-    if (res.ok) return data;
+    if (res.ok) {
+      const etag = method === "GET" ? (res.headers?.get?.("etag") ?? null) : null;
+      if (etag) {
+        kept.delete(url);
+        kept.set(url, { etag, data: structuredClone(data) });
+        if (kept.size > ETAG_CACHE_SIZE) kept.delete(kept.keys().next().value);
+      } else if (method === "GET") kept.delete(url);
+      return data;
+    }
     log?.debug?.("github: request failed", { method, path, status: res.status });
     throw explain(method, path, res, data, text);
   }
 
   return {
     request,
+    // Reads made, and how many GitHub answered 304 (not modified) from the ETag kept.
+    stats,
     // Open PRs of owner/repo, oldest first; with `baseRef`, only those into that branch.
     async openPulls(repo, baseRef) {
       const out = [];

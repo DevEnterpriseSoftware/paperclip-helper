@@ -31,6 +31,7 @@ export { why } from "./why.mjs";
 import { excerpt } from "./advice.mjs";
 import { findReady } from "./ready.mjs";
 import { COUNTERS, minutesSaved, readMetrics } from "./metrics.mjs";
+import { colours } from "./colour.mjs";
 
 export const USAGE = `Paperclip Helper: fixes what a self-hosted Paperclip doesn't recover from by itself.
 
@@ -839,33 +840,103 @@ export async function paperclipBuild(ctx) {
 const counted = (n, one, many) => (n ? plural(n, one, many) : null);
 const since = (iso) => (iso ? `${iso.slice(0, 16).replace("T", " ")} UTC` : "?");
 
+// "190.7 s", "850 ms".
+const seconds = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`);
+
+// How slow is slow, for the colours of `pch status`: null (fine), "yellow" or "red".
+// A check is measured against the watchdog's interval: one that takes longer than
+// the interval delays the next. A part of it, against a sixth and half of that. A
+// kind of request, against fixed times: Paperclip answers most within 100 ms.
+export function slowness(ms, { intervalSec = 60, what = "check" } = {}) {
+  const interval = intervalSec * 1000;
+  const [yellow, red] =
+    what === "check" ? [interval / 2, interval] :
+      what === "part" ? [interval / 6, interval / 2] :
+        what === "request" ? [250, 1000] :
+          [1000, 5000]; // the longest single request
+  return ms >= red ? "red" : ms >= yellow ? "yellow" : null;
+}
+
+const tint = (paint, level, text) => (level ? paint[level](text) : text);
+
+// What the watchdog's last check cost: its requests to Paperclip (and how many
+// answers it reused from earlier in the same check), its slowest parts and kinds of
+// request, and how many GitHub reads were answered "not modified". Slow figures are
+// yellow or red (see slowness).
+export function tickLines(w, { paint = colours({ enabled: false }), intervalSec = 60 } = {}) {
+  const t = w?.lastTick;
+  const lines = [];
+  const time = (ms, what) => tint(paint, slowness(ms, { intervalSec, what }), seconds(ms));
+  if (t) {
+    lines.push(`Requests to Paperclip: ${t.requests}${t.shared ? `, and ${plural(t.shared, "answer")} reused within the check` : ""}.`);
+    if (t.checks?.length) lines.push(`Slowest parts: ${t.checks.map((c) => `${c.name} ${time(c.ms, "part")} (${plural(c.requests, "request")})`).join(", ")}.`);
+    if (t.slowest?.length) {
+      lines.push(`Slowest requests: ${t.slowest.map((k) => `${k.kind}: ${k.count} × ${time(k.avgMs, "request")} avg, ${time(k.maxMs, "longest")} max`).join("; ")}.`);
+    }
+  }
+  const g = w?.github;
+  if (g?.reads) lines.push(`GitHub reads since start: ${g.reads}, ${g.notModified} answered "not modified" (not counted against the rate limit).`);
+  return lines;
+}
+
+// The key's expiry as a level: "red" once expired, "yellow" within 30 days, else null.
+function expiryLevel(key) {
+  if (!key?.expiresAt) return null;
+  const days = Math.floor((Date.parse(key.expiresAt) - Date.now()) / 86_400_000);
+  return days < 0 ? "red" : days < 30 ? "yellow" : null;
+}
+
+// `pch status`: one section per component, a blank line between them and around
+// the whole. On a terminal, what is on is green, what is off yellow, errors and a
+// stopped service red, warnings and slow timings yellow (or red when very slow).
 export async function status(ctx) {
+  const paint = colours();
+  const { red, green, yellow, bold } = paint;
+  const label = (name) => bold(name);
+  const onOff = (on) => (on ? green("on") : yellow("off"));
+  const lastError = (text) => out(`  ${red(`Last error: ${text}`)}`);
+  const intervalSec = ctx.config.watchdogIntervalSec ?? 60;
   const s = readStatus(ctx.config);
   const stale = !serviceLive(s);
+  out("");
   if (!s) {
-    out("The helper service has not written a status yet: is it running? (docker compose ps, docker compose logs)");
+    out(red("The helper service has not written a status yet: is it running? (docker compose ps, docker compose logs)"));
   } else {
     out(
       s.stoppedAt
-        ? `Paperclip Helper ${s.version}: NOT RUNNING. It stopped at ${since(s.stoppedAt)} (started ${since(s.startedAt)}).`
+        ? `${label(`Paperclip Helper ${s.version}`)}: ${red("NOT RUNNING")}. It stopped at ${since(s.stoppedAt)} (started ${since(s.startedAt)}).`
         : stale
-          ? `Paperclip Helper ${s.version}: NOT RUNNING. Its last heartbeat was ${ago(s.heartbeatAt)} (started ${since(s.startedAt)}).`
-          : `Paperclip Helper ${s.version}: running since ${since(s.startedAt)}.`,
+          ? `${label(`Paperclip Helper ${s.version}`)}: ${red("NOT RUNNING")}. Its last heartbeat was ${ago(s.heartbeatAt)} (started ${since(s.startedAt)}).`
+          : `${label(`Paperclip Helper ${s.version}`)}: ${green("running")} since ${since(s.startedAt)}.`,
     );
-    if (s.dryRun) out("DRY RUN: components log what they would do and change nothing.");
+    if (s.dryRun) out(yellow("DRY RUN: components log what they would do and change nothing."));
+
     const r = s.relay;
-    out(r?.on ? `Relay: on. ${plural(r.handled, "delivery", "deliveries")} handled, ${r.failed} failed, the last ${ago(r.lastEventAt)}.` : "Relay: off.");
-    if (r?.lastError) out(`  Last error: ${r.lastError}`);
+    out("");
+    out(
+      r?.on
+        ? `${label("Relay")}: ${onOff(true)}. ${plural(r.handled, "delivery", "deliveries")} handled, ${r.failed ? red(`${r.failed} failed`) : "0 failed"}, the last ${ago(r.lastEventAt)}.`
+        : `${label("Relay")}: ${onOff(false)}.`,
+    );
+    if (r?.lastError) lastError(r.lastError);
     const k = r?.on ? r.conflicts : null;
-    if (k) out(`  Merge conflicts: ${plural(k.sentBack, "PR")} sent back, last look ${ago(k.lastSweepAt)}.${k.lastError ? ` Last error: ${k.lastError}` : ""}`);
+    if (k) out(`  Merge conflicts: ${plural(k.sentBack, "PR")} sent back, last look ${ago(k.lastSweepAt)}.${k.lastError ? ` ${red(`Last error: ${k.lastError}`)}` : ""}`);
     const q = r?.on ? r.mergeQueue : null;
     if (q) {
       const parts = [plural(q.dropped, "drop") + " handled", `${q.sentBack} sent back`, `${q.noted} told to you`, counted(q.requeued, "queued again", "queued again")];
-      out(`  Merge queue: ${parts.filter(Boolean).join(", ")}.${q.lastError ? ` Last error: ${q.lastError}` : ""}`);
+      out(`  Merge queue: ${parts.filter(Boolean).join(", ")}.${q.lastError ? ` ${red(`Last error: ${q.lastError}`)}` : ""}`);
     }
+
     const w = s.watchdog;
+    out("");
     if (w?.on) {
-      out(`Watchdog: on. Last check ${ago(w.lastTickAt)}${w.lastTickMs != null ? ` (${w.lastTickMs} ms)` : ""}.`);
+      // A last check long ago means the watchdog is behind (a check still running, or stuck).
+      const age = w.lastTickAt ? Date.now() - Date.parse(w.lastTickAt) : null;
+      const expected = Math.max(intervalSec * 1000, w.lastTickMs ?? 0);
+      const late = age == null ? null : age > 10 * expected ? "red" : age > 3 * expected ? "yellow" : null;
+      const took = w.lastTickMs != null ? ` (${tint(paint, slowness(w.lastTickMs, { intervalSec, what: "check" }) ?? "green", seconds(w.lastTickMs))})` : "";
+      out(`${label("Watchdog")}: ${onOff(true)}. Last check ${tint(paint, late, ago(w.lastTickAt))}${took}.`);
+      for (const line of tickLines(w, { paint, intervalSec })) out(`  ${line}`);
       const done = [
         counted(w.nudges, "nudge"),
         counted(w.heals, "blocker repaired", "blockers repaired"),
@@ -886,43 +957,48 @@ export async function status(ctx) {
         counted(w.worktreeLinkNotes, "checkout with relative worktree links reported", "checkouts with relative worktree links reported"),
       ].filter(Boolean);
       out(`  Since start: ${done.length ? done.join(", ") : "nothing needed doing"}.`);
-      if (w.stuck) out(`  ${plural(w.stuck, "issue")} stuck behind a deferred wake: see the log.`);
-      if (w.lastError) out(`  Last error: ${w.lastError}`);
+      if (w.stuck) out(`  ${yellow(`${plural(w.stuck, "issue")} stuck behind a deferred wake: see the log.`)}`);
+      if (w.lastError) lastError(w.lastError);
     } else {
-      out("Watchdog: off.");
+      out(`${label("Watchdog")}: ${onOff(false)}.`);
     }
+
     const c = s.costSync;
+    out("");
     out(
       c?.on
-        ? `Cost sync: on. Last run ${ago(c.lastTickAt)}; ${plural(c.posted ?? 0, "run")} ($${((c.postedCents ?? 0) / 100).toFixed(2)}) posted since start.`
-        : "Cost sync: off.",
+        ? `${label("Cost sync")}: ${onOff(true)}. Last run ${ago(c.lastTickAt)}; ${plural(c.posted ?? 0, "run")} ($${((c.postedCents ?? 0) / 100).toFixed(2)}) posted since start.`
+        : `${label("Cost sync")}: ${onOff(false)}.`,
     );
-    if (c?.lastError) out(`  Last error: ${c.lastError}`);
+    if (c?.lastError) lastError(c.lastError);
     const unpriced = Object.entries(c?.unpriced ?? {});
-    if (unpriced.length) out(`  Not priced: ${unpriced.map(([m, n]) => `${m} (${plural(n, "run")})`).join(", ")}; see COST_PRICES_FILE and CODEX_DEFAULT_MODEL.`);
+    if (unpriced.length) out(`  ${yellow(`Not priced: ${unpriced.map(([m, n]) => `${m} (${plural(n, "run")})`).join(", ")}`)}; see COST_PRICES_FILE and CODEX_DEFAULT_MODEL.`);
   }
-  showMetrics(readMetrics(ctx.config));
+  showMetrics(readMetrics(ctx.config), paint);
   // Live checks, from this container.
+  out("");
   try {
     const me = await ctx.identity();
     const key = await currentKey(ctx);
     const build = await paperclipBuild(ctx);
-    out(`Paperclip: ${ctx.config.paperclipApi}${build ? ` (${build})` : ""} as ${me.user?.name ?? me.userId}${key ? `; ${expiryNote(key)}` : ""}`);
+    const note = key ? `; ${tint(paint, expiryLevel(key), expiryNote(key))}` : "";
+    out(`${label("Paperclip")}: ${ctx.config.paperclipApi}${build ? ` (${build})` : ""} as ${me.user?.name ?? me.userId}${note}`);
   } catch (err) {
-    out(`Paperclip: ${err.message}`);
+    out(`${label("Paperclip")}: ${red(err.message)}`);
     process.exitCode = 1;
   }
+  out("");
   if (stale) process.exitCode = 1;
 }
 
 // The lifetime counts and latest problems from data/metrics.json (metrics.mjs).
-function showMetrics(m) {
+function showMetrics(m, paint = colours({ enabled: false })) {
   if (!m?.totals) return;
   const t = m.totals;
   const n = (v) => Number(v ?? 0).toLocaleString("en-GB");
   const versions = m.firstVersion && m.firstVersion !== m.version ? `, ${m.firstVersion} → ${m.version}` : "";
   out("");
-  out(`All time (since ${since(m.firstStartedAt)}, ${plural(m.starts ?? 1, "start")}${versions}):`);
+  out(`${paint.bold("All time")} (since ${since(m.firstStartedAt)}, ${plural(m.starts ?? 1, "start")}${versions}):`);
   const credited = COUNTERS.filter((c) => c.minutes && t[c.key] > 0);
   const actions = credited.reduce((sum, c) => sum + t[c.key], 0);
   const minutes = minutesSaved(t);
@@ -936,13 +1012,16 @@ function showMetrics(m) {
     const extra = c.key === "nudges" && t.ciReports ? ` (${n(t.ciReports)} of them finished CI runs reported)` : "";
     out(`    ${n(t[c.key]).padStart(6)}  ${c.label}${extra}`);
   }
-  out(`  Relay: ${n(t.githubEvents)} GitHub ${t.githubEvents === 1 ? "event" : "events"} handled${t.relayFailures ? `, ${n(t.relayFailures)} failed` : ""}.`);
+  out(`  Relay: ${n(t.githubEvents)} GitHub ${t.githubEvents === 1 ? "event" : "events"} handled${t.relayFailures ? `, ${paint.red(`${n(t.relayFailures)} failed`)}` : ""}.`);
   out(`  Watchdog: ${n(t.watchdogChecks)} ${t.watchdogChecks === 1 ? "check" : "checks"} run${t.stuck ? `; ${n(t.stuck)} wakes found stuck behind a stopped run` : ""}.`);
   out(`  Cost sync: ${n(t.costPosts)} run ${t.costPosts === 1 ? "cost" : "costs"} posted ($${(Number(t.costCents ?? 0) / 100).toLocaleString("en-GB", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}).`);
   const recent = Array.isArray(m.recent) ? m.recent : [];
-  out(`  Problems: ${plural(m.warnings ?? 0, "warning")}, ${plural(m.errors ?? 0, "error")}${recent.length ? `. The latest ${recent.length}, newest last:` : "."}`);
+  const warnings = plural(m.warnings ?? 0, "warning");
+  const errors = plural(m.errors ?? 0, "error");
+  out(`  Problems: ${m.warnings ? paint.yellow(warnings) : warnings}, ${m.errors ? paint.red(errors) : errors}${recent.length ? `. The latest ${recent.length}, newest last:` : "."}`);
   for (const p of recent) {
-    out(`    ${since(p.at).replace(" UTC", "")}  ${p.level === "error" ? "ERROR" : "warn "}  ${p.msg}${p.detail ? ` (${p.detail})` : ""}`);
+    const line = `${p.level === "error" ? "ERROR" : "warn "}  ${p.msg}${p.detail ? ` (${p.detail})` : ""}`;
+    out(`    ${since(p.at).replace(" UTC", "")}  ${p.level === "error" ? paint.red(line) : paint.yellow(line)}`);
   }
 }
 

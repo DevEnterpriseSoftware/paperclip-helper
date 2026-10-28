@@ -1,6 +1,6 @@
 // Small units with no service around them: the state store's cap, the relay's
 // notes document, the price file, hold-release safety, answered cards, issue
-// paging, the GitHub client's retries, config ranges, usage counts, and the fake
+// paging, the GitHub client's retries and conditional reads, config ranges, usage counts, and the fake
 // Paperclip's own review decisions.
 
 import { test } from "node:test";
@@ -163,6 +163,39 @@ test("the GitHub client retries a read once (a 5xx, a dropped connection, a shor
   answers.push({ status: 404, body: { message: "Not Found" } });
   await assert.rejects(gh.request("GET", "/repos/o/r/check-runs/1"), /needs "Checks: read"/);
   assert.equal(calls.length, 4);
+});
+
+test("the GitHub client reads conditionally: a 304 answers with what it kept, and isn't a new read of the data", async () => {
+  const config = { githubApi: "https://api.github.test", timeoutSec: 5, githubToken: "t", version: "test" };
+  const sent = [];
+  let etag = '"v1"';
+  let body = { number: 7, state: "open" };
+  const fetchImpl = async (url, init) => {
+    sent.push({ url, method: init.method, ifNoneMatch: init.headers["if-none-match"] ?? null });
+    if (init.method === "GET" && init.headers["if-none-match"] === etag) return new Response(null, { status: 304 });
+    return new Response(JSON.stringify(init.method === "GET" ? body : { id: 1 }), { status: 200, headers: init.method === "GET" ? { etag } : {} });
+  };
+  const gh = createGitHub({ config, fetchImpl, sleep: async () => {} });
+
+  const first = await gh.pull("o/r", 7);
+  assert.equal(sent[0].ifNoneMatch, null);
+  first.state = "edited by the caller";
+  const second = await gh.pull("o/r", 7);
+  assert.equal(sent[1].ifNoneMatch, '"v1"');
+  assert.deepEqual(second, { number: 7, state: "open" }, "the kept answer, not a caller's edit of it");
+  assert.deepEqual(gh.stats, { reads: 2, notModified: 1 });
+
+  // Changed on GitHub: the new answer, and its ETag from then on.
+  etag = '"v2"';
+  body = { number: 7, state: "closed" };
+  assert.equal((await gh.pull("o/r", 7)).state, "closed");
+  await gh.pull("o/r", 7);
+  assert.equal(sent.at(-1).ifNoneMatch, '"v2"');
+  assert.equal(gh.stats.notModified, 2);
+
+  // Writes are never conditional.
+  await gh.comment("o/r", 7, "hi");
+  assert.equal(sent.at(-1).ifNoneMatch, null);
 });
 
 test("config: a port outside 0–65535 is a problem", () => {

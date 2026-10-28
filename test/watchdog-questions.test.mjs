@@ -156,14 +156,14 @@ test("cards are looked at once per stall window, not every tick", async (t) => {
   const env = await watchdogEnv(t);
   strandedQuestion(env.db);
   await env.watchdog.tick();
-  const looked = () => env.fake.requests.filter((r) => r.path.includes(scanQuery)).length;
-  const first = looked();
+  // The open-issue listing is shared by the tick's checks: what the card scan costs is its own requests.
+  const looked = () => env.watchdog.stats.lastTick.checks.find((c) => c.name === "question cards")?.requests ?? 0;
+  assert.ok(looked() > 0);
   await env.watchdog.tick();
-  assert.equal(looked(), first);
+  assert.equal(looked(), 0);
   env.later(4);
   await env.watchdog.tick();
-  assert.equal(first, 1);
-  assert.equal(looked(), 2);
+  assert.ok(looked() > 0);
 });
 
 test("hand-offs: a card's cancelled wake is no hand-off, but another never-started run still is", async (t) => {

@@ -5,6 +5,7 @@ import path from "node:path";
 import { captureOutput, setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import * as cmd from "../src/commands.mjs";
+import { colourEnabled, colours, plain } from "../src/colour.mjs";
 import { writeJson } from "../src/store.mjs";
 import { pull, startFakeGitHub } from "./fake-github.mjs";
 
@@ -128,14 +129,27 @@ test("status and health read the service's status file", async (t) => {
     startedAt: new Date().toISOString(),
     heartbeatAt: new Date().toISOString(),
     relay: { on: false },
-    watchdog: { on: true, lastTickAt: new Date().toISOString(), nudges: 3, heals: 1, lastTickMs: 40 },
+    watchdog: {
+      on: true, lastTickAt: new Date().toISOString(), nudges: 3, heals: 1, lastTickMs: 40,
+      lastTick: {
+        requests: 412, shared: 138,
+        checks: [{ name: "hand-offs", ms: 12_340, requests: 210 }, { name: "blocked issues", ms: 900, requests: 1 }],
+        slowest: [{ kind: "GET /api/issues/:id/runs", count: 210, ms: 113_400, avgMs: 540, maxMs: 2100 }],
+      },
+      github: { reads: 30, notModified: 21 },
+    },
     costSync: { on: true, posted: 5, postedCents: 1234, unpriced: { "gpt-9": 2 } },
   });
   const ok = await captureOutput(() => cmd.health(env.ctx));
   assert.deepEqual(ok, ["ok"]);
   const lines = (await captureOutput(() => cmd.status(env.ctx))).join("\n");
   assert.match(lines, /^Paperclip Helper 1\.0\.0: running since /m);
-  assert.match(lines, /^Watchdog: on\. Last check /m);
+  assert.match(lines, /^Watchdog: on\. Last check .* \(40 ms\)\.$/m);
+  // What the last check cost, so a slow one shows where its time went.
+  assert.match(lines, /^  Requests to Paperclip: 412, and 138 answers reused within the check\.$/m);
+  assert.match(lines, /^  Slowest parts: hand-offs 12\.3 s \(210 requests\), blocked issues 900 ms \(1 request\)\.$/m);
+  assert.match(lines, /^  Slowest requests: GET \/api\/issues\/:id\/runs: 210 × 540 ms avg, 2.1 s max\.$/m);
+  assert.match(lines, /^  GitHub reads since start: 30, 21 answered "not modified"/m);
   assert.match(lines, /^  Since start: 3 nudges, 1 blocker repaired\.$/m);
   assert.match(lines, /^Cost sync: on\. .*5 runs \(\$12\.34\) posted since start/m);
   assert.match(lines, /Not priced: gpt-9 \(2 runs\)/);
@@ -303,4 +317,79 @@ test("release refuses a still-running run, a bad outcome, and an issue without a
   issue.executionBlocker = null;
   const lines = await captureOutput(() => cmd.release(env.ctx, "ACM-52", { apply: true }));
   assert.match(lines.join("\n"), /no execution hold/);
+});
+
+test("colour: on a terminal only, NO_COLOR off, FORCE_COLOR on anywhere", () => {
+  assert.equal(colourEnabled({}, { isTTY: true }), true);
+  assert.equal(colourEnabled({}, { isTTY: false }), false);
+  assert.equal(colourEnabled({ NO_COLOR: "1" }, { isTTY: true }), false);
+  assert.equal(colourEnabled({ TERM: "dumb" }, { isTTY: true }), false);
+  assert.equal(colourEnabled({ FORCE_COLOR: "1" }, { isTTY: false }), true);
+  assert.equal(colourEnabled({ FORCE_COLOR: "0" }, { isTTY: true }), false);
+  assert.equal(colours({ enabled: false }).red("x"), "x");
+  assert.equal(colours({ enabled: true }).red("x"), "\x1b[31mx\x1b[39m");
+});
+
+test("slowness: a check against the interval, a part against a sixth and half of it, requests against fixed times", () => {
+  assert.equal(cmd.slowness(20_000, { intervalSec: 60 }), null);
+  assert.equal(cmd.slowness(30_000, { intervalSec: 60 }), "yellow");
+  assert.equal(cmd.slowness(190_667, { intervalSec: 60 }), "red");
+  assert.equal(cmd.slowness(9_000, { intervalSec: 60, what: "part" }), null);
+  assert.equal(cmd.slowness(12_000, { intervalSec: 60, what: "part" }), "yellow");
+  assert.equal(cmd.slowness(40_000, { intervalSec: 60, what: "part" }), "red");
+  assert.equal(cmd.slowness(80, { what: "request" }), null);
+  assert.equal(cmd.slowness(400, { what: "request" }), "yellow");
+  assert.equal(cmd.slowness(1500, { what: "request" }), "red");
+  assert.equal(cmd.slowness(2100, { what: "longest" }), "yellow");
+});
+
+test("status: sections apart, and in colour on a terminal: on green, off yellow, errors red, slow timings yellow or red", async (t) => {
+  const env = await setup();
+  t.after(env.close);
+  writeJson(env.ctx.config.statusFile, {
+    version: "1.0.0",
+    startedAt: new Date().toISOString(),
+    heartbeatAt: new Date().toISOString(),
+    relay: { on: false },
+    watchdog: {
+      on: true, lastTickAt: new Date().toISOString(), lastTickMs: 190_667, stuck: 2, lastError: "hand-offs: timeout",
+      lastTick: {
+        requests: 412, shared: 138,
+        checks: [{ name: "hand-offs", ms: 120_300, requests: 210 }, { name: "blocked issues", ms: 900, requests: 4 }],
+        slowest: [{ kind: "GET /api/issues/:id/runs", count: 210, ms: 113_400, avgMs: 540, maxMs: 6100 }],
+      },
+    },
+    costSync: { on: true, posted: 5, postedCents: 1234 },
+  });
+  const was = process.env.FORCE_COLOR;
+  process.env.FORCE_COLOR = "1";
+  let lines;
+  try {
+    lines = await captureOutput(() => cmd.status(env.ctx));
+  } finally {
+    if (was === undefined) delete process.env.FORCE_COLOR;
+    else process.env.FORCE_COLOR = was;
+  }
+  const text = lines.join("\n");
+  const R = (s) => `\x1b[31m${s}\x1b[39m`;
+  const G = (s) => `\x1b[32m${s}\x1b[39m`;
+  const Y = (s) => `\x1b[33m${s}\x1b[39m`;
+  assert.equal(lines[0], "", "a blank line before");
+  assert.equal(lines.at(-1), "", "and after");
+  assert.ok(text.includes(`: ${G("running")} since`));
+  assert.ok(text.includes(`Relay\x1b[22m: ${Y("off")}.`));
+  assert.ok(text.includes(`Watchdog\x1b[22m: ${G("on")}. Last check `));
+  assert.ok(text.includes(`(${R("190.7 s")}).`), "a check three times the interval is red");
+  assert.ok(text.includes(`hand-offs ${R("120.3 s")} (210 requests)`));
+  assert.ok(text.includes(`blocked issues 900 ms (4 requests)`), "a quick part stays plain");
+  assert.ok(text.includes(`210 × ${Y("540 ms")} avg, ${R("6.1 s")} max`));
+  assert.ok(text.includes(Y("2 issues stuck behind a deferred wake: see the log.")));
+  assert.ok(text.includes(R("Last error: hand-offs: timeout")));
+  // A blank line between the sections.
+  const plainLines = lines.map(plain);
+  for (const head of ["Relay:", "Watchdog:", "Cost sync:", "Paperclip:"]) {
+    const i = plainLines.findIndex((l) => l.startsWith(head));
+    assert.ok(i > 0 && plainLines[i - 1] === "", `${head} has a blank line before it`);
+  }
+  process.exitCode = 0;
 });

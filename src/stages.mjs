@@ -16,7 +16,7 @@
 //   * an issue in progress or in review whose stages an agent removed: the board
 //     is told once.
 
-import { pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
+import { mapLimit, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 import { listIssues } from "./paperclip.mjs";
 import { noteToBoard } from "./board-note.mjs";
 import { notesText } from "./quiet-notes.mjs";
@@ -24,6 +24,7 @@ import { notesText } from "./quiet-notes.mjs";
 const PR_URL = /https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/gi;
 const LOOKBACK_MS = 3 * 24 * 60 * 60_000; // only issues touched in the last few days
 const MAX_PRS = 3; // per issue
+const CONCURRENCY = 4;
 
 const stagesOf = (policy) => (Array.isArray(policy?.stages) ? policy.stages : []);
 
@@ -85,13 +86,14 @@ export function createStagesCheck({ ctx, records, state, stats, dryRunSeen, gith
       ...(github ? (await listIssues(api, companyId, "done")).filter(due) : []),
       ...(await listIssues(api, companyId, "in_progress,in_review")).filter((i) => due(i) && !i.executionRunId && !i.checkoutRunId),
     ];
-    for (const row of rows) {
+    // A few at a time: after a restart every issue updated in the lookback is read once.
+    await mapLimit(rows, CONCURRENCY, async (row) => {
       try {
         if (row.status === "done" ? await reopenIfPrOpen(row, agents) : await reportWipe(row, agents)) looked.set(row.id, row.updatedAt);
       } catch (err) {
         log.warn("watchdog: stages check failed", { issue: row.identifier ?? row.id, error: err.message });
       }
-    }
+    });
   }
 
   // A done issue an agent wiped the stages of, whose own PR (opened before the
