@@ -8,8 +8,8 @@
 //   npm run test:compat -- --keep latest    leave it running afterwards, to poke at
 //
 // Paperclip comes from npm (`npx paperclipai@<version>`) with its embedded
-// PostgreSQL, in a temporary PAPERCLIP_HOME, on a free loopback port. Nothing
-// touches a Paperclip you already run. It needs what Paperclip needs: a recent
+// PostgreSQL, in a temporary PAPERCLIP_HOME, on a free loopback port, without your
+// PAPERCLIP_* settings (paperclipEnv). Nothing touches a Paperclip you already run. It needs what Paperclip needs: a recent
 // Node (24.11 or newer for the 2026.9 and 2026.10 releases) and a user that isn't root,
 // because PostgreSQL refuses to start as root.
 
@@ -64,6 +64,17 @@ async function health(base) {
   }
 }
 
+// The environment the throwaway Paperclip starts with: yours, minus anything that
+// would point it, or the agents it runs, at another Paperclip. Paperclip hands its
+// agents PAPERCLIP_API_URL from its own environment when that is set, so a shell set
+// up for your own instance had the suite's agents post to it. Also left out: its
+// database, auth secret and listen address. (Windows matches names case-insensitively.)
+const FOREIGN_ENV = /^(PAPERCLIP_.*|BETTER_AUTH_.*|DATABASE_URL|HOST|PORT|SERVE_UI)$/i;
+function paperclipEnv(extra) {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !FOREIGN_ENV.test(key)));
+  return { ...env, ...extra };
+}
+
 async function runOne(version) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "pch-compat-paperclip-"));
   const logFile = path.join(home, "paperclip.log");
@@ -74,7 +85,7 @@ async function runOne(version) {
   const log = fs.openSync(logFile, "a");
   const child = spawn("npx", ["--yes", `paperclipai@${version}`, "onboard", "--yes", "--no-install-service", "--run"], {
     cwd: home,
-    env: { ...process.env, PAPERCLIP_HOME: home, PORT: String(port), PAPERCLIP_TELEMETRY_DISABLED: "1", DO_NOT_TRACK: "1", CI: "1" },
+    env: paperclipEnv({ PAPERCLIP_HOME: home, PORT: String(port), PAPERCLIP_TELEMETRY_DISABLED: "1", DO_NOT_TRACK: "1", CI: "1" }),
     stdio: ["ignore", log, log],
     detached: !windows,
     shell: windows,

@@ -90,6 +90,18 @@ const HELPER_ENDPOINTS = [
 const UNDOCUMENTED_ENDPOINTS = [
   ["GET", "/api/companies/{companyId}/costs/by-agent"], // pch usage
 ];
+// Whether two URLs reach the same Paperclip: localhost, 127.0.0.1 and ::1 are one host.
+const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+function sameInstance(a, b) {
+  try {
+    const [x, y] = [new URL(a), new URL(b)];
+    const host = (u) => (LOOPBACK.has(u.hostname) ? "loopback" : u.hostname);
+    const port = (u) => u.port || (u.protocol === "https:" ? "443" : "80");
+    return host(x) === host(y) && port(x) === port(y);
+  } catch {
+    return false;
+  }
+}
 const templateRegex = (template) => new RegExp(`^${template.replace(/\{[^}]+\}/g, "[^/]+")}$`);
 
 // The status values the helper's logic branches on. A value outside these sets
@@ -860,8 +872,11 @@ if (!BASE) {
     // (heartbeat/run-completion.ts → reconcileLegacyContinuation).
     test("CI backstop: a board key's monitor is the live path the disposition guard wants; its attempts count across monitors; the report clears it", async (t) => {
       const run = { id: 39498202022, html_url: "https://github.com/org/app/actions/runs/39498202022" };
+      // The agent says first where it will post and whether it got a run token, then the
+      // comment's status: the run's log is how a failed precondition explains itself.
       const script =
-        "const e = process.env; setTimeout(() => fetch(e.PAPERCLIP_API_URL + '/api/issues/' + e.CI_ISSUE + '/comments', { method: 'POST', " +
+        "const e = process.env; console.log('agent env', e.PAPERCLIP_API_URL, e.PAPERCLIP_API_KEY ? 'with a run token' : 'WITHOUT a run token', 'run', e.PAPERCLIP_RUN_ID); " +
+        "setTimeout(() => fetch(e.PAPERCLIP_API_URL + '/api/issues/' + e.CI_ISSUE + '/comments', { method: 'POST', " +
         "headers: { authorization: 'Bearer ' + e.PAPERCLIP_API_KEY, 'content-type': 'application/json', 'x-paperclip-run-id': e.PAPERCLIP_RUN_ID }, " +
         `body: JSON.stringify({ body: 'Pushed. Waiting on ${run.html_url}' }) }).then((r) => console.log('comment', r.status), (err) => console.log('comment failed', err.message)), 3000);`;
       const waitingIssue = async (name) => {
@@ -891,6 +906,19 @@ if (!BASE) {
         return { repaired: reasons.includes("issue_disposition_repair") || actions.includes("deliberate_wait_without_target"), reasons, actions, comments };
       };
 
+      // What each run on the issue did and printed: its status and error, and the agent's own lines.
+      const agentOutput = async (id) => {
+        const out = [];
+        for (const r of await runsOf(id)) {
+          const runId = r.runId ?? r.id;
+          const log = await board("GET", `/api/heartbeat-runs/${runId}/log?limitBytes=65536`);
+          const text = typeof log.data?.content === "string" ? log.data.content : JSON.stringify(log.data ?? "");
+          const lines = [...text.matchAll(/(agent env [^"\\\n]*|comment (?:\d+|failed[^"\\\n]*))/g)].map((m) => m[1]);
+          out.push(`${String(runId).slice(0, 8)} ${r.status}${r.error ? ` (${String(r.error).slice(0, 120)})` : ""}${log.status === 200 ? "" : ` [log → ${log.status}]`}: ${lines.join(" | ") || "no agent output"}`);
+        }
+        return out.join("; ") || "no runs";
+      };
+
       const control = await waitingIssue("Carol");
       const waiting = await waitingIssue("Dave");
       const sent = await schedule(waiting.id);
@@ -903,7 +931,17 @@ if (!BASE) {
       t.diagnostic(`control (no monitor): ${JSON.stringify(c)}`);
       t.diagnostic(`backstop: ${JSON.stringify(w)}`);
       if (!guarded) t.diagnostic("this Paperclip didn't repair the control issue: the guard isn't exercised");
-      assert.ok(w.comments >= 1, "the agent's own comment was posted with its run's token");
+      if (w.comments < 1) {
+        // The agent's comment is the test's precondition, not the helper's work: say what the runs did.
+        const [wOut, cOut] = [await agentOutput(waiting.id), await agentOutput(control.id)];
+        const elsewhere = [...`${wOut} ${cOut}`.matchAll(/agent env (\S+)/g)].map((m) => m[1]).find((url) => !sameInstance(url, BASE));
+        assert.fail(
+          `the agent's own comment was posted with its run's token. It wasn't: backstop issue runs: ${wOut}. Control issue (${c.comments} agent comments) runs: ${cOut}` +
+            (elsewhere
+              ? `. The agents were told to post to ${elsewhere}, not to this Paperclip (${BASE}): its PAPERCLIP_API_URL came from the environment it was started with. Start it without your PAPERCLIP_* settings (npm run test:compat does).`
+              : ""),
+        );
+      }
       assert.equal(w.repaired, false, "no disposition repair while the backstop stands");
       let full = await s.ctx.api.request("GET", `/api/issues/${waiting.id}`);
       assert.equal(full.status, "in_progress", "not blocked for the board");

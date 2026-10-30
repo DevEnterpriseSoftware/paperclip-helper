@@ -90,7 +90,9 @@ The suite seeds a company with `process`-adapter agents (a shell one-liner each)
 2. Each response carries the fields the helper reads, and each write behaves as the helper assumes.
 3. `login`, the watchdog, the relay, cost sync and the commands work end to end. For example, a hand-off whose wake Paperclip dropped is nudged, and the nudge starts the new owner's run.
 
-To run it against a Paperclip you started yourself, set `PAPERCLIP_COMPAT_API`. That instance must be in `local_trusted` mode and hold no companies of your own: the suite refuses to run otherwise.
+`npm run test:compat` starts that Paperclip without your `PAPERCLIP_*` settings (and without `DATABASE_URL`, `BETTER_AUTH_*`, `HOST`, `PORT`): Paperclip hands its agents `PAPERCLIP_API_URL` from its own environment, so a shell set up for your own instance would have the suite's agents post to it.
+
+To run it against a Paperclip you started yourself, set `PAPERCLIP_COMPAT_API`, and start that Paperclip without `PAPERCLIP_API_URL` set. That instance must be in `local_trusted` mode and hold no companies of your own: the suite refuses to run otherwise.
 
 The same suite runs in CI on every push, and daily against Paperclip's latest release (`.github/workflows/compat.yml`). When a new Paperclip passes, add its version to that workflow's list. When the helper calls a new endpoint, the suite's last test fails until you add it to `HELPER_ENDPOINTS` (or, for one Paperclip serves but leaves out of its OpenAPI document, `UNDOCUMENTED_ENDPOINTS`).
 
