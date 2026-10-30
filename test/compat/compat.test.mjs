@@ -370,6 +370,11 @@ if (!BASE) {
       const open = await s.ctx.api.request("GET", `/api/companies/${full.companyId}/execution-workspaces?status=active,idle,in_review,cleanup_failed`);
       assert.ok(Array.isArray(open), "execution workspaces are listed");
       for (const w of open) hasKeys(w, ["id", "status", "sourceIssueId", "branchName", "cwd"], "an execution workspace");
+      // What an automatic notice's owner lookup reads (decisions.resolveOwner): every workspace, archived too,
+      // by branchName and sourceIssueId. No new endpoint: the unfiltered list must still answer an array.
+      const all = await s.ctx.api.request("GET", `/api/companies/${full.companyId}/execution-workspaces`);
+      assert.ok(Array.isArray(all), "execution workspaces are listed without a status filter");
+      for (const w of all) hasKeys(w, ["id", "status", "sourceIssueId", "branchName"], "an execution workspace (unfiltered)");
       const noReadiness = await board("GET", "/api/execution-workspaces/00000000-0000-4000-8000-000000000001/close-readiness");
       assert.equal(noReadiness.status, 404, "close-readiness of an unknown workspace is a 404");
     });

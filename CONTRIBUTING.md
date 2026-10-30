@@ -13,7 +13,7 @@ src/
   github.mjs        GitHub API client (the conflict sweep, merge-queue drops, CI runs)
   relay.mjs         GitHub webhooks → decisions and comments (routing each event)
   webhook-server.mjs  the relay's HTTP side: signatures, duplicate deliveries, answering in time
-  decisions.mjs     finding a PR's issue and recording your decision on it
+  decisions.mjs     finding a PR's issue and recording your decision on it; the issue that owns a PR, for automatic notices
   conflicts.mjs     the relay's sweep for PRs with merge conflicts
   merge-queue.mjs   the relay's handling of PRs the merge queue drops
   quiet-notes.mjs   the relay's quiet notes, in each issue's pull-requests document

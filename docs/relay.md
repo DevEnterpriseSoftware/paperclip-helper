@@ -86,7 +86,12 @@ When agents open many small PRs, they overlap. Each one you merge can leave othe
 
 For each PR that GitHub says conflicts, it does what you would do with `/changes`:
 
-1. It finds the PR's issue [the same way](#finding-the-issue) as for your own decisions.
+1. It finds the issue that **owns** the PR. That is not [the search used for your own decisions](#finding-the-issue): that one may settle on any related issue waiting on you, which is right for your decision but wrong for a notice the helper sends by itself. In order of trust:
+   1. the issue that lists the PR as a `pull_request` work product (among the issues the PR names and their subtasks);
+   2. the issue whose identifier starts the PR's title (`ACM-12: …`, `[ACM-12] …`);
+   3. the issue whose execution workspace branch is the PR's head branch.
+
+   A work product settles it, even when the branch was made in another issue's workspace. Without one, the title and the branch must not point at different issues. If several issues list the PR, or the sources disagree, or nothing matches, **nothing goes to any issue**: the board is told once per push (the log, and `WATCHDOG_NOTIFY_ISSUE`), with what each source said. The owner is looked up again for every notice.
 2. If that issue's review is waiting on you, it **requests changes**: the issue goes back to its engineer, in your name, with a brief to bring the branch up to date with the base branch, resolve the conflicts, run the tests and push to the same branch. If the review isn't waiting on you, it **comments** with the same brief instead, which wakes the assignee and records no decision.
 3. It **comments on the PR**, so you can see it was already sent back and how:
 
@@ -94,7 +99,8 @@ For each PR that GitHub says conflicts, it does what you would do with `/changes
 
 **What stops it from looping or wasting runs:**
 
-- **Once per push.** A PR is not sent back again until its branch gets a new commit.
+- **Once per push.** One notice per PR, head commit and conflict state. A PR is not sent back again until its branch gets a new commit, even if GitHub calls it mergeable for a while in between.
+- **Only to the owner.** Before writing, the relay checks once more that the issue owns the PR by one of the three tests above. At the board's approval stage its change request moves the issue back to its implementer, so a notice on the wrong issue would send approved work back; it is stopped, and the board is told instead (`relay: an automatic notice was stopped` in the log).
 - **A cap.** After `RELAY_CONFLICT_MAX_ATTEMPTS` (2) pushes that still conflict, it stops and says on the PR that it needs you. A PR that merges cleanly again starts from zero.
 - **Skipped:** drafts, PRs that name no Paperclip issue, and PRs whose issue is done or cancelled.
 - **`DRY_RUN=true`** logs what it would send back and touches nothing.
@@ -115,7 +121,7 @@ With `RELAY_MERGE_QUEUE` on (the default) and a GitHub token with **Actions: Rea
 
 | Reason | What it finds | What it does |
 |---|---|---|
-| `CI_FAILURE` | A job failed (a test, a check that only fails on the combined change), or timed out. | Sends the PR back [like a conflict](#prs-with-merge-conflicts), with the run, the failed jobs and the first failure annotation (that needs **Checks: Read**; without it the brief has none), and a note on the PR (`RELAY_CONFLICT_PR_COMMENT`). |
+| `CI_FAILURE` | A job failed (a test, a check that only fails on the combined change), or timed out. | Sends the PR back [like a conflict](#prs-with-merge-conflicts), to the issue that owns it (or tells the board when none does), with the run, the failed jobs and the first failure annotation (that needs **Checks: Read**; without it the brief has none), and a note on the PR (`RELAY_CONFLICT_PR_COMMENT`). |
 | `CI_FAILURE` | Every failed job failed setting up its runner, before checkout (GitHub's "Set up runner" or "Set up job" step: a self-hosted runner's job-started hook, say). None of the PR's code ran. | Tells the board the runner is at fault: fix it, then queue the PR again. Never sent back, and never queued again by the relay: it would fail the same way. |
 | `CI_FAILURE` | Only a cancelled job (a runner restarted mid-run). | Tells the board the PR isn't at fault: queue it again. |
 | `CI_FAILURE` | No failed or cancelled job to show. | Tells the board it couldn't tell why, rather than guess. |

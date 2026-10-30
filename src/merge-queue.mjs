@@ -186,6 +186,18 @@ export function createMergeQueueHandler({ ctx, state, github, decisions, sweepCo
     return { identifier: issue.identifier, action: "note on the PR" };
   }
 
+  // A failed check on a PR no single issue owns: sent back to no issue, and the board is told.
+  async function unowned(key, out, pr, drop, companyId, reason) {
+    const result = { ...out, action: config.dryRun ? "board note (dry run)" : "board note", reason: `no single issue owns it: ${reason}` };
+    if (config.dryRun) return result;
+    records.set(key, { at: ctx.now(), kind: drop.kind, issue: null });
+    state.touch();
+    const text = `${prLabel(pr)} was dropped from the merge queue for a failed check, but it wasn't sent back: no single Paperclip issue owns it (${reason}). Send it back to the right issue yourself (\`pch changes <issue> "…"\`).\n\n${drop.run?.html_url ?? pr.html_url}`;
+    if (companyId) await noteToBoard({ api, config, log }, companyId, text, { source: "relay", signature: RELAYED_SIGNATURE, pr: pr.number });
+    else log.warn("relay: a note for the board", { text, pr: pr.number });
+    return result;
+  }
+
   async function handle(repo, payload) {
     const number = payload.pull_request?.number;
     const why = dropReason(payload.reason);
@@ -210,8 +222,10 @@ export function createMergeQueueHandler({ ctx, state, github, decisions, sweepCo
     if (records.has(key)) return { pr: number, drop: drop.kind, action: "skip", reason: "already handled for this merge group" };
     const out = { pr: number, drop: drop.kind, reason: payload.reason ?? null };
 
-    const target = await decisions.resolveTarget(pr, identifiers, drop.kind === "failed" ? {} : { own: true });
+    // A failed check sends the PR back, so only to the issue that owns it (decisions.resolveOwner).
+    const target = drop.kind === "failed" ? await decisions.resolveOwner(pr, identifiers) : await decisions.resolveTarget(pr, identifiers, { own: true });
     if (!target) return { ...out, action: "skip", reason: `no Paperclip issue found for ${identifiers.join(", ")}` };
+    if (!target.issue) return unowned(key, out, pr, drop, target.companyId, target.reason);
     const issue = target.issue;
     if (!target.waiting && CLOSED.has(issue.status)) return { ...out, action: "skip", reason: `${issue.identifier} is ${issue.status}` };
     stats.dropped += 1;
@@ -223,7 +237,8 @@ export function createMergeQueueHandler({ ctx, state, github, decisions, sweepCo
 
     if (drop.kind === "failed") {
       const annotation = await firstAnnotation(repo, drop.jobs);
-      const result = await decisions.decide({ pr, identifiers, kind: "changes", comment: failureBrief(pr, drop, annotation), target });
+      const result = await decisions.decide({ pr, identifiers, kind: "changes", comment: failureBrief(pr, drop, annotation), target, automatic: true });
+      if (result.code === "not-owner") return unowned(key, out, pr, drop, target.companyId, result.reason);
       record(result);
       if (config.dryRun) return { ...out, ...result };
       stats.sentBack += 1;

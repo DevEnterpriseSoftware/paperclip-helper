@@ -8,6 +8,14 @@ function identifierRegex(prefixes) {
   return new RegExp(`\\b${prefix}-(\\d+)\\b`, "gi");
 }
 
+// The identifier that starts the PR's title ("ACM-12: …", "[ACM-12] …"), or null.
+// One named later in the title is a mention, not the PR's own issue.
+export function titleIdentifier(pr, prefixes) {
+  const title = typeof pr?.title === "string" ? pr.title : "";
+  const match = new RegExp(`^[\\s\\[(]*${identifierRegex(prefixes).source}`, "i").exec(title);
+  return match ? `${match[1].toUpperCase()}-${match[2]}` : null;
+}
+
 // Every issue identifier the PR names, in order: title, branch, body.
 export function findIdentifiers(pr, prefixes) {
   const found = [];

@@ -5,20 +5,25 @@
 // merge them. After every merge (and every RELAY_CONFLICT_SWEEP_SEC as a safety
 // net) this looks at the open PRs and, for each one GitHub says conflicts:
 //
-//   * finds its Paperclip issue the way the relay does for your own decisions;
+//   * finds the issue that owns it (decisions.resolveOwner: the issue listing it as
+//     a work product, else the one its title starts with, else the one whose
+//     workspace branch is its head branch), never just an issue waiting on you;
 //   * requests changes on it when its review is waiting on you, or else leaves a
 //     comment, either of which wakes the agent with a brief to merge the base
 //     branch, resolve the conflicts and push;
 //   * says so in a comment on the PR, so you can see it was already sent back.
 //
-// Guards: a PR is sent back once per head commit (nothing more until the agent
-// pushes); after RELAY_CONFLICT_MAX_ATTEMPTS pushes that still conflict it is
-// left to you, with a note on the PR; drafts, PRs that name no Paperclip issue
-// and PRs whose issue is done or cancelled are skipped. A PR that merges cleanly
-// again starts from zero.
+// Guards: one notice per PR, head commit and conflict state, remembered across a
+// clean spell (nothing more until the agent pushes); after
+// RELAY_CONFLICT_MAX_ATTEMPTS pushes that still conflict it is left to you, with a
+// note on the PR; drafts, PRs that name no Paperclip issue and PRs whose issue is
+// done or cancelled are skipped. With no single owner, nothing goes to any issue:
+// the board is told once per head commit. The owner is looked up again for every
+// notice. A PR that merges cleanly again starts its count from zero.
 
-import { CLOSED_STATUSES, prLabel, signed } from "./util.mjs";
+import { CLOSED_STATUSES, prLabel, RELAYED_SIGNATURE, signed } from "./util.mjs";
 import { findIdentifiers } from "./identifiers.mjs";
+import { noteToBoard } from "./board-note.mjs";
 
 // GitHub works out `mergeable` in the background: null means "ask again".
 const MERGEABLE_TRIES = 5;
@@ -26,9 +31,15 @@ const MERGEABLE_WAIT_MS = 3000;
 // After a merge, give GitHub a moment to notice the base branch moved.
 const AFTER_MERGE_WAIT_MS = 5000;
 const CLOSED = CLOSED_STATUSES;
+// Notices remembered per PR, so one isn't sent twice for the same commit.
+const SENT_KEPT = 10;
+
+// What one notice is for: the PR's head commit and how it conflicts. GitHub's
+// mergeable_state for a conflict is "dirty"; anything else it says is kept apart.
+const noticeKey = (pr) => `${pr.head?.sha ?? "?"}:${pr.mergeable_state && pr.mergeable_state !== "unknown" ? pr.mergeable_state : "dirty"}`;
 
 export function createConflictSweep({ ctx, state, github, decisions, sleep }) {
-  const { config, log } = ctx;
+  const { config, log, api } = ctx;
   const wait = sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const records = state.conflicts;
   const stats = { sweeps: 0, sentBack: 0, lastSweepAt: null, lastError: null };
@@ -87,6 +98,20 @@ export function createConflictSweep({ ctx, state, github, decisions, sleep }) {
     }
   }
 
+  // No single issue owns the PR: nothing goes to any issue (a change request on the
+  // wrong one would send its work back), and the board is told, once per head
+  // commit, with what each source said.
+  async function unowned(repo, pr, rec, companyId, reason) {
+    const out = { pr: pr.number, action: "board note", reason: `no single issue owns it: ${reason}` };
+    if (config.dryRun) return { ...out, action: "board note (dry run)" };
+    records.set(`${repo}#${pr.number}`, { ...rec, head: pr.head?.sha ?? null, unowned: true, gaveUp: false, at: ctx.now() });
+    state.touch();
+    const text = `${prLabel(pr)} conflicts with \`${pr.base?.ref ?? "its base branch"}\`, but it wasn't sent back: no single Paperclip issue owns it (${reason}). Send it back to the right issue yourself (\`pch changes <issue> "…"\`), or record the PR as a work product on its issue; the next push is looked at again.\n\n${pr.html_url}`;
+    if (companyId) await noteToBoard({ api, config, log }, companyId, text, { source: "relay", signature: RELAYED_SIGNATURE, repo, pr: pr.number });
+    else log.warn("relay: a note for the board", { text, repo, pr: pr.number });
+    return out;
+  }
+
   async function checkPull(repo, listed, after) {
     const number = listed.number;
     const key = `${repo}#${number}`;
@@ -99,17 +124,24 @@ export function createConflictSweep({ ctx, state, github, decisions, sleep }) {
     if (!pr) return skip("GitHub hasn't worked out yet whether it merges");
     if (pr.state && pr.state !== "open") return skip(`now ${pr.state}`);
     if (pr.draft) return skip("draft");
+    const rec = records.get(key);
     if (pr.mergeable) {
-      // Resolved: the next conflict is a new one.
-      if (records.delete(key)) state.touch();
+      // Resolved: the next conflict is a new one, but not on a commit already sent back.
+      if (rec?.head || rec?.gaveUp || rec?.unowned) {
+        if (rec.sent?.length) records.set(key, { sent: rec.sent, at: ctx.now() });
+        else records.delete(key);
+        state.touch();
+      }
       return { pr: number, action: "clean" };
     }
 
     const head = pr.head?.sha ?? null;
-    const rec = records.get(key);
+    const notice = noticeKey(pr);
     if (rec && rec.head === head) {
+      if (rec.unowned) return skip("no issue owns it; the board was told");
       return skip(rec.gaveUp ? "left to you after the attempts ran out" : "already sent back, waiting for a push");
     }
+    if (rec?.sent?.includes(notice)) return skip("already sent back for this commit");
     const attempts = rec?.attempts ?? 0;
     const max = config.conflictMaxAttempts;
     const base = pr.base?.ref ?? "the base branch";
@@ -117,7 +149,7 @@ export function createConflictSweep({ ctx, state, github, decisions, sleep }) {
     if (attempts >= max) {
       if (config.dryRun) return { pr: number, action: "give up (dry run)", attempts };
       const first = !rec?.gaveUp;
-      records.set(key, { ...rec, head, gaveUp: true, at: ctx.now() });
+      records.set(key, { ...rec, head, gaveUp: true, unowned: false, at: ctx.now() });
       state.touch();
       if (first) {
         log.warn("relay: PR still conflicts after every attempt, leaving it to you", { repo, pr: number, attempts });
@@ -130,17 +162,21 @@ export function createConflictSweep({ ctx, state, github, decisions, sleep }) {
       return { pr: number, action: "give up", attempts };
     }
 
-    const target = await decisions.resolveTarget(pr, identifiers);
+    // Looked up again for every notice: never taken from an earlier one.
+    const target = await decisions.resolveOwner(pr, identifiers);
     if (!target) return skip(`no Paperclip issue found for ${identifiers.join(", ")}`);
+    if (!target.issue) return unowned(repo, pr, rec, target.companyId, target.reason);
     const issueLabel = target.issue.identifier ?? target.issue.id;
     if (!target.waiting && CLOSED.has(target.issue.status)) return skip(`${issueLabel} is ${target.issue.status}`);
 
-    const result = await decisions.decide({ pr, identifiers, kind: "changes", comment: brief(pr, after), target });
+    const result = await decisions.decide({ pr, identifiers, kind: "changes", comment: brief(pr, after), target, automatic: true });
+    if (result.code === "not-owner") return unowned(repo, pr, rec, target.companyId, result.reason);
     const out = { pr: number, attempt: attempts + 1, identifier: result.identifier, action: result.action };
     if (result.reason) out.reason = result.reason;
     if (config.dryRun) return out;
 
-    records.set(key, { head, attempts: attempts + 1, at: ctx.now(), issue: result.identifier });
+    const sent = [...(rec?.sent ?? []), notice].slice(-SENT_KEPT);
+    records.set(key, { head, attempts: attempts + 1, at: ctx.now(), issue: result.identifier, sent });
     state.touch();
     stats.sentBack += 1;
     const how =

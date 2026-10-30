@@ -7,6 +7,11 @@
 // merges, reviews and PR comments; the conflict sweep (conflicts.mjs) and the
 // merge-queue handler (merge-queue.mjs) to send a PR back to its agent.
 //
+// What the helper sends on its own (a conflict send-back, a failed merge-queue
+// check) goes only to the PR's owner: resolveOwner() finds it, and decide() with
+// `automatic: true` checks it again before writing anything. The walk above is for
+// your own decisions, where any issue waiting on you is a fair place to record them.
+//
 // decide() returns { identifier, action, status, ... } and, when nothing was
 // recorded as a decision, a `code`:
 //   "not-found"     none of the issues the PR names exists in Paperclip
@@ -15,11 +20,14 @@
 //                   as a comment on the first one
 //   "ambiguous"     several wait on you and none lists this PR (`waitingOn`): your
 //                   text went in as a comment, and nothing was decided
+//   "not-owner"     an automatic notice for an issue that doesn't own the PR:
+//                   nothing was written
 // decisionNote() turns that into the note the relay leaves on the PR.
 
 import { approvalWaitingOn, DECISION_STATUS, prLabel, RELAYED_SIGNATURE, signed, ts } from "./util.mjs";
 import { issueActivity, stagesWipe } from "./stages.mjs";
 import { appendNote } from "./quiet-notes.mjs";
+import { titleIdentifier } from "./identifiers.mjs";
 
 // Stages a single merge may approve after the first, when each is waiting on you.
 const MAX_CHAINED_STAGES = 3;
@@ -240,6 +248,107 @@ export function createDecisions(ctx) {
     return { issue: waiting[0], waiting: true, ambiguous: waiting.map((i) => i.identifier ?? i.id) };
   }
 
+  // The issue that owns the PR, for what the helper sends on its own. Unlike
+  // resolveTarget(), never an issue the PR's issues merely relate to (a blocker, a
+  // sibling, whatever waits on you): a change request there sends approved work
+  // back. In order of trust:
+  //   1. the issue that lists the PR as a pull_request work product (the issues the
+  //      PR names and their subtasks are asked);
+  //   2. the issue whose identifier starts the PR's title;
+  //   3. the issue whose execution workspace branch is the PR's head branch.
+  // A work product settles it. Without one, title and branch must not point at two
+  // different issues. Several issues listing the PR, or nothing matching, is no
+  // owner: the caller tells the board instead of guessing.
+  //
+  // Returns null when none of the issues the PR names exists, else
+  // { issue, waiting, source, companyId } with the owner read in full, or
+  // { issue: null, reason, companyId } when there is no single owner.
+  async function resolveOwner(pr, identifiers) {
+    const { userId } = await ctx.identity();
+    const missing = (fallback) => (err) => {
+      if (err?.status === 404 || err?.status === 403) return fallback;
+      throw err;
+    };
+    const get = (ref) => api.request("GET", `/api/issues/${encodeURIComponent(ref)}`).catch(missing(null));
+    const label = (issue) => issue.identifier ?? issue.id;
+
+    const candidates = new Map(); // id → issue
+    const named = [];
+    for (const identifier of identifiers) {
+      const issue = await get(identifier);
+      if (!issue?.id || candidates.has(issue.id)) continue;
+      candidates.set(issue.id, issue);
+      named.push(issue);
+    }
+    if (!named.length) return null;
+    const companyId = named[0].companyId ?? null;
+    for (const issue of named) {
+      const rows = await api
+        .request("GET", `/api/companies/${issue.companyId}/issues?parentId=${issue.id}&limit=100`)
+        .catch(missing([]));
+      for (const row of Array.isArray(rows) ? rows : []) {
+        if (candidates.size >= MAX_RELATED_ISSUES) break;
+        if (row?.id && !candidates.has(row.id)) candidates.set(row.id, row);
+      }
+    }
+
+    const holders = [];
+    for (const issue of candidates.values()) {
+      if (await listsPr(issue, pr)) holders.push(issue);
+    }
+    const byTitle = titleIdentifier(pr, ctx.prefixes());
+    const titleIssue = byTitle ? (named.find((i) => i.identifier === byTitle) ?? null) : null;
+    const branch = await branchOwner(companyId, pr?.head?.ref);
+
+    const owner = async (issue, source) => {
+      const full = (await get(issue.id)) ?? issue;
+      return { issue: full, waiting: approvalWaitingOn(full, userId), source, companyId };
+    };
+    const none = (reason) => ({ issue: null, reason, companyId });
+    if (holders.length === 1) return owner(holders[0], "work product");
+    if (holders.length > 1) return none(`${holders.map(label).join(" and ")} all list it as a work product`);
+    if (branch.several) return none(`its head branch \`${pr.head.ref}\` is the workspace branch of ${branch.several.join(" and ")}`);
+    const branchIssue = branch.issueId ? (candidates.get(branch.issueId) ?? (await get(branch.issueId))) : null;
+    if (titleIssue && branchIssue && titleIssue.id !== branchIssue.id) {
+      return none(`its title starts with ${label(titleIssue)}, but its head branch \`${pr.head.ref}\` is ${label(branchIssue)}'s workspace branch, and no issue lists it as a work product`);
+    }
+    if (titleIssue) return owner(titleIssue, "title");
+    if (branchIssue?.id) return owner(branchIssue, "branch");
+    return none(
+      `no issue lists it as a work product, its title starts with no issue identifier${byTitle ? ` that exists (${byTitle})` : ""}, and its head branch${pr?.head?.ref ? ` \`${pr.head.ref}\`` : ""} is no issue's workspace branch`,
+    );
+  }
+
+  // Whether the issue lists the PR as a pull_request work product.
+  async function listsPr(issue, pr) {
+    const products = await api.request("GET", `/api/issues/${issue.id}/work-products`).catch(() => []);
+    return (Array.isArray(products) ? products : []).some((wp) => isWorkProductOf(wp, pr));
+  }
+
+  // The issue whose execution workspace has this branch: { issueId } or
+  // { several: [identifiers] } or {}. A live workspace counts before an archived
+  // one: a branch can outlive the workspace it was made in, and be reused.
+  async function branchOwner(companyId, branch) {
+    if (!companyId || !branch) return {};
+    const rows = await api.request("GET", `/api/companies/${companyId}/execution-workspaces`).catch(() => []);
+    const mine = (Array.isArray(rows) ? rows : []).filter((w) => w?.branchName === branch && w.sourceIssueId);
+    const live = mine.filter((w) => w.status !== "archived");
+    const ids = [...new Set((live.length ? live : mine).map((w) => w.sourceIssueId))];
+    if (ids.length <= 1) return ids.length ? { issueId: ids[0] } : {};
+    const issues = await Promise.all(ids.map((id) => api.request("GET", `/api/issues/${id}`).catch(() => null)));
+    return { several: issues.map((i, n) => i?.identifier ?? ids[n].slice(0, 8)) };
+  }
+
+  // Whether the issue owns the PR by any of resolveOwner()'s three tests: the last
+  // check before an automatic notice writes to it.
+  async function ownsPr(issue, pr) {
+    if (!issue?.id) return false;
+    if (issue.identifier && titleIdentifier(pr, ctx.prefixes()) === issue.identifier) return true;
+    if (await listsPr(issue, pr)) return true;
+    const branch = await branchOwner(issue.companyId, pr?.head?.ref);
+    return branch.issueId === issue.id;
+  }
+
   // The PR's own issue (the first it names), being worked on or in review, with no
   // stage pending, whose stages Paperclip's activity log shows an agent removed
   // (stages.mjs). A blocked issue waits on something the merge doesn't settle (a
@@ -375,12 +484,21 @@ export function createDecisions(ctx) {
   // Record `kind` ("approve" or "changes") for the PR, with `comment` as its text.
   // `target`: what resolveTarget() found, when the caller already looked. `merged`:
   // the decision is your merge of the PR (not a /approve on an open one).
-  async function decide({ pr, identifiers, kind, comment, target = undefined, merged = false }) {
-    target ??= await resolveTarget(pr, identifiers);
+  // `automatic`: the helper sends this on its own (a conflict, a failed check), not
+  // on your behalf. It then goes only to an issue that owns the PR: at the board's
+  // approval stage this PATCH is a change request, and on any other issue the
+  // comment wakes an agent whose work it isn't.
+  async function decide({ pr, identifiers, kind, comment, target = undefined, merged = false, automatic = false }) {
+    target ??= automatic ? await resolveOwner(pr, identifiers) : await resolveTarget(pr, identifiers);
     if (!target) return { identifiers, action: "none", code: "not-found", reason: "no Paperclip issue found for the identifiers" };
     const { issue, waiting, ambiguous, via } = target;
+    if (automatic && !issue) return { identifiers, action: "none", code: "not-owner", reason: target.reason ?? "no issue owns the PR" };
     const identifier = issue.identifier ?? issue.id;
     const stageType = issue?.executionState?.currentStageType ?? null;
+    if (automatic && (ambiguous || !(await ownsPr(issue, pr)))) {
+      log.warn("relay: an automatic notice was stopped: the issue doesn't own the PR", { identifier, pr: pr?.number, waiting: Boolean(waiting) });
+      return { identifier, action: "none", code: "not-owner", reason: `${identifier} doesn't own ${prLabel(pr)}`, status: issue.status, stageType };
+    }
 
     if (kind === "approve" && issue.status === "done") {
       return { identifier, action: "none", code: "already-done", reason: "issue already done" };
@@ -466,5 +584,5 @@ export function createDecisions(ctx) {
     return addComment(target?.issue?.identifier ?? identifiers[0], comment);
   }
 
-  return { resolveTarget, decide, addNote, addComment, commentOnTarget };
+  return { resolveTarget, resolveOwner, ownsPr, decide, addNote, addComment, commentOnTarget };
 }

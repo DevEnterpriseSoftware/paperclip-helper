@@ -1,6 +1,6 @@
 {
   "name": "paperclip-helper",
-  "version": "1.15.0",
+  "version": "1.15.1",
   "description": "Runs beside a self-hosted Paperclip and fixes what it doesn't recover from by itself: approve agents' work by merging their PRs, restart stalled work, pause agents at a usage limit, and record what subscription runs really cost.",
   "keywords": [
     "paperclip",
