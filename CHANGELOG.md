@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.14.3
+
+- **`pch worktrees` says why it leaves each workspace, and where it is.** It used to give Paperclip's first reason only, and one that named nothing: "This workspace is still linked to an open issue." It now shows every reason Paperclip gives, and names the open issues a workspace is still linked to, with their status, from close-readiness's `linkedIssues` (a follow-up issue that reuses a cancelled issue's workspace is the usual case). "A run still holds the issue" now names the run and its state, and says when the run has ended but still holds the issue, pointing to `pch why ISSUE`; the workspace is still left alone, since a cancelled run's process may still be alive. Each workspace left for you or refused has its folder on the line below, and the section of those that may hold work ends with the git commands that show it. A workspace whose folder is already gone is marked so: closing it frees nothing on disk. [docs/commands.md](docs/commands.md#worktrees-finished-issues-worktrees-still-on-disk)
+- **`pch worktrees --verbose`** also lists each workspace left alone: an open issue's, with its status; a recently finished one's, with how long ago; one with no source issue; and one whose issue isn't listed (deleted, or not visible to you). Without it the open issues' workspaces are counted by status: `31 of open issues (18 in_progress, 9 blocked, 4 todo)`.
+- **Tests:** 507 in all, among them the named linked issues and every blocking reason, a run that still holds the issue while running and after it ended, the folder lines, a folder already gone, `--verbose`'s list, and `--links` refusing `--verbose`.
+
 ## 1.14.2
 
 - **Relay: a 404 from GitHub is no longer reported as a missing permission.** Every 403 and 404 was explained as "the token needs "Pull requests: read" on this repository", but GitHub answers 404 both for what isn't there and for what a token can't see. On a live instance the conflict sweep logged that for five PRs in a row although the App had Pull requests: Read and write, and the same token had listed those PRs a moment before. A 403 still names the permission. A 404 now says it is either not there or not visible to the token, what the token then needs, and, with `GITHUB_TOKEN_FILE`, how long ago the file was written.

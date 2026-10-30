@@ -193,7 +193,7 @@ Paperclip records $0 for runs billed to a subscription. Cost sync posts one cost
 | `pch answer ISSUE CARD text` | Answers a question card as you (a card with one question). |
 | `pch workspace ISSUE [--apply]` | Gives an issue linked to a closed workspace, or to another issue's, a new isolated workspace. With a closed one, also the other open issues linked to it. It previews unless you pass `--apply`. |
 | `pch release ISSUE [--apply]` | Releases an execution hold that messages and Interrupt can't clear (one a paused agent's cancelled run left, too), then delivers the saved messages. It previews unless you pass `--apply`. |
-| `pch worktrees [--apply]` | Closes the workspaces of finished issues so Paperclip removes their git worktrees, leaving those that may hold work. It previews unless you pass `--apply`. |
+| `pch worktrees [--apply] [--verbose]` | Closes the workspaces of finished issues so Paperclip removes their git worktrees, leaving those that may hold work, and says why it leaves each of the others, with its folder. It previews unless you pass `--apply`; `--verbose` also lists the workspaces of open and recently finished issues. |
 | `pch worktrees --links [--retry]` | The issues whose every run fails at setup on relative git worktree links, by project checkout, with the repair to run on Paperclip's host (including removing the repository extension git leaves behind). `--retry` then wakes the ones still parked and reports their next runs. |
 | `pch usage [--days N] [--agent NAME]` | Where the tokens go: each agent's runs, tokens, cost and what woke it, and the agents worth a look. |
 | `pch costs` | Previews what cost sync would post, and what it does to budgets. |

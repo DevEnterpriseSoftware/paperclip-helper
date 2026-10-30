@@ -39,15 +39,15 @@ export const SPECS = {
   },
   workspace: { usage: "workspace ISSUE [--apply]", args: ["issue"], options: { apply: "boolean" } },
   worktrees: {
-    usage: "worktrees [--apply] [--min-days N] [--include-untracked] [--include-unmerged] | worktrees --links [--retry]",
+    usage: "worktrees [--apply] [--min-days N] [--include-untracked] [--include-unmerged] [--verbose] | worktrees --links [--retry]",
     options: {
-      apply: "boolean", "min-days": { type: "number", default: 1 }, "include-untracked": "boolean", "include-unmerged": "boolean",
+      apply: "boolean", "min-days": { type: "number", default: 1 }, "include-untracked": "boolean", "include-unmerged": "boolean", verbose: "boolean",
       links: "boolean", retry: "boolean",
     },
     // The two forms don't mix.
     validate: (o, given) =>
       o.retry && !o.links ? "--retry goes with --links."
-        : o.links && ["apply", "minDays", "includeUntracked", "includeUnmerged"].some((k) => given.has(k)) ? "--links takes only --retry."
+        : o.links && ["apply", "minDays", "includeUntracked", "includeUnmerged", "verbose"].some((k) => given.has(k)) ? "--links takes only --retry."
         : null,
   },
   models: { usage: "models" },

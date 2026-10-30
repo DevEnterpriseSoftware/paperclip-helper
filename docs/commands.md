@@ -15,7 +15,7 @@
 | `pch answer ISSUE CARD text` | Answers a question card as you, as the card's form would: `CARD` is its id or the start of it. A card with one question only: an option whose label (or id) is the text, else the text as a typed answer when the question takes one. Without a matching card it lists the pending ones. Quote the text to keep its spacing exactly. |
 | `pch release ISSUE [--apply] [--outcome …]` | Releases an execution hold whose run can't prove it stopped, so messages and Interrupt stay saved behind it. It previews unless you pass `--apply`. See [`release`](#release-a-hold-messages-cant-clear). |
 | `pch workspace ISSUE [--apply]` | Gives an issue linked to a closed workspace, or to another issue's live one, a new isolated workspace. It previews unless you pass `--apply`. See [`workspace`](#workspace-an-issue-linked-to-the-wrong-workspace). |
-| `pch worktrees [--apply]` | Closes the execution workspaces of finished issues, so Paperclip removes their git worktrees from disk. It previews unless you pass `--apply`. See [`worktrees`](#worktrees-finished-issues-worktrees-still-on-disk). |
+| `pch worktrees [--apply] [--verbose]` | Closes the execution workspaces of finished issues, so Paperclip removes their git worktrees from disk. It previews unless you pass `--apply`, says why it leaves each of the others, with its folder, and `--verbose` also lists the workspaces of open and recently finished issues. See [`worktrees`](#worktrees-finished-issues-worktrees-still-on-disk). |
 | `pch worktrees --links [--retry]` | The issues whose every run fails at setup because Paperclip can't follow their worktrees' git links (`workspace_validation_failed`, `source_registration_unproven`), grouped by project checkout, with the commands that repair the links on Paperclip's host. `--retry`, once you've run them, comments on each issue still parked that way and reports its next run. See [`worktrees --links`](#worktrees---links-every-run-fails-at-setup-on-relative-worktree-links). |
 | `pch usage [--days N] [--agent NAME]` | Where the tokens go: per agent, its runs, tokens, cost, model and effort, what woke it, and the agents worth a look (one that polls, one that keeps failing, one using most of its provider's tokens). Read-only. See [`usage`](#usage-where-the-tokens-go). |
 | `pch costs` | Previews what cost sync would post, and what it does to budgets. |
@@ -230,7 +230,7 @@ Each issue with an isolated workspace gets its own git worktree, and every one c
 
 Miss any one and the worktree stays. On a busy instance they pile up into hundreds of worktrees and tens of GB, inside a WSL or VM disk that doesn't shrink by itself.
 
-`pch worktrees` lists the open workspaces of issues finished at least a day ago (`--min-days N` to change that), with what Paperclip's own close check (`close-readiness`) says about each:
+`pch worktrees` lists the open workspaces of issues finished at least a day ago (`--min-days N` to change that), with what Paperclip's own close check (`close-readiness`) says about each. Every workspace it won't close, or leaves for you, has its folder on the line below, so you can look at it yourself:
 
 ```text
 $ pch worktrees
@@ -241,11 +241,18 @@ ACM: 231 open workspaces, 162 of them worktrees of issues finished 1+ days ago
     …
   4 may hold work that isn't on GitHub. Look at these yourself:
     ACM-51     done       14d  2 modified tracked files  ACM-51-module-settings-one-credential-key-rule
-    ACM-241    done       11d  2 commits not on master  ACM-241-protected-build-renames-nothing
+               /srv/app/.paperclip/worktrees/ACM-51-module-settings-one-credential-key-rule
+    ACM-241    cancelled  11d  2 commits not on master  ACM-241-protected-build-renames-nothing
+               /srv/app/.paperclip/worktrees/ACM-241-protected-build-renames-nothing
     …
+  On Paperclip's host, git -C <folder> status --short lists the uncommitted files; git -C <folder> log --oneline <base>..HEAD the unmerged commits.
   Paperclip won't close 23:
-    ACM-305    done        6d  This workspace is still linked to an open issue.  ACM-305-…
-  Left alone: 31 of open issues, 2 of issues finished in the last day.
+    ACM-305    done        6d  still linked to open issue ACM-318 (in_progress)  ACM-305-…
+               /srv/app/.paperclip/worktrees/ACM-305-…
+    ACM-311    cancelled   4d  run 3f2a91c0 still holds the issue although it ended (cancelled 4d ago): see pch why ACM-311  ACM-311-…
+               /srv/app/.paperclip/worktrees/ACM-311-…
+  Left alone: 31 of open issues (18 in_progress, 9 blocked, 4 todo), 2 of issues finished in the last day.
+  --verbose lists each of them, and why.
 
 --apply closes these 171 workspaces, as their Close button does: …
   pch worktrees --apply
@@ -260,8 +267,14 @@ What it leaves alone:
 - **Untracked files** (anything git doesn't ignore: scratch clones, new files nobody committed) unless you pass `--include-untracked`. Ignored build output (`bin/`, `obj/`, `node_modules/`) doesn't count.
 - **Commits not on the base branch** unless you pass `--include-unmerged`. A squash-merged branch always looks like this, because the merge puts new commits on the base branch. With `GITHUB_TOKEN` or `GITHUB_TOKEN_FILE` set ("Pull requests: Read"), the command asks GitHub for the branch's PR: a merged PR with at least as many commits as the worktree is ahead holds all of them, so that worktree is closed ("PR #41 merged"). More commits than the PR had means some were made after it, and the worktree is left for you. The repository is the workspace's `repoUrl`, or each of `GITHUB_REPOS`.
 - **Sessions on the project's shared checkout** (`shared_workspace`). They're only counted: closing one removes a record and frees nothing.
-- **What Paperclip refuses**: a workspace another open issue is still linked to, or one whose git state it can't read (its folder may already be gone).
-- **An issue a run still holds.**
+- **What Paperclip refuses**: a workspace another open issue is still linked to (a follow-up issue that reuses a cancelled one's workspace, say), named with its status, or one whose git state it can't read. Every reason Paperclip gives is shown, not only the first.
+- **An issue a run still holds**, named with the run's state. A run that has ended but still holds the issue is Paperclip's to release: a cancelled run's process may still be alive, so the helper doesn't close the workspace under it. `pch why ISSUE` says what holds it, and `pch release` releases a hold whose run can't prove it stopped.
+
+A workspace whose folder is already gone is still closed (`its folder is already gone`): that tidies Paperclip's record and frees nothing on disk.
+
+`--verbose` also lists each workspace left alone (an open issue's, with its status; a recently finished one's, with how long ago; one with no source issue; one whose issue isn't listed, deleted or not visible to you), with its folder. Without it they are only counted, by status.
+
+Cancelled issues are treated like done ones: a cancelled issue's workspace with uncommitted changes is listed for you to look at, never closed, and one with commits that were never merged is listed too unless you pass `--include-unmerged`.
 
 The helper changes nothing on disk itself; Paperclip does the removal and records each step in the workspace's operations. To have Paperclip's reaper keep up by itself, shorten its cooldown with `PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS` in Paperclip's environment. Reclaiming the freed space from a WSL or VM disk is a separate step (on WSL: `fstrim`, then compact the `.vhdx`).
 

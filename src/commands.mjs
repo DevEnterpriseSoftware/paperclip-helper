@@ -21,7 +21,7 @@ import {
   issuesLinkedTo,
   linkFacts,
 } from "./workspace.mjs";
-import { closeWorkspace, lastFailedOperation, survey } from "./worktrees.mjs";
+import { age, closeWorkspace, folderOf, lastFailedOperation, survey } from "./worktrees.mjs";
 import {
   awaitNextRuns, byCheckout, codeLabel, linkCheck, parkedOnValidation, RELATIVE_LINKS, repairCommands, retryProblem,
 } from "./worktree-links.mjs";
@@ -57,8 +57,9 @@ Decide and unblock
   workspace ISSUE [--apply]  give an issue linked to a closed (or another issue's) workspace its own
 
 Housekeeping
-  worktrees [--apply] [--min-days N] [--include-untracked] [--include-unmerged]
-                             close finished issues' workspaces, so Paperclip removes their worktrees
+  worktrees [--apply] [--min-days N] [--include-untracked] [--include-unmerged] [--verbose]
+                             close finished issues' workspaces, so Paperclip removes their worktrees;
+                             --verbose also lists each workspace left alone, and why
   worktrees --links [--retry]
                              issues whose every run fails at setup on relative worktree links: the
                              repair to run on the host (--retry: then wake them)
@@ -432,11 +433,11 @@ export async function workspace(ctx, identifier, { apply = false } = {}) {
 // Workspaces of finished issues still on disk (see worktrees.mjs). Lists what
 // Paperclip would remove, what it would throw away work for, and what it
 // refuses; --apply closes the first group one by one, as the Close button does.
-export async function worktrees(ctx, { apply = false, minDays = 1, includeUntracked = false, includeUnmerged = false, links = false, retry = false, given = new Set(), ...rest } = {}) {
+export async function worktrees(ctx, { apply = false, minDays = 1, includeUntracked = false, includeUnmerged = false, verbose = false, links = false, retry = false, given = new Set(), ...rest } = {}) {
   const { api } = ctx;
   if (retry && !links) throw new Error("--retry goes with --links: pch worktrees --links --retry");
   if (links) {
-    const others = ["apply", "minDays", "includeUntracked", "includeUnmerged"].filter((k) => given.has(k) || (k === "apply" && apply));
+    const others = ["apply", "minDays", "includeUntracked", "includeUnmerged", "verbose"].filter((k) => given.has(k) || (k === "apply" && apply));
     if (others.length) throw new Error("--links takes only --retry: usage: pch worktrees --links [--retry]");
     return worktreeLinks(ctx, { retry, ...rest });
   }
@@ -451,6 +452,11 @@ export async function worktrees(ctx, { apply = false, minDays = 1, includeUntrac
     const branch = r.ws.branchName ?? r.ws.name ?? r.ws.id.slice(0, 8);
     return `    ${label(r.issue).padEnd(10)} ${r.issue.status.padEnd(9)} ${days}  ${note ? `${note}  ` : ""}${branch.length > 70 ? `${branch.slice(0, 69)}…` : branch}`;
   };
+  // The worktree's folder under its row, for the ones you may want to look at yourself.
+  const where = (ws) => {
+    const f = folderOf(ws);
+    if (f) out(`               ${f}`);
+  };
   const toClose = [];
   let reviewCount = 0;
   const hasGitHub = Boolean(ctx.config.githubToken || ctx.config.githubTokenFile);
@@ -459,7 +465,7 @@ export async function worktrees(ctx, { apply = false, minDays = 1, includeUntrac
   for (const companyId of me.companyIds ?? []) {
     const company = await api.request("GET", `/api/companies/${companyId}`).catch(() => ({}));
     const name = company.issuePrefix ?? company.name ?? companyId;
-    const { counts, results, failedBefore, githubErrors } = await survey(api, companyId, {
+    const { counts, results, failedBefore, leftAlone, openByStatus, githubErrors } = await survey(api, companyId, {
       now,
       minDays,
       flags: opts,
@@ -480,11 +486,18 @@ export async function worktrees(ctx, { apply = false, minDays = 1, includeUntrac
     }
     if (review.length) {
       out(`  ${review.length} may hold work that isn't on GitHub. Look at these yourself:`);
-      for (const r of review) out(row(r, r.reasons.join(", ")));
+      for (const r of review) {
+        out(row(r, r.reasons.join(", ")));
+        where(r.ws);
+      }
+      out("  On Paperclip's host, git -C <folder> status --short lists the uncommitted files; git -C <folder> log --oneline <base>..HEAD the unmerged commits.");
     }
     if (skip.length) {
       out(`  Paperclip won't close ${skip.length}:`);
-      for (const r of skip) out(row(r, r.reasons[0]));
+      for (const r of skip) {
+        out(row(r, r.reasons.join("; ")));
+        where(r.ws);
+      }
     }
     if (failedBefore.length) {
       out(`  ${failedBefore.length} were closed before, but their clean-up failed. Paperclip treats them as closed and won't retry;`);
@@ -495,13 +508,28 @@ export async function worktrees(ctx, { apply = false, minDays = 1, includeUntrac
         if (f.ws.cleanupReason) out(`               ${excerpt(f.ws.cleanupReason, 160)}`);
       }
     }
+    const byStatus = Object.entries(openByStatus ?? {}).sort((a, b) => b[1] - a[1]).map(([s, n]) => `${n} ${s}`);
     const notLooked = [
-      counts.open && `${counts.open} of open issues`,
+      counts.open && `${counts.open} of open issues${byStatus.length ? ` (${byStatus.join(", ")})` : ""}`,
       counts.recent && `${counts.recent} of issues finished in the last ${minDays === 1 ? "day" : `${minDays} days`}`,
       counts.shared && `${counts.shared} sessions on the project's shared checkout (nothing to free)`,
       counts.noIssue && `${counts.noIssue} with no source issue`,
     ].filter(Boolean);
     if (notLooked.length) out(`  Left alone: ${notLooked.join(", ")}.`);
+    if (verbose && leftAlone?.length) {
+      const why = (l) =>
+        l.why === "recent" ? `finished ${age(l.days * 24 * 60 * 60_000)} ago`
+          : l.why === "noIssue" ? "no source issue"
+          : l.why === "missing" ? "its issue isn't listed (deleted, or not visible to you)"
+          : `issue is ${l.issue?.status ?? "open"}`;
+      for (const l of leftAlone) {
+        const who = l.issue ? label(l.issue) : l.ws.sourceIssueId ? String(l.ws.sourceIssueId).slice(0, 8) : "-";
+        out(`    ${who.padEnd(10)} ${why(l)}  ${l.ws.branchName ?? l.ws.name ?? l.ws.id.slice(0, 8)}`);
+        where(l.ws);
+      }
+    } else if (leftAlone?.length) {
+      out("  --verbose lists each of them, and why.");
+    }
     if (!hasGitHub && review.some((r) => r.reasons.some((x) => / not on /.test(x)))) {
       out("  Without GITHUB_TOKEN or GITHUB_TOKEN_FILE, a squash-merged branch looks unmerged: set one to have merged PRs checked.");
     }

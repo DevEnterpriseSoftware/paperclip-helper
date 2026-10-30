@@ -21,7 +21,7 @@ test("an option a command doesn't have stops it, rather than being posted as tex
 
 test("an option's value can follow it or be joined to it", () => {
   for (const line of [["worktrees", "--min-days", "3"], ["worktrees", "--min-days=3"]]) {
-    assert.deepEqual(parse(line).options, { apply: false, minDays: 3, includeUntracked: false, includeUnmerged: false, links: false, retry: false });
+    assert.deepEqual(parse(line).options, { apply: false, minDays: 3, includeUntracked: false, includeUnmerged: false, verbose: false, links: false, retry: false });
   }
   assert.deepEqual(parse(["usage", "--days=3", "--agent", "Carla"]).options, { days: 3, agent: "Carla" });
   assert.deepEqual(parse(["usage", "--agent=A=B"]).options, { days: 7, agent: "A=B" });
@@ -70,10 +70,12 @@ test("missing and extra arguments are usage errors", () => {
 });
 
 test("worktrees: --retry needs --links, and --links takes no other option", () => {
-  assert.deepEqual(parse(["worktrees", "--links", "--retry"]).options, { apply: false, minDays: 1, includeUntracked: false, includeUnmerged: false, links: true, retry: true });
+  assert.deepEqual(parse(["worktrees", "--links", "--retry"]).options, { apply: false, minDays: 1, includeUntracked: false, includeUnmerged: false, verbose: false, links: true, retry: true });
   assert.throws(() => parse(["worktrees", "--retry"]), /--retry goes with --links\.\nusage: pch worktrees/);
   assert.throws(() => parse(["worktrees", "--links", "--apply"]), /--links takes only --retry\./);
   assert.throws(() => parse(["worktrees", "--links", "--min-days=3"]), /--links takes only --retry\./);
+  assert.throws(() => parse(["worktrees", "--links", "--verbose"]), /--links takes only --retry\./);
+  assert.equal(parse(["worktrees", "--verbose"]).options.verbose, true);
 });
 
 test("--help on a command prints its usage line", () => {
@@ -99,5 +101,5 @@ test("pch stops on a usage error before it reads any settings or calls Paperclip
   assert.match(run.stderr, /^pch comment has no option --apply/);
   const help = spawnSync(process.execPath, [index, "worktrees", "--help"], { encoding: "utf8", env: { PATH: process.env.PATH } });
   assert.equal(help.status, 0);
-  assert.equal(help.stdout.trim(), "usage: pch worktrees [--apply] [--min-days N] [--include-untracked] [--include-unmerged] | worktrees --links [--retry]");
+  assert.equal(help.stdout.trim(), "usage: pch worktrees [--apply] [--min-days N] [--include-untracked] [--include-unmerged] [--verbose] | worktrees --links [--retry]");
 });

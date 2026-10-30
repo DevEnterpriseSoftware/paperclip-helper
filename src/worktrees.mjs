@@ -22,9 +22,11 @@
 // Everything else is left for you unless you ask for it.
 
 import { listIssues } from "./paperclip.mjs";
-import { mapLimit, plural } from "./util.mjs";
+import { mapLimit, plural, TERMINAL_RUN } from "./util.mjs";
 
 const TERMINAL = new Set(["done", "cancelled"]);
+// Every issue status that isn't done or cancelled: what a workspace of an open issue is waiting on.
+const OPEN_ISSUE_STATUSES = "backlog,todo,in_progress,in_review,blocked";
 
 // Workspaces that may still hold a worktree. cleanup_failed is a closed one whose
 // clean-up didn't finish. Paperclip treats it as closed: it can't be closed again,
@@ -32,6 +34,17 @@ const TERMINAL = new Set(["done", "cancelled"]);
 export const OPEN_WORKSPACE_STATUSES = "active,idle,in_review,cleanup_failed";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+// The worktree's folder on Paperclip's host, as the workspace records it.
+export const folderOf = (ws) => ws?.cwd ?? ws?.providerRef ?? null;
+
+// "3d", "5h" or "12m": how long ago `ms` was, for a reason line.
+export function age(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "?";
+  if (ms >= DAY_MS) return `${Math.floor(ms / DAY_MS)}d`;
+  if (ms >= 60 * 60_000) return `${Math.floor(ms / (60 * 60_000))}h`;
+  return `${Math.max(0, Math.floor(ms / 60_000))}m`;
+}
 
 // When the issue finished, as Paperclip's reaper reads it (issueTerminalTimestamp).
 export function finishedAt(issue) {
@@ -58,10 +71,13 @@ export function verdict(readiness, { includeUntracked = false, includeUnmerged =
   if (readiness.isSharedWorkspace) return { action: "skip", reasons: ["it is the project's shared checkout, not a worktree"] };
   if (readiness.isProjectPrimaryWorkspace) return { action: "skip", reasons: ["it is the project's main checkout"] };
   const blocking = Array.isArray(readiness.blockingReasons) ? readiness.blockingReasons : [];
-  if (blocking.length) return { action: "skip", reasons: blocking };
+  if (blocking.length) return { action: "skip", reasons: blocking.map((r) => namedBlocker(r, readiness)) };
 
   const git = readiness.git ?? {};
   const reasons = [];
+  // Paperclip couldn't look at the worktree because its folder is gone: closing
+  // tidies the record and frees nothing on disk.
+  if ((readiness.warnings ?? []).some((w) => /does not exist|has no local path/i.test(String(w)))) reasons.push("its folder is already gone");
   let held = false;
   if (git.hasDirtyTrackedFiles) {
     held = true;
@@ -86,6 +102,16 @@ export function verdict(readiness, { includeUntracked = false, includeUnmerged =
     }
   }
   return { action: held ? "review" : "close", reasons };
+}
+
+// Paperclip's "This workspace is still linked to an open issue." names no issue;
+// its close-readiness lists them (linkedIssues), so the reason can.
+function namedBlocker(reason, readiness) {
+  if (!/linked to (an|\d+) open issue/i.test(reason)) return reason;
+  const open = (readiness.linkedIssues ?? []).filter((i) => i && !TERMINAL.has(i.status));
+  if (!open.length) return reason;
+  const names = open.map((i) => `${i.identifier ?? String(i.id).slice(0, 8)} (${i.status})`);
+  return `still linked to open ${open.length === 1 ? "issue" : "issues"} ${names.join(", ")}`;
 }
 
 const unmergedCommits = (readiness) => {
@@ -119,7 +145,9 @@ export async function survey(api, companyId, { now, minDays = 1, concurrency = 4
   const workspaces = (Array.isArray(rows) ? rows : []).filter((w) => w.status !== "archived");
   const counts = { workspaces: workspaces.length, open: 0, recent: 0, noIssue: 0, shared: 0 };
   const failedBefore = [];
-  if (!workspaces.length) return { counts, results: [], failedBefore, githubErrors: [] };
+  // Each workspace not looked at, and why: { ws, issue, why: "open" | "recent" | "noIssue" | "missing", days? }.
+  const leftAlone = [];
+  if (!workspaces.length) return { counts, results: [], failedBefore, leftAlone, openByStatus: {}, githubErrors: [] };
 
   const finished = await listIssues(api, companyId, "done,cancelled");
   const issuesById = new Map(finished.map((i) => [i.id, i]));
@@ -136,25 +164,44 @@ export async function survey(api, companyId, { now, minDays = 1, concurrency = 4
     }
     if (!ws.sourceIssueId) {
       counts.noIssue += 1;
+      leftAlone.push({ ws, issue: null, why: "noIssue" });
       continue;
     }
     const issue = issuesById.get(ws.sourceIssueId);
     if (!issue || !TERMINAL.has(issue.status)) {
       counts.open += 1;
+      leftAlone.push({ ws, issue: issue ?? null, why: "open" });
       continue;
     }
     const at = finishedAt(issue);
     const days = at === null ? null : (now - at) / DAY_MS;
     if (days !== null && days < minDays) {
       counts.recent += 1;
+      leftAlone.push({ ws, issue, why: "recent", days });
       continue;
     }
     candidates.push({ ws, issue, days });
   }
 
+  // What the open issues are waiting on: one listing of every open status. An
+  // issue in neither listing is gone, or one this user can't see.
+  const openByStatus = {};
+  if (leftAlone.some((l) => l.why === "open")) {
+    const open = await listIssues(api, companyId, OPEN_ISSUE_STATUSES).catch(() => null);
+    const openById = new Map((open ?? []).map((i) => [i.id, i]));
+    for (const l of leftAlone) {
+      if (l.why !== "open") continue;
+      l.issue = openById.get(l.ws.sourceIssueId) ?? null;
+      if (!l.issue && open) l.why = "missing";
+      const status = l.issue?.status ?? (open ? "not found" : "unknown");
+      openByStatus[status] = (openByStatus[status] ?? 0) + 1;
+    }
+  }
+
   const githubErrors = [];
   const results = await mapLimit(candidates, concurrency, async (c) => {
-    if (c.issue.executionRunId || c.issue.checkoutRunId) return { ...c, action: "skip", reasons: ["a run still holds the issue"] };
+    const holder = c.issue.executionRunId ?? c.issue.checkoutRunId;
+    if (holder) return { ...c, action: "skip", reasons: [await heldBy(api, holder, now, c.issue.identifier ?? c.issue.id)] };
     let readiness;
     try {
       readiness = await api.request("GET", `/api/execution-workspaces/${c.ws.id}/close-readiness`, undefined, { timeoutMs: 60_000 });
@@ -172,7 +219,20 @@ export async function survey(api, companyId, { now, minDays = 1, concurrency = 4
     }
     return { ...c, readiness, pr, ...verdict(readiness, flags, pr) };
   });
-  return { counts, results, failedBefore, githubErrors: [...new Set(githubErrors)] };
+  return { counts, results, failedBefore, leftAlone, openByStatus, githubErrors: [...new Set(githubErrors)] };
+}
+
+// Which run holds a finished issue, and what state it is in. A run that has
+// finished but still holds the issue is Paperclip's to release (pch why ISSUE,
+// pch release ISSUE): a cancelled run's process may still be alive, so the
+// helper doesn't close the workspace under it.
+async function heldBy(api, runId, now, issue) {
+  const run = await api.request("GET", `/api/heartbeat-runs/${runId}`).catch(() => null);
+  const id = String(runId).slice(0, 8);
+  if (!run) return `run ${id} still holds the issue (Paperclip didn't say what state it is in)`;
+  if (!TERMINAL_RUN.has(run.status)) return `run ${id} still holds the issue (${run.status})`;
+  const ended = Date.parse(run.finishedAt ?? "");
+  return `run ${id} still holds the issue although it ended (${run.status}${Number.isFinite(ended) ? ` ${age(now - ended)} ago` : ""}): see pch why ${issue}`;
 }
 
 // Closes one workspace, as its Close button does. Paperclip removes the worktree
