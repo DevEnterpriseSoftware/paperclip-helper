@@ -420,12 +420,56 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         if ("executionPolicy" in body) {
           // Like Paperclip's applyMonitorTransition: a policy sent without its monitor clears it ("manual").
           const had = issue.executionPolicy?.monitor;
+          const policy = body.executionPolicy ? { ...body.executionPolicy } : null;
+          const asked = policy?.monitor ?? null;
+          if (asked && JSON.stringify(asked) !== JSON.stringify(had ?? null)) {
+            // A new monitor (prepareIssueMonitorUpdate, applyMonitorTransition and
+            // exhaustedMonitorClearReason, services/issue-execution-policy.ts at 1b4c8038):
+            // only on an issue in progress or in review assigned to an agent; nextCheckAt
+            // ahead and timeoutAt after it; refused when the issue's attempt count, kept
+            // across every monitor it has had, already reaches maxAttempts. The externalRef
+            // is stored redacted (normalizeIssueExecutionPolicy), and scheduledBy is
+            // "board" for a board user, "assignee" for the agent.
+            const now = db.now?.() ?? Date.now();
+            const status = body.status ?? issue.status;
+            if (!["in_progress", "in_review"].includes(status) || !issue.assigneeAgentId || issue.assigneeUserId) {
+              return send(422, { error: "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review" });
+            }
+            if (!(Date.parse(asked.nextCheckAt) > now)) return send(422, { error: "Monitor nextCheckAt must be in the future" });
+            if (asked.timeoutAt && Date.parse(asked.timeoutAt) <= Date.parse(asked.nextCheckAt)) return send(422, { error: "Monitor timeoutAt must be later than nextCheckAt" });
+            if (asked.maxAttempts != null && !(Number.isInteger(asked.maxAttempts) && asked.maxAttempts >= 1 && asked.maxAttempts <= 100)) {
+              return send(400, { error: "Invalid execution policy" });
+            }
+            if (asked.notes != null && String(asked.notes).length > 500) return send(400, { error: "Invalid execution policy" });
+            const attemptCount = issue.monitorAttemptCount ?? issue.executionState?.monitor?.attemptCount ?? 0;
+            if ((asked.timeoutAt && Date.parse(asked.timeoutAt) <= now) || (asked.maxAttempts != null && attemptCount >= asked.maxAttempts)) {
+              return send(422, { error: "Monitor bounds are already exhausted" });
+            }
+            const scheduledBy = /^agent/.test(db.meSource ?? "board_key") ? "assignee" : "board";
+            const stored = {
+              nextCheckAt: asked.nextCheckAt, notes: asked.notes ?? null, scheduledBy, kind: asked.kind ?? null, serviceName: asked.serviceName ?? null,
+              externalRef: asked.externalRef ? "[redacted]" : null, timeoutAt: asked.timeoutAt ?? null, maxAttempts: asked.maxAttempts ?? null, recoveryPolicy: asked.recoveryPolicy ?? null,
+            };
+            policy.monitor = stored;
+            issue.monitorAttemptCount = attemptCount;
+            issue.executionState = {
+              ...(issue.executionState ?? {}),
+              monitor: { status: "scheduled", ...stored, attemptCount, lastTriggeredAt: issue.executionState?.monitor?.lastTriggeredAt ?? null, clearedAt: null, clearReason: null },
+            };
+            db.activity.push({ action: "issue.monitor_scheduled", entityType: "issue", entityId: issue.id, actorType: scheduledBy === "board" ? "user" : "agent", details: { ...stored }, createdAt: new Date(now).toISOString() });
+          }
           // normalizeIssueExecutionPolicy: no stages and no monitor left is no policy.
-          const policy = body.executionPolicy;
           issue.executionPolicy = policy && (policy.stages?.length || policy.monitor) ? policy : null;
-          if (had && !body.executionPolicy?.monitor && issue.executionState?.monitor) {
+          if (had && !asked && issue.executionState?.monitor) {
             issue.executionState = { ...issue.executionState, monitor: { ...issue.executionState.monitor, status: "cleared", clearReason: "manual", nextCheckAt: null } };
           }
+        }
+        // A status Paperclip doesn't keep a monitor in clears it (monitorClearReasonForIssue).
+        if (issue.executionPolicy?.monitor && !["in_progress", "in_review"].includes(issue.status)) {
+          const reason = ["done", "cancelled"].includes(issue.status) ? issue.status : "invalid_status";
+          const { monitor: _gone, ...rest } = issue.executionPolicy;
+          issue.executionPolicy = rest.stages?.length ? rest : null;
+          if (issue.executionState?.monitor) issue.executionState = { ...issue.executionState, monitor: { ...issue.executionState.monitor, status: "cleared", clearReason: reason, nextCheckAt: null } };
         }
         // Like Paperclip's issue update: with isolated workspaces off, the
         // workspace fields are dropped without an error.

@@ -12,9 +12,19 @@
 // Optionally (WATCHDOG_CI_RERUN_JOBS) a failed run whose failed jobs all match a
 // pattern you know to be flaky is re-run first, a few times per run, and only
 // reported once an attempt passes or the re-runs are used up.
+//
+// The backstop (WATCHDOG_CI_BACKSTOP_MIN). An issue left in progress, owned by an
+// agent, with no run and no monitor, has no live path for Paperclip's disposition
+// guard: when the agent's run ends that way, Paperclip wakes it to "repair" the
+// disposition, twice, then blocks the issue for the board ("unchanged_source_state_
+// exhausted"). A comment naming a run isn't a live path; a scheduled monitor is. So
+// while the run an agent waits on is still going, the watchdog gives its issue a
+// Paperclip monitor of its own: one check, hours out (the run's worst case), whose
+// notes name the run. The watchdog still reports the run when it finishes and clears
+// the monitor in the same step; the monitor fires only if that report never comes.
 
 import { listIssues } from "./paperclip.mjs";
-import { ACTIVE_RUN, asleep, mapLimit, ts } from "./util.mjs";
+import { ACTIVE_RUN, asleep, mapLimit, pausedRefusal, ts } from "./util.mjs";
 
 // Runs are referred to by id (11 digits today) or by URL. A bare number needs at
 // least 9 digits and a word that says it's a run, so a PR or issue number never
@@ -88,6 +98,76 @@ export function monitorPending(monitor, now) {
   const spent = Boolean(timeout && timeout <= next) || (max > 0 && Number(monitor.attemptCount ?? 0) + 1 > max);
   return !spent || (monitor.recoveryPolicy ?? "wake_owner") === "wake_owner";
 }
+
+// ---------------------------------------------------------------- the backstop monitor
+
+// The watchdog's own monitor is told apart by its notes, which start with this
+// (Paperclip stores a monitor's externalRef as "[redacted]", so the notes are also
+// where the run is named), and by who scheduled it: a board key's monitor is
+// scheduledBy "board".
+export const BACKSTOP_MARK = "Paperclip Helper CI backstop";
+export const isBackstop = (monitor) =>
+  String(monitor?.notes ?? "").startsWith(BACKSTOP_MARK) && (monitor.scheduledBy == null || monitor.scheduledBy === "board");
+
+// Paperclip's limits on a monitor: maxAttempts 1–100, notes up to 500 characters.
+const MAX_MONITOR_ATTEMPTS = 100;
+// Past nextCheckAt, a monitor whose timeoutAt has also passed is cleared instead of
+// fired; the scheduler looks every 30 seconds, so this leaves it ample time to fire.
+const BACKSTOP_TIMEOUT_MARGIN_MS = 30 * 60_000;
+
+export function backstopNotes(run, { replaced = false } = {}) {
+  const ref = run.html_url ?? `run ${run.id}`;
+  return (
+    `${BACKSTOP_MARK} for CI run ${ref}. It wakes the assignee once, at this check, only if the Helper misses the run finishing; ` +
+    `the Helper reports the run and clears this monitor when it finishes.${replaced ? " It replaced the assignee's own monitor polling this run." : ""}`
+  ).slice(0, 500);
+}
+
+// The monitor the watchdog schedules for a run (PATCH /api/issues/:id
+// executionPolicy.monitor). One check: Paperclip strips a monitor from the policy
+// when it fires. Its attempt count is the issue's, kept across every monitor ever
+// scheduled on it, and a monitor whose maxAttempts that count already reaches is
+// refused ("Monitor bounds are already exhausted"): maxAttempts is one more than the
+// issue has used, or none past Paperclip's cap of 100 (the timeout still bounds it).
+export function backstopMonitor({ run, now, backstopMs, attemptCount = 0, replaced = false }) {
+  const next = now + backstopMs;
+  const used = Math.max(0, Number(attemptCount) || 0);
+  return {
+    kind: "external_service",
+    serviceName: "github",
+    externalRef: run.html_url ?? String(run.id),
+    nextCheckAt: new Date(next).toISOString(),
+    timeoutAt: new Date(next + BACKSTOP_TIMEOUT_MARGIN_MS).toISOString(),
+    ...(used + 1 <= MAX_MONITOR_ATTEMPTS ? { maxAttempts: used + 1 } : {}),
+    recoveryPolicy: "wake_owner",
+    notes: backstopNotes(run, { replaced }),
+  };
+}
+
+// The attempts the issue's monitors have used, as Paperclip counts them.
+export const monitorAttempts = (issue) =>
+  Math.max(Number(issue?.monitorAttemptCount) || 0, Number(issue?.executionState?.monitor?.attemptCount) || 0);
+
+// Does the monitor watch this run and nothing else? Every run its notes name is it.
+export function watchesOnly(monitor, run) {
+  const refs = runRefs(monitor?.notes);
+  return refs.length > 0 && refs.every((r) => String(r.id) === String(run.id));
+}
+
+// An agent's own monitor on the run it waits on: its notes name that run and no
+// other, or name no run at all on a GitHub service ("github", "GitHub Actions", "CI")
+// while the agent's comment names the run.
+const CI_SERVICE = /git\s*hub|actions|\bci\b/i;
+export function agentCiMonitor(monitor, run) {
+  if (!monitor || isBackstop(monitor)) return false;
+  if (watchesOnly(monitor, run)) return true;
+  return runRefs(monitor.notes).length === 0 && CI_SERVICE.test(String(monitor.serviceName ?? ""));
+}
+
+// It polls: its next check comes sooner than half the backstop would. Each check is
+// a full run that finds the CI still going. One set as far out as the backstop is
+// the agent's own backstop, and is left to stand for the watchdog's.
+export const polls = (monitor, now, backstopMs) => ts(monitor?.nextCheckAt) - now < backstopMs / 2;
 
 const FAILED = new Set(["failure", "timed_out", "startup_failure"]);
 export const failedJobs = (jobs) => (Array.isArray(jobs) ? jobs : []).filter((j) => FAILED.has(j?.conclusion));
@@ -180,6 +260,10 @@ const CONCURRENCY = 4;
 const RUNNER_LOOKBACK_MS = 24 * 60 * 60_000;
 const RUNNER_RUNS_READ = 12;
 const RUNNER_NOTE_EVERY_MS = 24 * 60 * 60_000;
+// Backstops the watchdog schedules for one run on one issue, at most: an agent that
+// keeps replacing the watchdog's monitor (or Paperclip that keeps refusing it) is
+// left alone after that.
+const BACKSTOPS_PER_RUN = 3;
 
 // Check 11. From the watchdog: its records (keys from `record`), the GitHub client,
 // `agentFor` (an agent by id, cached for the tick), `nudge` (its once-per-key
@@ -199,6 +283,8 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
   const ciSilenced = new Map(); // CI record key → { companyId, reasons }: why a finished run isn't reported, as logged
   const ciRefused = new Set(); // repos whose runs the GitHub token may not read, warned once until it can
   const runnerScans = new Map(); // "repo|runner" → { failures, at }: other PRs' setup failures, for one scan
+  const backstopMs = Math.max(0, Number(config.watchdogCiBackstopMin) || 0) * 60_000; // 0: no backstop
+  const backstopSeen = new Map(); // issueId → { companyId, updatedAt, assignee }: settled by the backstop pass at that point
   const rerunPattern = (() => {
     if (!config.watchdogCiRerunJobs) return null;
     try {
@@ -211,16 +297,16 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
 
 
   // The run behind a reference: { state: "missing" } (not in GITHUB_REPOS, or not
-  // found), { state: "unknown" } (GitHub didn't answer), { state: "running" }, or
-  // { state: "finished", repo, run, jobs } with the latest attempt's jobs. Read
-  // once per scan: a finished run can be re-run (by you, or an agent) at any time.
-  // Ids not found anywhere are remembered for the process.
-  async function lookupRun(ref) {
+  // found), { state: "unknown" } (GitHub didn't answer), { state: "running", repo,
+  // run }, or { state: "finished", repo, run, jobs } with the latest attempt's jobs.
+  // Read once per scan (`fresh`: read again now): a finished run can be re-run (by
+  // you, or an agent) at any time. Ids not found anywhere are remembered for the process.
+  async function lookupRun(ref, { fresh = false } = {}) {
     if (ciMissing.has(`${ref.repo ?? "*"}#${ref.id}`)) return { state: "missing" };
     const repos = ref.repo ? [ref.repo] : ciRepoOf.has(ref.id) ? [ciRepoOf.get(ref.id)] : config.repos;
     for (const repo of repos) {
       if (config.repos.length && !config.repos.includes(repo)) continue;
-      const cached = ciRuns.get(`${repo}#${ref.id}`);
+      const cached = fresh ? null : ciRuns.get(`${repo}#${ref.id}`);
       if (cached) return cached;
       let run;
       try {
@@ -239,7 +325,7 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
       }
       ciRefused.delete(repo);
       ciRepoOf.set(ref.id, repo);
-      let found = { state: "running" };
+      let found = { state: "running", repo, run };
       if (run?.status === "completed") {
         const jobs = run.conclusion === "success" || UNINFORMATIVE.has(run.conclusion) ? [] : await github.workflowJobs(repo, ref.id).catch(() => []);
         found = { state: "finished", repo, run, jobs };
@@ -389,6 +475,7 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
 
   async function checkCiRuns(companyId, agents) {
     if (!github) return;
+    await checkBackstops(companyId, agents);
     const last = ciScanAt.get(companyId);
     if (last && now() - last < stallMs) return;
     ciScanAt.set(companyId, now());
@@ -463,8 +550,16 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     // Cancelled by a newer push, skipped, waiting on approval.
     if (!dispatchedOnDefault && UNINFORMATIVE.has(run.conclusion)) return silent(`its conclusion, ${run.conclusion}, says nothing about the change`);
     const finishedAt = ts(run.updated_at);
-    // Give the agent's own monitor, or the agent, the stall window to notice.
-    if (!finishedAt || now() - finishedAt < stallMs) return silent("finished less than the stall window ago");
+    full ??= await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+    if (!full || full.assigneeAgentId !== assignee) return;
+    const monitor = full.executionState?.monitor;
+    const monitorDue = monitorPending(monitor, now());
+    // The watchdog's own backstop, or a monitor that watches this very run and nothing
+    // else, is the agent's wait: it is cleared with the report, so nothing else will
+    // notice the run finished. Report it now.
+    const heldByMonitor = monitorDue && (isBackstop(monitor) || watchesOnly(monitor, run));
+    // Otherwise give the agent's own monitor, or the agent, the stall window to notice.
+    if (!finishedAt || (!heldByMonitor && now() - finishedAt < stallMs)) return silent("finished less than the stall window ago");
     // The agent wrote about the run after it finished: it watched it within its own run.
     if (cached.saidAt && ts(cached.saidAt) >= finishedAt) return silent("the agent commented after it finished");
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => null);
@@ -474,15 +569,12 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     if (startedRuns(runs).some((r) => r.agentId === assignee && ts(r.startedAt ?? r.createdAt) >= finishedAt)) {
       return silent("the agent has run on the issue since it finished");
     }
-    full ??= await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
-    if (!full || full.assigneeAgentId !== assignee) return;
-    const monitor = full.executionState?.monitor;
-    const monitorDue = monitorPending(monitor, now());
     // A monitor still due that watches this very run would only wake the agent again
     // to find it finished: report now, and clear the monitor in the same step. One
     // that watches something else is left to fire. (Paperclip redacts a monitor's
-    // externalRef, so only its notes can name the run.)
-    if (monitorDue && !watchesOnly(monitor, run)) return silent("the agent's Paperclip monitor will still fire", { nextCheckAt: monitor.nextCheckAt });
+    // externalRef, so only its notes can name the run.) The watchdog's own backstop
+    // for an earlier run is stale once the agent waits on this one: cleared too.
+    if (monitorDue && !heldByMonitor) return silent("the agent's Paperclip monitor will still fire", { nextCheckAt: monitor.nextCheckAt });
     // A monitor Paperclip shows without the policy that holds it can't be cleared: leave it to fire.
     if (monitorDue && !full.executionPolicy?.monitor) return silent("the agent's monitor can't be cleared");
     // A wake still waiting gets the stall window to start a run. One older than
@@ -504,25 +596,48 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     const reruns = records.get(record.ciRerun(found.repo, run))?.count ?? 0;
     // The policy is replaced whole: read it again now, so nothing changed meanwhile is overwritten.
     let clearMonitor;
+    let cleared = null; // the monitor cleared with the report
     if (monitorDue) {
       const fresh = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
       const freshMonitor = fresh?.executionState?.monitor;
-      if (!fresh || (monitorPending(freshMonitor, now()) && (!watchesOnly(freshMonitor, run) || !fresh.executionPolicy?.monitor))) {
+      const freshHeld = isBackstop(freshMonitor) || watchesOnly(freshMonitor, run);
+      if (!fresh || (monitorPending(freshMonitor, now()) && (!freshHeld || !fresh.executionPolicy?.monitor))) {
         return silent("the agent's monitor changed while the report was prepared");
       }
-      if (monitorPending(freshMonitor, now())) clearMonitor = withoutMonitor(fresh.executionPolicy);
+      if (monitorPending(freshMonitor, now())) {
+        clearMonitor = withoutMonitor(fresh.executionPolicy);
+        cleared = freshMonitor;
+      }
     }
+    const backstopKey = record.ciBackstop(issue);
+    const replaced = Boolean(records.get(backstopKey)?.replaced);
     const posted = await nudge(
       full,
       key,
       agent,
       ciMessage({ run, jobs: found.jobs, reruns }),
-      { reason: "CI run finished", repo: found.repo, run: run.id, conclusion: run.conclusion },
-      clearMonitor !== undefined
-        ? { patch: { executionPolicy: clearMonitor }, patchNote: "\n\nYour Paperclip monitor for this run was cleared: it would only have woken you to find the run finished." }
-        : {},
+      { reason: "CI run finished", repo: found.repo, run: run.id, conclusion: run.conclusion, ...(cleared && isBackstop(cleared) ? { backstopCleared: true } : {}) },
+      clearMonitor !== undefined ? { patch: { executionPolicy: clearMonitor }, patchNote: clearedNote(cleared, replaced) } : {},
     );
-    if (posted) stats.ciReports += 1;
+    if (posted) {
+      stats.ciReports += 1;
+      if (cleared && isBackstop(cleared) && records.has(backstopKey)) {
+        records.delete(backstopKey);
+        state.touch();
+      }
+    }
+  }
+
+  // What the report adds when it clears a monitor.
+  function clearedNote(monitor, replaced) {
+    if (!isBackstop(monitor)) return "\n\nYour Paperclip monitor for this run was cleared: it would only have woken you to find the run finished.";
+    return (
+      "\n\nThe Helper's backstop monitor for this run was cleared." +
+      (replaced
+        ? " It had replaced your own monitor polling the run: to wait on CI, name the run in your last comment and end your run, " +
+          "without a monitor; the Helper keeps one for you and wakes you when the run finishes."
+        : "")
+    );
   }
 
   // The issue's execution policy without its monitor (Paperclip replaces the policy
@@ -533,11 +648,159 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     return rest;
   }
 
-  // Does the monitor watch this run and nothing else? Every run its notes name is it.
-  function watchesOnly(monitor, run) {
-    const refs = runRefs(monitor?.notes);
-    return refs.length > 0 && refs.every((r) => String(r.id) === String(run.id));
+  // ---------------------------------------------------------------- the backstop, every tick
+
+  // Every tick, not once per stall window: Paperclip's disposition guard looks at the
+  // issue the moment the agent's run ends, and the sooner the backstop stands, the
+  // fewer repair wakes. Each issue is read again only once it has changed (its
+  // updatedAt moves with every comment, run and monitor change), and its run looked
+  // up once then.
+  async function checkBackstops(companyId, agents) {
+    if (!backstopMs) return;
+    const issues = (await listIssues(api, companyId, CI_STATUSES)).filter(
+      (i) => i.assigneeAgentId && now() - ts(i.updatedAt) < CI_LOOKBACK_MS,
+    );
+    const live = new Set(issues.map((i) => i.id));
+    for (const [id, seen] of backstopSeen) if (seen.companyId === companyId && !live.has(id)) backstopSeen.delete(id);
+    await mapLimit(issues, CONCURRENCY, async (issue) => {
+      try {
+        await backstopIssue(issue, agents, companyId);
+      } catch (err) {
+        log.warn("watchdog: CI backstop check failed", { issue: issue.identifier ?? issue.id, error: err.message });
+      }
+    });
   }
+
+  async function backstopIssue(issue, agents, companyId) {
+    const seen = backstopSeen.get(issue.id);
+    if (seen && seen.updatedAt === issue.updatedAt && seen.assignee === issue.assigneeAgentId) return;
+    const settle = () => backstopSeen.set(issue.id, { companyId, updatedAt: issue.updatedAt, assignee: issue.assigneeAgentId });
+    const key = record.ciBackstop(issue);
+    let mine = records.get(key);
+    // Only an issue in progress needs one (the guard looks at todo and in progress,
+    // and Paperclip takes a monitor only in progress or in review). Paperclip clears a
+    // monitor itself when the issue moves to todo, blocked, done or cancelled; one left
+    // on an issue now in review, or now another agent's, would wake the wrong run.
+    if (issue.status !== "in_progress" || (mine && mine.agentId !== issue.assigneeAgentId)) {
+      if (mine && !(await tidyBackstop(issue, key, issue.status !== "in_progress" ? `the issue is ${issue.status}` : "the issue changed hands"))) return;
+      if (issue.status !== "in_progress") return settle();
+      mine = undefined; // gone with the previous owner's backstop; the new owner may wait on CI too
+    }
+    const assignee = issue.assigneeAgentId;
+    const comments = await api.request("GET", `/api/issues/${issue.id}/comments?order=desc&limit=10`).catch(() => null);
+    if (!Array.isArray(comments)) return;
+    const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+    if (!full) return;
+    if (full.status !== "in_progress" || full.assigneeAgentId !== assignee || full.assigneeUserId) return settle();
+    const monitor = full.executionState?.monitor;
+    // What the agent said it waits on. The watchdog's own notes don't count: the
+    // agent's comments decide which run its wait is.
+    const said = waitingOn(comments, assignee, isBackstop(monitor) ? null : monitor);
+    const refs = runRefs(said.text);
+    if (!refs.length) return settle();
+    const agent = await agentFor(assignee, agents).catch(() => null);
+    if (!agent || asleep(agent)) return settle();
+    // The newest run named that is in GITHUB_REPOS, read now: one that has already
+    // finished needs no backstop (the report is on its way).
+    let found = null;
+    for (const ref of refs) {
+      const r = await lookupRun(ref, { fresh: true });
+      if (r.state === "missing") continue;
+      if (r.state === "unknown") return; // GitHub didn't answer: next tick
+      found = r;
+      break;
+    }
+    if (!found || found.state !== "running") return settle();
+    const { run } = found;
+    const runKey = `${found.repo}#${run.id}`;
+    const pending = monitorPending(monitor, now());
+    let replaced = false;
+    if (pending && isBackstop(monitor)) {
+      if (watchesOnly(monitor, run)) {
+        // Already standing (a restart forgot the record: take it up again).
+        if (!mine || mine.run !== runKey) {
+          records.set(key, { count: 1, at: now(), run: runKey, agentId: assignee, replaced: Boolean(mine?.replaced) });
+          state.touch();
+        }
+        return settle();
+      }
+      // The watchdog's backstop for an earlier run: moved to this one below.
+    } else if (pending) {
+      // The agent's own monitor. Left alone unless it polls the run it waits on.
+      if (!agentCiMonitor(monitor, run) || !polls(monitor, now(), backstopMs) || !full.executionPolicy?.monitor) return settle();
+      replaced = true;
+    }
+    const count = mine?.run === runKey ? (mine.count ?? 0) : 0;
+    const extra = { issue: issue.identifier ?? issue.id, agent: agent.name, repo: found.repo, run: run.id, ...(replaced ? { replaced: "the agent's polling monitor" } : {}) };
+    if (count >= BACKSTOPS_PER_RUN) {
+      if (count === BACKSTOPS_PER_RUN) {
+        records.set(key, { ...mine, count: count + 1, at: now() });
+        state.touch();
+        log.warn("watchdog: the CI backstop monitor keeps being replaced or refused; the issue is left to Paperclip", extra);
+      }
+      return settle();
+    }
+    if (config.dryRun) {
+      const seenKey = `${key}:${runKey}`;
+      if (!dryRunSeen.has(seenKey)) {
+        dryRunSeen.add(seenKey);
+        log("watchdog: would schedule a CI backstop monitor (dry run)", extra);
+      }
+      return settle();
+    }
+    // The policy is replaced whole: read it again now, so nothing changed meanwhile
+    // is overwritten, and act only on the monitor seen above.
+    const fresh = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+    if (!fresh || fresh.status !== "in_progress" || fresh.assigneeAgentId !== assignee) return;
+    if (!sameMonitor(fresh.executionState?.monitor, monitor)) return; // next tick
+    const next = backstopMonitor({ run, now: now(), backstopMs, attemptCount: monitorAttempts(fresh), replaced });
+    records.set(key, { count: count + 1, at: now(), run: runKey, agentId: assignee, replaced: replaced || (mine?.run === runKey && Boolean(mine?.replaced)) });
+    state.touch();
+    try {
+      await api.request("PATCH", `/api/issues/${issue.id}`, { executionPolicy: { ...(fresh.executionPolicy ?? {}), monitor: next } });
+    } catch (err) {
+      if (pausedRefusal(err)) {
+        records.set(key, { ...records.get(key), count }); // a paused task: not a try used up
+        log.debug("watchdog: the issue is paused; CI backstop postponed", extra);
+        return;
+      }
+      log.warn("watchdog: Paperclip refused the CI backstop monitor", { ...extra, error: err.message });
+      return;
+    }
+    stats.ciBackstops = (stats.ciBackstops ?? 0) + 1;
+    log("watchdog: scheduled a CI backstop monitor", { ...extra, nextCheckAt: next.nextCheckAt, maxAttempts: next.maxAttempts ?? null });
+  }
+
+  // Clears the watchdog's backstop from an issue it no longer fits, without a comment
+  // (a comment would wake the assignee). True once nothing of it is left.
+  async function tidyBackstop(issue, key, why) {
+    const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+    if (!full) return false;
+    const monitor = full.executionState?.monitor;
+    if (monitorPending(monitor, now()) && isBackstop(monitor) && full.executionPolicy?.monitor) {
+      const extra = { issue: issue.identifier ?? issue.id, reason: why };
+      if (config.dryRun) {
+        if (!dryRunSeen.has(`${key}:tidy`)) {
+          dryRunSeen.add(`${key}:tidy`);
+          log("watchdog: would clear its CI backstop monitor (dry run)", extra);
+        }
+        return false;
+      }
+      try {
+        await api.request("PATCH", `/api/issues/${issue.id}`, { executionPolicy: withoutMonitor(full.executionPolicy) ?? null });
+      } catch (err) {
+        if (!pausedRefusal(err)) log.warn("watchdog: couldn't clear its CI backstop monitor", { ...extra, error: err.message });
+        return false;
+      }
+      log("watchdog: cleared its CI backstop monitor", extra);
+    }
+    records.delete(key);
+    state.touch();
+    return true;
+  }
+
+  const sameMonitor = (a, b) =>
+    (a?.status ?? null) === (b?.status ?? null) && (a?.nextCheckAt ?? null) === (b?.nextCheckAt ?? null) && (a?.notes ?? null) === (b?.notes ?? null);
 
   return { check: checkCiRuns };
 }

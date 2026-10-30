@@ -974,6 +974,7 @@ export async function status(ctx) {
         counted(w.questions, "undelivered question card routed", "undelivered question cards routed"),
         counted(w.ciReports, "finished CI run reported", "finished CI runs reported"),
         counted(w.ciReruns, "flaky CI run re-run", "flaky CI runs re-run"),
+        counted(w.ciBackstops, "CI backstop monitor scheduled", "CI backstop monitors scheduled"),
         counted(w.returned, "issue returned to its agent", "issues returned to their agent"),
         counted(w.resumed, "issue restored after a resume", "issues restored after a resume"),
         w.limitPauses ? `${plural(w.limitPauses, "agent")} paused at a usage limit (${w.limitResumes} resumed)` : null,
@@ -983,6 +984,7 @@ export async function status(ctx) {
         counted(w.runnerProblems, "broken runner reported", "broken runners reported"),
         counted(w.readyNotes, "PR ready to queue reported", "PRs ready to queue reported"),
         counted(w.worktreeLinkNotes, "checkout with relative worktree links reported", "checkouts with relative worktree links reported"),
+        counted(w.selfWakes, "agent waking itself reported", "agents waking themselves reported"),
       ].filter(Boolean);
       out(`  Since start: ${done.length ? done.join(", ") : "nothing needed doing"}.`);
       if (w.stuck) out(`  ${yellow(`${plural(w.stuck, "issue")} stuck behind a deferred wake: see the log.`)}`);

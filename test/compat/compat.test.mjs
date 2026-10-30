@@ -32,6 +32,7 @@ import { createRelay } from "../../src/relay.mjs";
 import { createCostSync } from "../../src/cost-sync.mjs";
 import * as commands from "../../src/commands.mjs";
 import { approvalWaitingOn } from "../../src/util.mjs";
+import { backstopMonitor, isBackstop, monitorAttempts } from "../../src/ci-runs.mjs";
 
 const BASE = (process.env.PAPERCLIP_COMPAT_API ?? "").replace(/\/+$/, "");
 const COMPANY_PREFIX = "pch-compat";
@@ -843,6 +844,92 @@ if (!BASE) {
       assert.ok(!listed.some((a) => a.id === s.modelled.id), "terminated agents are left out of the list");
       const direct = await s.ctx.api.request("GET", `/api/agents/${s.modelled.id}`);
       assert.equal(direct.status, "terminated", "which is why cost sync reads them one by one");
+    });
+
+    // Watchdog 11's backstop, and the disposition guard it answers. Last, so the
+    // repairs the control issue gets touch no other test. Each agent does what a real
+    // one waiting on CI does: posts "waiting on <run>" through the API with its run's
+    // own token (so Paperclip's missing-comment retry stays out of it) and ends its
+    // run, leaving the issue in progress. The backstop goes on while that run is still
+    // going, as the watchdog's does: the guard looks the moment the run ends
+    // (heartbeat/run-completion.ts → reconcileLegacyContinuation).
+    test("CI backstop: a board key's monitor is the live path the disposition guard wants; its attempts count across monitors; the report clears it", async (t) => {
+      const run = { id: 39498202022, html_url: "https://github.com/org/app/actions/runs/39498202022" };
+      const script =
+        "const e = process.env; setTimeout(() => fetch(e.PAPERCLIP_API_URL + '/api/issues/' + e.CI_ISSUE + '/comments', { method: 'POST', " +
+        "headers: { authorization: 'Bearer ' + e.PAPERCLIP_API_KEY, 'content-type': 'application/json', 'x-paperclip-run-id': e.PAPERCLIP_RUN_ID }, " +
+        `body: JSON.stringify({ body: 'Pushed. Waiting on ${run.html_url}' }) }).then((r) => console.log('comment', r.status), (err) => console.log('comment failed', err.message)), 3000);`;
+      const waitingIssue = async (name) => {
+        const created = await issue({ title: `Waiting on CI (${name})`, status: "todo" });
+        const owner = await agent(name, script, { env: { CI_ISSUE: created.id } });
+        await ok("PATCH", `/api/issues/${created.id}`, { assigneeAgentId: owner.id, status: "in_progress" });
+        return { ...created, owner };
+      };
+      const schedule = async (id, extra = {}) => {
+        const full = await s.ctx.api.request("GET", `/api/issues/${id}`);
+        const monitor = { ...backstopMonitor({ run, now: Date.now(), backstopMs: 6 * 60 * 60_000, attemptCount: monitorAttempts(full) }), ...extra };
+        await s.ctx.api.request("PATCH", `/api/issues/${id}`, { executionPolicy: { ...(full.executionPolicy ?? {}), monitor } });
+        return monitor;
+      };
+      // What the guard did: its repair runs (wake reason issue_disposition_repair; the
+      // wake diagnostics show that reason as "other") and its recovery action.
+      const guardOn = async (id) => {
+        const runs = await runsOf(id);
+        const reasons = [];
+        for (const r of runs) {
+          const detail = await s.ctx.api.request("GET", `/api/heartbeat-runs/${r.runId ?? r.id}`).catch(() => null);
+          reasons.push(detail?.contextSnapshot?.wakeReason ?? detail?.wakeReason ?? r.invocationSource ?? "?");
+        }
+        const recovery = await s.ctx.api.request("GET", `/api/issues/${id}/recovery-actions`).catch(() => null);
+        const actions = [recovery?.active, ...(recovery?.actions ?? [])].filter(Boolean).map((a) => a.kind);
+        const comments = (await commentsOf(id)).filter((c) => c.authorAgentId).length;
+        return { repaired: reasons.includes("issue_disposition_repair") || actions.includes("deliberate_wait_without_target"), reasons, actions, comments };
+      };
+
+      const control = await waitingIssue("Carol");
+      const waiting = await waitingIssue("Dave");
+      const sent = await schedule(waiting.id);
+      const guarded = await until("the guard to repair the control issue", async () => (await guardOn(control.id)).repaired, { timeoutMs: 60_000, everyMs: 2000 }).then(
+        () => true,
+        () => false,
+      );
+      await settled(waiting.id);
+      const [c, w] = [await guardOn(control.id), await guardOn(waiting.id)];
+      t.diagnostic(`control (no monitor): ${JSON.stringify(c)}`);
+      t.diagnostic(`backstop: ${JSON.stringify(w)}`);
+      if (!guarded) t.diagnostic("this Paperclip didn't repair the control issue: the guard isn't exercised");
+      assert.ok(w.comments >= 1, "the agent's own comment was posted with its run's token");
+      assert.equal(w.repaired, false, "no disposition repair while the backstop stands");
+      let full = await s.ctx.api.request("GET", `/api/issues/${waiting.id}`);
+      assert.equal(full.status, "in_progress", "not blocked for the board");
+      const m = full.executionState?.monitor;
+      assert.equal(m?.status, "scheduled");
+      assert.equal(m.scheduledBy, "board", "a board key's monitor is scheduledBy board");
+      assert.equal(m.notes, sent.notes, "the notes are kept as sent: they name the run");
+      assert.ok(isBackstop(m), "the watchdog recognises its own monitor");
+      assert.equal(full.executionPolicy?.monitor?.externalRef, "[redacted]", "the externalRef is stored redacted");
+
+      // Fired once, the issue's attempt count is 1: a monitor allowing 1 is refused.
+      await ok("POST", `/api/issues/${waiting.id}/monitor/check-now`, {});
+      await until("the monitor to fire", async () => (await s.ctx.api.request("GET", `/api/issues/${waiting.id}`)).executionState?.monitor?.status !== "scheduled");
+      full = await s.ctx.api.request("GET", `/api/issues/${waiting.id}`);
+      assert.ok(monitorAttempts(full) >= 1, `the attempt count moved (${JSON.stringify(full.executionState?.monitor)})`);
+      await assert.rejects(schedule(waiting.id, { maxAttempts: monitorAttempts(full) }), (err) => err.status === 422 && /exhausted/i.test(err.message));
+      if (full.status === "in_progress") {
+        await schedule(waiting.id); // one more than used: accepted
+        // The report: the policy without its monitor, with the comment, in one PATCH.
+        full = await s.ctx.api.request("GET", `/api/issues/${waiting.id}`);
+        const { monitor: _m, ...rest } = full.executionPolicy ?? {};
+        await s.ctx.api.request("PATCH", `/api/issues/${waiting.id}`, { executionPolicy: rest, comment: "compat: the CI run finished" });
+        full = await s.ctx.api.request("GET", `/api/issues/${waiting.id}`);
+        assert.equal(full.executionState?.monitor?.status, "cleared");
+        assert.equal(full.executionState.monitor.clearReason, "manual");
+        assert.ok(!full.executionPolicy?.monitor);
+      } else {
+        t.diagnostic(`after the monitor fired the issue is ${full.status}: the clearing isn't checked`);
+      }
+      // No more runs for the tests after this one.
+      for (const owner of [control.owner, waiting.owner]) await ok("POST", `/api/agents/${owner.id}/pause`, {});
     });
 
     // ------------------------------------------------------------ 8. the end

@@ -8,7 +8,8 @@ import { pendingCards } from "./questions.mjs";
 import { deadLinkWorkspaceId, describeLink, linkFacts } from "./workspace.mjs";
 import { classifyFailure, labelOf, localZone, resetLabel } from "./limits.mjs";
 import { issueActivity, stagesWipe } from "./stages.mjs";
-import { runRefs, waitingOn } from "./ci-runs.mjs";
+import { isBackstop, monitorPending, runRefs, waitingOn } from "./ci-runs.mjs";
+import { selfWakeLoop } from "./self-wakes.mjs";
 import { PAUSE_CANCEL, RECONCILIATION_CAUSE } from "./release.mjs";
 import { describeWakes } from "./paused-holds.mjs";
 import { codeLabel, EXTENSION_ERROR, hostPaths, meaningOf, readWorkspace, RECOVERY_KIND, VALIDATION_FAILED, validationOf } from "./worktree-links.mjs";
@@ -293,16 +294,26 @@ async function whyReport(ctx, identifier, out) {
     participant = { name: agent?.name ?? (await nameOf(p.agentId)), status: agent?.status ?? null };
     out(`Review stage waits on: ${participant.name}${participant.status ? ` (${participant.status})` : ""}`);
   }
+  // The activity log: who removed the stages (watchdog 17), and whether an agent
+  // keeps waking itself with its runs' posted final messages (watchdog 21).
+  const activity = full?.id ? await issueActivity(api, full.id) : null;
   // In review with no stage pending: did an agent's update remove the stages (watchdog 17)?
   let stagesWipedBy = null;
   if (full?.status === "in_review" && full.executionState?.status !== "pending" && full.id) {
-    const wipe = stagesWipe(await issueActivity(api, full.id));
+    const wipe = stagesWipe(activity);
     if (wipe) stagesWipedBy = (await nameOf(wipe.agentId ?? wipe.actorId)) ?? "an agent";
   }
+  const loop = selfWakeLoop(activity, runList, { now: ctx.now() });
+  const selfWake = loop ? { name: (await nameOf(loop.agentId)) ?? "an agent", count: loop.count } : null;
+  if (selfWake) out(`Self-wakes: ${selfWake.name}, ${selfWake.count} in the last hour (each run's final message, posted as its comment, started its next run)`);
   // The CI run the assignee's latest comments say it waits on (watchdog 11).
   const said = waitingOn(Array.isArray(comments) ? comments : [], full?.assigneeAgentId, full?.executionState?.monitor);
   const ref = runRefs(said.text)[0];
   const ciRun = ref ? (ref.repo ? `${ref.repo}#${ref.id}` : ref.id) : null;
+  // The watchdog's backstop monitor for that wait (watchdog 11), if it stands.
+  const monitor = full?.executionState?.monitor;
+  const ciBackstop = monitorPending(monitor, ctx.now()) && isBackstop(monitor) ? { nextCheckAt: monitor.nextCheckAt } : null;
+  if (ciBackstop) out(`CI backstop: the Helper's monitor, next check ${ciBackstop.nextCheckAt}`);
   return {
     identifier,
     issue: full ?? { status: issue.status },
@@ -321,6 +332,8 @@ async function whyReport(ctx, identifier, out) {
     participant,
     stagesWipedBy,
     ciRun,
+    ciBackstop,
+    selfWake,
     pauseHold,
     recovery,
     queue,

@@ -56,6 +56,8 @@ export function advise(facts) {
     participant = null, // the agent a pending review stage waits on: { name, status }
     stagesWipedBy = null, // in review with no stage: who removed its stages (watchdog 17), when the activity log shows it
     ciRun = null, // the CI run the assignee's latest comments say it waits on: "repo#id" or the bare id
+    ciBackstop = null, // the watchdog's backstop monitor for that wait stands: { nextCheckAt }
+    selfWake = null, // an agent keeps waking itself with its runs' posted final messages (self-wakes.mjs): { name, count }
     pauseHold = null, // the hold is from a run a pause cancelled (watchdog 18): { ownerName, runId, waiting, held }
     workspaceValidation = null, // Paperclip refused the assignee's runs at setup on the workspace (worktree-links.mjs): { reason, reasonCode, paths, repoUrl, nextAction }
     extensionError = null, // an agent's build fails on extensions.relativeWorktrees (worktree-links.mjs): { paths, in }
@@ -108,6 +110,21 @@ export function advise(facts) {
         sweep
           ? `Once ${who} is resumed, the watchdog restores the issues Paperclip blocked during the pause and wakes them; others wait for you.`
           : `If nothing starts a few minutes later: ${comment(`${who}, please continue this issue.`)}`,
+      ],
+      watchdog: "manual",
+    };
+  }
+
+  // An agent waking itself: whatever it is doing now, the next run follows the same way.
+  if (selfWake) {
+    return {
+      what:
+        `${selfWake.name} keeps waking itself: ${selfWake.count} of its runs here in the last hour ended without a comment of its own, ` +
+        "Paperclip posted each run's final message as its comment, and that comment started its next run within seconds.",
+      steps: [
+        "Pause the issue (or the agent) to stop the loop.",
+        `Tell ${selfWake.name} (its instructions) to end every run with a comment of its own: what it did, and what it waits on, if anything.`,
+        `Then resume, and if it should carry on: ${comment(`${selfWake.name}, please continue this issue.`)}`,
       ],
       watchdog: "manual",
     };
@@ -525,7 +542,9 @@ export function advise(facts) {
   if (latest && latest.status === "succeeded" && ciRun) {
     const reports = config.watchdog !== false && config.watchdogCiRuns !== false && Boolean(config.githubToken || config.githubTokenFile);
     return {
-      what: `${who}'s last run finished ${quietFor} ago, waiting on CI run ${ciRun}.${note}`,
+      what:
+        `${who}'s last run finished ${quietFor} ago, waiting on CI run ${ciRun}.` +
+        `${ciBackstop ? ` The Helper's backstop monitor holds the wait (next check ${ciBackstop.nextCheckAt}), so Paperclip doesn't count it as stalled.` : ""}${note}`,
       steps: [
         "Wait for the run to finish.",
         `If it has finished and ${who} hasn't heard: ${comment(`${who}, CI run ${ciRun} has finished. Please check its result and continue.`)}`,

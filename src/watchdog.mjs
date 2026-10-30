@@ -103,7 +103,13 @@
 //    including cancelled, is reported. A failed run whose jobs all failed setting
 //    up their runner, before checkout, when another PR's run failed the same way
 //    on that runner, is a runner problem: the board is told once (a day) per
-//    runner, the agent that it isn't its PR, and nothing is re-run.
+//    runner, the agent that it isn't its PR, and nothing is re-run. While the run
+//    is still going, an issue in progress gets a Paperclip monitor of the
+//    watchdog's own, WATCHDOG_CI_BACKSTOP_MIN out (a backstop): Paperclip's
+//    disposition guard counts it as a live path, so the agent isn't woken to
+//    "repair" its wait nor the issue escalated to the board. It replaces an agent's
+//    monitor polling the run, leaves any other monitor alone, and is cleared in the
+//    same step as the report; it fires only if the report never comes.
 //
 // 12. Answers that reach nobody (board-held.mjs). An agent asked you with a card
 //    and you answered it while the issue waited on your review, so Paperclip
@@ -192,6 +198,12 @@
 //    are never commented on: before the repair, a comment only fails the same way.
 //    6 leaves these issues to that note.
 //
+// 21. Agents that wake themselves (self-wakes.mjs). A run that ends without the
+//    agent's own comment gets its final message posted as the agent's comment
+//    (source run_presentation_resolver), which wakes the same agent within seconds,
+//    and so on. With WATCHDOG_SELF_WAKES on, five or more such turns on one issue
+//    within an hour tell the board once per issue. The issue is never commented on.
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
@@ -203,6 +215,7 @@ import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorksp
 import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue, strandedCard } from "./questions.mjs";
 import { createGitHub } from "./github.mjs";
 import { createCiRunsCheck } from "./ci-runs.mjs";
+import { createSelfWakeCheck } from "./self-wakes.mjs";
 import { createBoardHeldCheck, quote } from "./board-held.mjs";
 import { createLimitCheck, localZone, RECOGNISERS } from "./limits.mjs";
 import { createStagesCheck } from "./stages.mjs";
@@ -262,6 +275,7 @@ const record = {
   ciRun: (issue, run) => `ci:${issue.id}:${run.id}:${run.run_attempt ?? 1}`, // the comment that a run the agent waits on finished
   ciRerun: (repo, run) => `ci-rerun:${repo}#${run.id}`, // re-runs of a run's flaky failed jobs: { count, at }
   ciRerunFail: (repo, run) => `ci-rerun-fail:${repo}#${run.id}`, // GitHub refused a re-run, reported once
+  ciBackstop: (issue) => `ci-backstop:${issue.id}`, // the watchdog's backstop monitor on the issue: { count, at, run, agentId, replaced }
   answer: (card) => `answer:${card.id}`, // the return of an issue whose card you answered on your review
   escalated: (issue) => `escalated:${issue.id}`, // returns of reviews Paperclip escalated to you, per issue
   escalatedSeen: (issue, decisionId) => `escalated-seen:${issue.id}:${decisionId ?? "?"}`, // one return per escalation, or its report
@@ -284,7 +298,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   const records = state.nudges;
   const stats = {
     ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, questions: 0,
-    ciReports: 0, ciReruns: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, pausedHolds: 0,
+    ciReports: 0, ciReruns: 0, ciBackstops: 0, selfWakes: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, pausedHolds: 0,
     runnerProblems: 0, readyNotes: 0, worktreeLinkNotes: 0, lastError: null,
     // The last tick's requests, how many were answered from what the tick had already
     // read, its slowest checks and its slowest kinds of request (for `pch status`).
@@ -1327,6 +1341,13 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     noteToBoard: (companyId, text, extra) => noteToBoard(ctx, companyId, text, extra),
   });
 
+  // ---------------------------------------------------------------- 21. agents that wake themselves
+
+  const selfWakeCheck = createSelfWakeCheck({
+    ctx, records, state, stats, dryRunSeen, agentFor,
+    noteToBoard: (companyId, text, extra) => noteToBoard(ctx, companyId, text, extra),
+  });
+
   // ---------------------------------------------------------------- 12, 13. issues waiting on your review
 
   const boardHeld = createBoardHeldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, quiet, startedRuns });
@@ -1383,6 +1404,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
         if (config.watchdogStagesWipe) await run("review stages", companyId, () => stagesCheck.check(companyId, agents));
         if (config.watchdogReportReadyToMerge) await run("ready to queue", companyId, () => readyCheck.check(companyId, agents));
         if (config.watchdogWorktreeLinks) await run("worktree links", companyId, () => worktreeLinks.check(companyId));
+        if (config.watchdogSelfWakes) await run("self-wakes", companyId, () => selfWakeCheck.check(companyId, agents));
       }
       stats.lastError = failure;
     } catch (err) {
@@ -1414,6 +1436,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
         routeQuestions: config.watchdogRouteQuestions,
         ciRuns: config.watchdogCiRuns ? (github ? true : "off: no GitHub token (GITHUB_TOKEN or GITHUB_TOKEN_FILE)") : false,
         ciRerunJobs: config.watchdogCiRerunJobs || null,
+        ciBackstopMin: config.watchdogCiRuns && github ? config.watchdogCiBackstopMin || "off" : null,
         deliverAnswers: config.watchdogDeliverAnswers,
         returnEscalatedReviews: config.watchdogReturnEscalatedReviews,
         cancelledBlockers: config.watchdogCancelledBlockers,
@@ -1423,6 +1446,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
         stagesWipe: config.watchdogStagesWipe ? (github ? true : "on, without the open-PR part: no GitHub token") : false,
         reportReadyToMerge: config.watchdogReportReadyToMerge ? (github ? true : "off: no GitHub token (GITHUB_TOKEN or GITHUB_TOKEN_FILE)") : false,
         worktreeLinks: config.watchdogWorktreeLinks,
+        selfWakes: config.watchdogSelfWakes,
         resumeSweep: config.watchdogResumeSweep,
         // Runs at once per agent, for the sweep's restores and 6's nudges.
         runsPerAgent: config.watchdogResumeSweepLimit || "the agent's maxConcurrentRuns",

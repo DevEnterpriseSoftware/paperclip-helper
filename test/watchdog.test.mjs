@@ -902,7 +902,12 @@ test("an issue whose owner ran last isn't read again every tick until it changes
 
   await env.watchdog.tick();
   assert.equal(runReads(), 1);
-  assert.equal(env.watchdog.stats.lastTick.checks.find((c) => c.name === "hand-offs")?.requests, 1);
+  // The tick lists its five slowest checks; with sub-millisecond timings the hand-off
+  // check may not be among them, but when it is, it made that one read.
+  const { checks } = env.watchdog.stats.lastTick;
+  const handOffs = checks.find((c) => c.name === "hand-offs");
+  if (handOffs) assert.equal(handOffs.requests, 1);
+  else assert.equal(checks.length, 5, "left out only for five slower checks");
   await env.watchdog.tick();
   await env.watchdog.tick();
   assert.equal(runReads(), 1, "settled: its runs aren't read again");

@@ -108,6 +108,11 @@ export function loadConfig(env = process.env) {
   const webhookPath = get("RELAY_PATH", "/hooks/github");
   if (!webhookPath.startsWith("/")) problems.push(`RELAY_PATH=${webhookPath} must start with /`);
 
+  // A backstop is hours out, never minutes: a short one is the polling it replaces.
+  const backstopMin = get("WATCHDOG_CI_BACKSTOP_MIN");
+  if (backstopMin !== "" && Number(backstopMin) > 0 && Number(backstopMin) < 30) {
+    problems.push(`WATCHDOG_CI_BACKSTOP_MIN=${backstopMin} must be 0 (off) or at least 30`);
+  }
   const sweepSec = get("RELAY_CONFLICT_SWEEP_SEC");
   if (sweepSec !== "" && Number(sweepSec) > 0 && Number(sweepSec) < 60) {
     problems.push(`RELAY_CONFLICT_SWEEP_SEC=${sweepSec} must be 0 (off) or at least 60`);
@@ -200,6 +205,12 @@ export function loadConfig(env = process.env) {
     // all match is re-run first, up to WATCHDOG_CI_RERUN_MAX times. Empty: never re-run.
     watchdogCiRerunJobs: regex("WATCHDOG_CI_RERUN_JOBS"),
     watchdogCiRerunMax: num("WATCHDOG_CI_RERUN_MAX", 2),
+    // While a run an agent waits on is still going, give its issue (in progress) a
+    // Paperclip monitor of the watchdog's own, this many minutes out: the live path
+    // Paperclip's disposition guard asks for. Cleared when the run is reported; it
+    // fires only if that report never comes. At least the runs' worst case (a merge
+    // queue's status-check timeout, a long queue for one runner). 0: no backstop.
+    watchdogCiBackstopMin: num("WATCHDOG_CI_BACKSTOP_MIN", 360),
     // Return an issue waiting on your review to its agent when you answered the agent's
     // card meanwhile: Paperclip woke you with the answer, not the agent.
     watchdogDeliverAnswers: bool("WATCHDOG_DELIVER_ANSWERS", true),
@@ -241,6 +252,10 @@ export function loadConfig(env = process.env) {
     // Tell the board, once per project checkout, when issues are parked because their git
     // worktree links are relative (watchdog 20). Notes only: nothing is commented or changed.
     watchdogWorktreeLinks: bool("WATCHDOG_WORKTREE_LINKS", true),
+    // Tell the board, once per issue, when an agent keeps waking itself there: its runs
+    // end without a comment of its own, Paperclip posts each run's final message as the
+    // agent's comment, and that starts its next run (watchdog 21). Notes only.
+    watchdogSelfWakes: bool("WATCHDOG_SELF_WAKES", true),
 
     // cost-sync.mjs: API-equivalent cost of subscription runs
     costSync: bool("COST_SYNC", true),

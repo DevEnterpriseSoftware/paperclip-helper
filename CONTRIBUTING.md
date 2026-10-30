@@ -19,12 +19,13 @@ src/
   quiet-notes.mjs   the relay's quiet notes, in each issue's pull-requests document
   identifiers.mjs   finding issue identifiers (ACM-12) in PR titles, branches and bodies
   watchdog.mjs      stalled-work checks and nudges (the list of checks is at its top)
-  ci-runs.mjs       watchdog 11: CI runs agents wait on (and runners that fail every job's set-up)
+  ci-runs.mjs       watchdog 11: CI runs agents wait on, the backstop monitor that holds the wait, and runners that fail every job's set-up
   board-held.mjs    watchdog 12, 13: issues waiting on your review
   questions.mjs     watchdog 10: question cards addressed to a teammate
   release.mjs       watchdog 7 and `pch release`: holds Paperclip can't release
   workspace.mjs     watchdog 8, 9 and `pch workspace`: workspace links
   worktree-links.mjs  watchdog 20, `pch worktrees --links` and `pch why`: runs refused on the workspace (workspace validation)
+  self-wakes.mjs    watchdog 21 and `pch why`: agents woken by their own runs' posted final messages
   resume.mjs        watchdog 15: issues blocked while their agent was paused
   limits.mjs        watchdog 16: usage limits (a recogniser per adapter)
   stages.mjs        watchdog 17: wiped review stages
