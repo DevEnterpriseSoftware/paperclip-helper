@@ -358,16 +358,30 @@ const SAME_EVENT_MS = 6 * 60 * 60_000;
 const PAUSE_MATCH_MS = 60_000;
 // Resume attempts per agent before it's left to you.
 const MAX_RESUME_TRIES = 5;
+// A resume Paperclip accepted but hasn't finished: the board is told after this long,
+// and the watchdog stops watching (and leaves it to you) after a day. Paperclip
+// finishes a resume by itself, usually within seconds, but only once the agent's
+// pause has finished, which waits for every run and workspace lease it had to be
+// stopped and cleaned up (docs/paperclip-internals.md, Agents).
+const RESUME_STUCK_MS = 10 * 60_000;
+const RESUME_WATCH_MS = 24 * 60 * 60_000;
 // Ticks an agent may stay busy (its runs keep it from being paused) before the log says so.
 const LONG_WAIT_TICKS = 30;
 
 const names = (list) => list.join(", ");
+// The holds Paperclip keeps an agent paused by (2026.10: lifecycleHolds; earlier: its pauseReason).
+const holdsOf = (agent) => (Array.isArray(agent?.lifecycleHolds) ? agent.lifecycleHolds : agent?.pauseReason ? [agent.pauseReason] : []);
+// What the log says about an agent's pause in Paperclip.
+const lifecycleOf = (agent, name) => ({
+  agent: name, status: agent?.status ?? null, lifecycleState: agent?.lifecycleState ?? null,
+  holds: holdsOf(agent), lifecycleError: agent?.lifecycleError ?? null, pausedAt: agent?.pausedAt ?? null,
+});
 
 // The check: pause the agents on an account that hit its limit, each once it has no
 // live run; tell the board once; resume exactly those agents at the reset. One
 // record per company and account in the watchdog's records,
 // `limit:<companyId>:<account>`: { adapter, what, resetAt, timeZone, unknownReset,
-// waitMs, paused: { agentId: { name, pausedAt, tries } }, waitTicks: { agentId: ticks
+// waitMs, paused: { agentId: { name, pausedAt, tries, resumeSentAt, stuckNoted } }, waitTicks: { agentId: ticks
 // busy }, notified, runId, resumedAt }. A record from before 1.12 has no adapter: Claude's.
 export function createLimitCheck({ api, config, log, records, state, now, stats, dryRunSeen }) {
   const graceMs = config.watchdogLimitResumeGraceMin * 60_000;
@@ -565,34 +579,98 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
 
   // Resumes the agents the watchdog paused, unless a person has paused one since
   // (a later pausedAt) or resumed it already. A refused resume is tried again each
-  // tick, up to MAX_RESUME_TRIES; the event ends once none is left to resume.
+  // tick, up to MAX_RESUME_TRIES. An agent counts as resumed only once Paperclip
+  // shows it so: a resume it accepted but hasn't finished (it answers while the agent
+  // is still `resuming`, or still `pausing`) is read again each tick, and the board is
+  // told if it takes long. The event ends once none is left to resume or watch.
   async function resume(event, agents) {
     if (config.dryRun) return;
+    const stuck = [];
     for (const [id, entry] of Object.entries(event.paused)) {
       const { name, pausedAt } = entry;
       let agent = agents.get(id);
       if (!agent) agent = await api.request("GET", `/api/agents/${id}`).catch(() => null);
       if (!agent) continue; // can't tell now: next tick
+      if (entry.resumeSentAt) {
+        // Asked already: wait for Paperclip to finish it, without asking again.
+        if (agent.status !== "paused") {
+          await resumed(event, id, entry, agent);
+          continue;
+        }
+        const holds = holdsOf(agent);
+        if (holds.length || Math.abs(ts(agent.pausedAt) - ts(pausedAt)) > PAUSE_MATCH_MS) {
+          log.warn("watchdog: an agent resumed after its usage limit is held paused by something else now; leaving it paused", { agent: name, holds });
+          delete event.paused[id];
+          continue;
+        }
+        const waited = now() - entry.resumeSentAt;
+        if (waited >= RESUME_WATCH_MS) {
+          log.warn("watchdog: Paperclip still shows an agent paused a day after the watchdog resumed it; resume it yourself", lifecycleOf(agent, name));
+          delete event.paused[id];
+          continue;
+        }
+        if (waited >= RESUME_STUCK_MS && !entry.stuckNoted) stuck.push({ entry, agent });
+        continue;
+      }
       if (agent.status !== "paused" || Math.abs(ts(agent.pausedAt) - ts(pausedAt)) > PAUSE_MATCH_MS || (agent.pauseReason && agent.pauseReason !== "manual")) {
         if (agent.status === "paused") log("watchdog: an agent paused for a usage limit was paused again since; leaving it paused", { agent: name });
         delete event.paused[id];
         continue;
       }
       try {
-        const resumed = await api.request("POST", `/api/agents/${id}/resume`, {});
-        Object.assign(agent, { status: resumed?.status ?? "idle", pausedAt: resumed?.pausedAt ?? null });
-        delete event.paused[id];
-        stats.limitResumes += 1;
-        log("watchdog: resumed an agent after its usage limit reset", { agent: name });
+        await api.request("POST", `/api/agents/${id}/resume`, {});
       } catch (err) {
         entry.tries = (entry.tries ?? 0) + 1;
         const giveUp = entry.tries >= MAX_RESUME_TRIES;
         log.warn(`watchdog: couldn't resume an agent after its usage limit reset${giveUp ? "; resume it yourself" : "; trying again next tick"}`, { agent: name, error: err.message });
         if (giveUp) delete event.paused[id];
+        continue;
       }
+      entry.resumeSentAt = now();
+      // Paperclip's answer is no proof: it is the agent as it was (when the resume
+      // changes nothing yet) or `resuming`, shown as paused. Read it again.
+      const fresh = await api.request("GET", `/api/agents/${id}`).catch(() => null);
+      if (fresh && fresh.status !== "paused") await resumed(event, id, entry, fresh, agent);
+      else log("watchdog: asked Paperclip to resume an agent after its usage limit reset; waiting for it to finish", lifecycleOf(fresh ?? agent, name));
     }
+    if (stuck.length) await noteStuck(event, stuck);
     if (!Object.keys(event.paused).length) event.resumedAt = now();
     save(event);
+  }
+
+  // An agent Paperclip now shows resumed: counted, and the board told if it heard it was stuck.
+  async function resumed(event, id, entry, fresh, listed = fresh) {
+    Object.assign(listed, { status: fresh.status ?? "idle", pausedAt: fresh.pausedAt ?? null });
+    delete event.paused[id];
+    stats.limitResumes += 1;
+    const waitedMin = Math.round((now() - entry.resumeSentAt) / 60_000);
+    log("watchdog: resumed an agent after its usage limit reset", { agent: entry.name, ...(waitedMin ? { waitedMin } : {}) });
+    if (entry.stuckNoted) {
+      await noteToBoard({ api, config, log }, event.companyId, `${entry.name} is running again: Paperclip finished the resume the watchdog asked for after the ${label(event)} ${event.what ?? "usage limit"} reset, ${waitedMin} minutes later.`, { level: "info" });
+    }
+  }
+
+  // Tells the board, once per agent, that a resume hasn't taken effect, and why as far as Paperclip shows.
+  async function noteStuck(event, stuck) {
+    const who = names(stuck.map(({ entry }) => entry.name));
+    const one = stuck.length === 1;
+    const states = [...new Set(stuck.map(({ agent }) => agent.lifecycleState).filter(Boolean))];
+    const errors = [...new Set(stuck.map(({ agent }) => agent.lifecycleError).filter(Boolean))];
+    const pausing = states.includes("pausing");
+    const text =
+      `${who} ${one ? "was" : "were"} resumed after the ${label(event)} ${event.what ?? "usage limit"} reset, but Paperclip still shows ${one ? "it" : "them"} paused` +
+      (states.length ? ` (lifecycle state ${states.map((s) => `\`${s}\``).join(", ")})` : "") +
+      (errors.length ? `, with the error "${errors.join("; ")}"` : "") +
+      ". " +
+      (pausing
+        ? `Paperclip hasn't finished pausing ${one ? "it" : "them"}: a pause finishes only once every run and workspace lease the agent has had is stopped and cleaned up, and a resume takes effect only after that, so resuming again won't help. Restarting Paperclip makes it check again; a lease whose clean-up failed has to be cleaned up first.`
+        : `A resume Paperclip accepted usually takes effect within seconds; this one hasn't.`) +
+      ` The watchdog keeps watching for a day and says when ${one ? "it is" : "they are"} back.`;
+    for (const { entry, agent } of stuck) {
+      entry.stuckNoted = true;
+      log.warn("watchdog: an agent resumed after its usage limit is still paused in Paperclip", lifecycleOf(agent, entry.name));
+    }
+    await noteToBoard({ api, config, log }, event.companyId, text);
   }
 
   return { check };

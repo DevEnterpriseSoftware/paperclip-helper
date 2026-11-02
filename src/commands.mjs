@@ -752,9 +752,24 @@ export async function models(ctx) {
     const cfg = a.adapterConfig ?? {};
     out(
       `${String(a.name).padEnd(16)} ${String(a.adapterType ?? "").padEnd(14)} ${String(cfg.model ?? "(default)").padEnd(20)} ` +
-        `${String(effortOf(cfg)).padEnd(8)} ${a.status ?? ""}`,
+        `${String(effortOf(cfg)).padEnd(8)} ${a.status ?? ""}${pauseDetail(a)}`,
     );
   }
+}
+
+// Why a paused agent is paused, as far as Paperclip shows: its holds (or, before
+// 2026.10, its pause reason), a pause or resume Paperclip hasn't finished, and since when.
+// " (no hold, still pausing, since 2026-10-31 21:48 UTC)": nothing holds it, but its pause
+// never finished, so a resume can't take effect yet (docs/paperclip-internals.md, Agents).
+export function pauseDetail(agent) {
+  if (agent?.status !== "paused") return "";
+  const holds = Array.isArray(agent.lifecycleHolds) ? agent.lifecycleHolds : agent.pauseReason ? [agent.pauseReason] : null;
+  const parts = [];
+  if (holds) parts.push(holds.length ? holds.join(", ") : "no hold");
+  if (agent.lifecycleState && agent.lifecycleState !== "paused") parts.push(`still ${agent.lifecycleState}`);
+  const since = Date.parse(agent.pausedAt ?? "");
+  if (Number.isFinite(since)) parts.push(`since ${new Date(since).toISOString().slice(0, 16).replace("T", " ")} UTC`);
+  return parts.length ? ` (${parts.join(", ")})` : "";
 }
 
 // PATCH merges into adapterConfig, so only the model changes: effort, engine,

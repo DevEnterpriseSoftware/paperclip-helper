@@ -51,6 +51,16 @@ export function emptyDb() {
     // Off by default: with it on, a board update or comment wakes the issue's assignee
     // as Paperclip does (a queued run in issueRuns), for tests that check the wake.
     simulateWakes: false,
+    // Paperclip 2026.10's agent lifecycle, off by default (see POST /api/agents/:id/pause).
+    lifecycleStates: false,
+    stuckPauses: new Set(), // agent ids whose pause never finishes (a run or lease that can't be cleaned up)
+    // The lifecycle worker finishing an agent's pause or resume: `pausing` becomes
+    // `paused` (or goes straight on to resuming when no hold is left), `resuming`
+    // becomes ready.
+    finishLifecycle(agent) {
+      if (agent.lifecycleState === "pausing") agent.lifecycleState = agent.lifecycleHolds?.length ? "paused" : "resuming";
+      if (agent.lifecycleState === "resuming") Object.assign(agent, { lifecycleState: "ready", status: "idle", pausedAt: null, pauseReason: null, lifecycleHolds: [] });
+    },
   };
 }
 
@@ -333,6 +343,32 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       const agent = db.agents.find((a) => a.id === m[1]);
       if (!agent) return send(404, { error: "Agent not found" });
       db.lifecycle = [...(db.lifecycle ?? []), { agentId: agent.id, action: m[2] }];
+      // Paperclip 2026.10's lifecycle (modules/agent-lifecycle), when a test turns it on
+      // with db.lifecycleStates: a pause is `pausing` until its worker has stopped every
+      // run and lease (db.stuckPauses: agents whose pause never finishes), a resume is
+      // `resuming` (shown as paused) until the worker finishes it (db.finishLifecycle).
+      // Resuming an agent still `pausing` only lifts its holds, and Paperclip answers
+      // with the agent as it was.
+      if (db.lifecycleStates) {
+        const at = new Date(db.now?.() ?? Date.now()).toISOString();
+        let answer = agent;
+        if (m[2] === "pause") {
+          const holds = [...new Set([...(agent.lifecycleHolds ?? []), "manual"])];
+          if (["paused", "pausing"].includes(agent.lifecycleState)) Object.assign(agent, { lifecycleHolds: holds, pauseReason: holds[0] });
+          else Object.assign(agent, { status: "paused", lifecycleState: "pausing", lifecycleHolds: holds, pauseReason: "manual", pausedAt: at });
+          if (!db.stuckPauses?.has(agent.id)) db.finishLifecycle(agent);
+        } else {
+          const holds = (agent.lifecycleHolds ?? []).filter((h) => ["budget", "company_archived", "company_paused"].includes(h));
+          if (agent.lifecycleState === "pausing" || holds.length) {
+            answer = structuredClone(agent);
+            Object.assign(agent, { lifecycleHolds: holds, pauseReason: holds[0] ?? null });
+          } else if (agent.lifecycleState === "paused") {
+            Object.assign(agent, { lifecycleState: "resuming", lifecycleHolds: [], pauseReason: null });
+          }
+        }
+        db.activity.push({ action: `agent.${m[2]}d`, entityType: "agent", entityId: agent.id, createdAt: at });
+        return send(200, answer);
+      }
       if (m[2] === "pause") {
         // db.now: a test's own clock, when it runs on one.
         if (agent.status !== "paused") Object.assign(agent, { status: "paused", pausedAt: new Date(db.now?.() ?? Date.now()).toISOString(), pauseReason: "manual" });

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { setup } from "./helpers.mjs";
+import { captureOutput, setup } from "./helpers.mjs";
+import * as cmd from "../src/commands.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { createWatchdog } from "../src/watchdog.mjs";
 import { createStateStore } from "../src/store.mjs";
@@ -653,4 +654,120 @@ test("a failed Codex run that mentions a limit the recogniser doesn't take for o
   await env.watchdog.tick();
   assert.equal(logged().length, 2);
   assert.equal(logged()[1].error, "Monthly quota for this key reached.");
+});
+
+// Paperclip 2026.10 pauses and resumes through its lifecycle worker: the fake does the same.
+function lifecycleEnv(env) {
+  env.db.lifecycleStates = true;
+  return env;
+}
+const limitRecord = (env) => [...env.state.nudges.entries()].find(([k]) => k.startsWith("limit:"))[1];
+
+test("a resume Paperclip finishes after it answers counts once the agent is running, and is asked for once", async (t) => {
+  const env = lifecycleEnv(await limitEnv(t));
+  const engineer = claude(env.db, "Engineer");
+  failedRun(env.db, engineer, { at: T0 - 2 * MIN });
+  await env.watchdog.tick();
+  assert.equal(engineer.lifecycleState, "paused");
+
+  env.clock.at = Date.parse("2026-10-12T15:06:00Z");
+  await env.watchdog.tick();
+  assert.equal(engineer.lifecycleState, "resuming", "Paperclip shows it paused until its worker finishes");
+  assert.equal(engineer.status, "paused");
+  assert.equal(env.watchdog.stats.limitResumes, 0, "not counted before Paperclip shows it resumed");
+  assert.ok(env.logs.some((l) => /asked Paperclip to resume an agent .*waiting for it to finish/.test(l.msg) && l.lifecycleState === "resuming"));
+  assert.equal(limitRecord(env).resumedAt, undefined, "still watching");
+
+  env.db.finishLifecycle(engineer);
+  env.clock.at += MIN;
+  await env.watchdog.tick();
+  assert.equal(engineer.status, "idle");
+  assert.deepEqual(lifecycle(env, "resume"), ["Engineer"], "asked once");
+  assert.equal(env.watchdog.stats.limitResumes, 1);
+  assert.ok(env.logs.some((l) => l.msg === "watchdog: resumed an agent after its usage limit reset" && l.agent === "Engineer"));
+  assert.ok(limitRecord(env).resumedAt);
+  assert.equal(env.db.comments.filter((c) => c.identifier === "ACM-1").length, 1, "only the pause's note: a resume within minutes needs none");
+});
+
+test("an agent whose pause never finished stays paused after its resume: the board is told once, and again when it is back", async (t) => {
+  const env = lifecycleEnv(await limitEnv(t));
+  const engineer = claude(env.db, "Engineer");
+  const reviewer = claude(env.db, "Reviewer");
+  env.db.stuckPauses.add(engineer.id); // a lease whose clean-up failed, say
+  failedRun(env.db, engineer, { at: T0 - 2 * MIN });
+  await env.watchdog.tick();
+  assert.equal(engineer.lifecycleState, "pausing");
+  assert.equal(engineer.status, "paused");
+
+  env.clock.at = Date.parse("2026-10-12T15:06:00Z");
+  await env.watchdog.tick();
+  // Paperclip lifted the hold but left it pausing, and answered with it as it was.
+  assert.deepEqual(engineer.lifecycleHolds, []);
+  assert.equal(engineer.pauseReason, null);
+  assert.equal(engineer.status, "paused");
+  assert.equal(reviewer.lifecycleState, "resuming");
+  env.db.finishLifecycle(reviewer);
+
+  env.clock.at += 5 * MIN;
+  await env.watchdog.tick();
+  assert.equal(reviewer.status, "idle");
+  assert.equal(env.watchdog.stats.limitResumes, 1, "the reviewer only");
+  const notes = () => env.db.comments.filter((c) => c.identifier === "ACM-1");
+  assert.equal(notes().length, 1, "not yet: Paperclip gets ten minutes");
+
+  env.clock.at += 6 * MIN;
+  await env.watchdog.tick();
+  assert.equal(notes().length, 2);
+  assert.match(notes()[1].body, /^Engineer was resumed after the Claude usage limit reset, but Paperclip still shows it paused \(lifecycle state `pausing`\)\. Paperclip hasn't finished pausing it: .*resuming again won't help\. Restarting Paperclip makes it check again.* The watchdog keeps watching for a day and says when it is back\./s);
+  assert.ok(env.logs.some((l) => /still paused in Paperclip/.test(l.msg) && l.agent === "Engineer" && l.lifecycleState === "pausing"));
+
+  env.clock.at += 30 * MIN;
+  await env.watchdog.tick();
+  assert.equal(notes().length, 2, "told once");
+  assert.deepEqual(lifecycle(env, "resume").sort(), ["Engineer", "Reviewer"], "never asked twice");
+  assert.equal(limitRecord(env).resumedAt, undefined);
+
+  // `pch why` on the engineer's issue says so, rather than a resume time already past.
+  env.db.issues.push({ id: uuid(), identifier: "ACM-2", companyId: ids.company, status: "todo", title: "Work", assigneeAgentId: engineer.id, updatedAt: iso(T0) });
+  env.state.save({ force: true });
+  const why = (await captureOutput(() => cmd.why(env.ctx, "ACM-2"))).join("\n");
+  assert.match(why, /Paused by the watchdog at a usage limit; resumed at Mon 12 Oct, 16:06 \(Europe\/London\), which Paperclip hasn't finished/);
+  assert.match(why, /Paperclip hasn't finished pausing Engineer/);
+
+  // Paperclip finally finishes the pause; with no hold left it goes straight on to resume.
+  env.db.finishLifecycle(engineer);
+  env.clock.at += MIN;
+  await env.watchdog.tick();
+  assert.equal(engineer.status, "idle");
+  assert.equal(env.watchdog.stats.limitResumes, 2);
+  assert.match(notes()[2].body, /^Engineer is running again: Paperclip finished the resume the watchdog asked for after the Claude usage limit reset, 42 minutes later\./);
+  assert.ok(limitRecord(env).resumedAt);
+});
+
+test("a resume still pending is left alone once something else holds the agent, and watched for a day at most", async (t) => {
+  const env = lifecycleEnv(await limitEnv(t));
+  const engineer = claude(env.db, "Engineer");
+  const reviewer = claude(env.db, "Reviewer");
+  env.db.stuckPauses.add(engineer.id);
+  env.db.stuckPauses.add(reviewer.id);
+  failedRun(env.db, engineer, { at: T0 - 2 * MIN });
+  await env.watchdog.tick();
+  env.clock.at = Date.parse("2026-10-12T15:06:00Z");
+  await env.watchdog.tick();
+  assert.equal(engineer.status, "paused");
+
+  // You pause the reviewer again yourself: Paperclip adds your hold to the pause still under way.
+  await env.ctx.api.request("POST", `/api/agents/${reviewer.id}/pause`, {});
+  assert.equal(reviewer.pauseReason, "manual");
+  env.clock.at += MIN;
+  await env.watchdog.tick();
+  assert.ok(env.logs.some((l) => /held paused by something else now; leaving it paused/.test(l.msg) && l.agent === "Reviewer"));
+  assert.equal(limitRecord(env).paused[reviewer.id], undefined);
+
+  env.clock.at += 25 * 60 * MIN;
+  await env.watchdog.tick();
+  assert.ok(env.logs.some((l) => /a day after the watchdog resumed it; resume it yourself/.test(l.msg) && l.agent === "Engineer"));
+  assert.ok(limitRecord(env).resumedAt, "the limit is over");
+  assert.equal(env.watchdog.stats.limitResumes, 0);
+  assert.equal(lifecycle(env, "resume").length, 2, "each asked once");
 });

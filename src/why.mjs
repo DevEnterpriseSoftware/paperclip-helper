@@ -278,13 +278,18 @@ async function whyReport(ctx, identifier, out) {
   for (const [key, r] of Object.entries(records)) {
     if (!key.startsWith("limit:") || r?.resumedAt || !r?.paused?.[full?.assigneeAgentId]) continue;
     const graceMs = (ctx.config.watchdogLimitResumeGraceMin ?? 5) * 60_000;
+    const sent = r.paused[full.assigneeAgentId].resumeSentAt;
     limitPause = {
       label: labelOf(r.adapter ?? "claude_local"),
       what: r.what ?? "usage limit",
       resetAt: r.unknownReset ? null : resetLabel(r.resetAt, r.timeZone),
       resumeAt: resetLabel(r.resetAt + graceMs, r.timeZone),
+      // Asked already, but Paperclip hasn't finished the resume (watchdog 16).
+      resumeSentAt: sent ? resetLabel(sent, r.timeZone) : null,
     };
-    out(`Paused by the watchdog at a usage limit; resumed at ${limitPause.resumeAt}`);
+    out(sent
+      ? `Paused by the watchdog at a usage limit; resumed at ${limitPause.resumeSentAt}, which Paperclip hasn't finished`
+      : `Paused by the watchdog at a usage limit; resumed at ${limitPause.resumeAt}`);
   }
   // The agent a pending review stage waits on, when it isn't the assignee's own status that matters.
   const p = full?.executionState?.status === "pending" ? full.executionState.currentParticipant : null;
@@ -318,7 +323,7 @@ async function whyReport(ctx, identifier, out) {
     identifier,
     issue: full ?? { status: issue.status },
     me: me?.userId ?? null,
-    assignee: assigneeAgent ? { name: assigneeAgent.name, status: assigneeAgent.status } : assignee ? { name: assignee, status: null } : null,
+    assignee: assigneeAgent ? { name: assigneeAgent.name, status: assigneeAgent.status, lifecycleState: assigneeAgent.lifecycleState ?? null } : assignee ? { name: assignee, status: null } : null,
     nameOf: (agentId) => names.get(agentId) ?? null,
     blockers,
     wakes: (wakes?.events ?? []).filter((e) => e.kind === "wake_request"),

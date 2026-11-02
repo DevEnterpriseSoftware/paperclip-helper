@@ -51,7 +51,7 @@ export function advise(facts) {
     deadLinkRun = null, // { runId, workspaceId }: the assignee's last run failed restoring a linked workspace
     cards = [], // the issue's pending question cards (questions.mjs)
     routed = {}, // card id → the issue the watchdog routed it to
-    limitPause = null, // the watchdog paused the assignee at a usage limit: { label, what, resetAt, resumeAt } (labels)
+    limitPause = null, // the watchdog paused the assignee at a usage limit: { label, what, resetAt, resumeAt, resumeSentAt } (labels; resumeSentAt once it asked Paperclip to resume it)
     lastFailure = null, // the assignee's latest run failed on its provider: { kind: "limit" | "transient", label, what, resetAt }
     participant = null, // the agent a pending review stage waits on: { name, status }
     stagesWipedBy = null, // in review with no stage: who removed its stages (watchdog 17), when the activity log shows it
@@ -89,6 +89,23 @@ export function advise(facts) {
     };
   }
   const sweep = config.watchdog !== false && config.watchdogResumeSweep !== false;
+  if (assignee?.status === "paused" && limitPause?.resumeSentAt) {
+    const state = assignee.lifecycleState;
+    return {
+      what:
+        `The watchdog resumed ${who} at ${limitPause.resumeSentAt}, after its ${limitPause.label} ${limitPause.what} reset, ` +
+        `but Paperclip still shows ${who} paused${state ? ` (lifecycle state ${state})` : ""}.`,
+      steps:
+        state === "pausing"
+          ? [
+              `Paperclip hasn't finished pausing ${who}: a pause finishes only once every run and workspace lease the agent has had is stopped and cleaned up, and the resume takes effect only after that. Resuming again won't help.`,
+              "Restart Paperclip to make it check again; a lease whose clean-up failed has to be cleaned up first.",
+            ]
+          : ["Paperclip usually finishes a resume within seconds: look again shortly."],
+      watchdog: "auto",
+      autoNote: "The watchdog keeps watching for a day and tells the board when the agent is running again.",
+    };
+  }
   if (assignee?.status === "paused" && limitPause) {
     return {
       what:

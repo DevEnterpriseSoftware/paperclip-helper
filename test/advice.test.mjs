@@ -158,6 +158,17 @@ test("advice: an agent the watchdog paused at a usage limit waits for the reset;
   assert.match(noSweep.steps[1], /^If nothing starts/);
 });
 
+test("advice: an agent the watchdog resumed that Paperclip still shows paused", () => {
+  const limitPause = { label: "Claude", what: "usage limit", resetAt: "Mon 2 Nov, 15:00 (Europe/London)", resumeAt: "Mon 2 Nov, 15:05 (Europe/London)", resumeSentAt: "Mon 2 Nov, 15:07 (Europe/London)" };
+  const pausing = advise(base({ assignee: { name: "Carla", status: "paused", lifecycleState: "pausing" }, limitPause }));
+  assert.match(pausing.what, /^The watchdog resumed Carla at Mon 2 Nov, 15:07 \(Europe\/London\), after its Claude usage limit reset, but Paperclip still shows Carla paused \(lifecycle state pausing\)\./);
+  assert.match(pausing.steps[0], /hasn't finished pausing Carla.*Resuming again won't help/);
+  assert.match(pausing.steps[1], /^Restart Paperclip/);
+  assert.equal(pausing.watchdog, "auto");
+  const resuming = advise(base({ assignee: { name: "Carla", status: "paused", lifecycleState: "resuming" }, limitPause }));
+  assert.match(resuming.steps[0], /within seconds/);
+});
+
 test("advice: a run that hit its usage limit, and one that only met a busy model", () => {
   const limit = advise(base({ runs: [run(A, "failed", 5, { errorCode: "provider_quota" })], lastFailure: { kind: "limit", label: "Claude", what: "usage limit", resetAt: "Mon 12 Oct, 16:00 (Europe/London)" } }));
   assert.match(limit.what, /Carla's last run hit its Claude usage limit, which resets Mon 12 Oct, 16:00/);
