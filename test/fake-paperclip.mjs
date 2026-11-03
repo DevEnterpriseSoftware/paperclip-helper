@@ -24,6 +24,7 @@ export function emptyDb() {
     challenges: {},
     agents: [],
     issues: [],
+    projects: [], // { id, companyId, name }
     comments: [],
     patches: [],
     issueRuns: {}, // issueId → [{ runId, agentId, status, createdAt, finishedAt }]
@@ -274,10 +275,19 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         .slice(0, limit);
       return send(200, list);
     }
+    if ((m = p.match(/^\/api\/companies\/([^/]+)\/projects$/)) && req.method === "GET") {
+      return send(200, db.projects.filter((pr) => pr.companyId === m[1]));
+    }
     if ((m = p.match(/^\/api\/companies\/([^/]+)\/cost-events$/)) && req.method === "POST") {
       const issues = costEventIssues(body, db.costStatuses);
       if (issues.length) return send(400, { error: "Validation error", details: issues });
       if (body.issueId && !db.issues.some((i) => i.id === body.issueId)) return send(422, { error: "Issue not found" });
+      // Like createCostEventInTransaction: a projectId must be a project of the company.
+      if (body.projectId) {
+        const project = db.projects.find((pr) => pr.id === body.projectId);
+        if (!project) return send(404, { error: "Project not found" });
+        if (project.companyId !== m[1]) return send(422, { error: "Project does not belong to company" });
+      }
       // Paperclip 2026.10 records a receipt once per idempotencyKey: the same receipt
       // again returns the first, a different one is a 409. Older versions drop the key.
       let receipt = body;

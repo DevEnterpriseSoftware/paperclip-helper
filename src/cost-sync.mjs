@@ -13,7 +13,8 @@
 //     and OpenAI's list prices (prices.mjs), doubled for fast mode.
 //
 // Each event has zero tokens (the run's own event already counted them), the
-// run's heartbeatRunId (so run counts and project attribution stay right), and
+// run's heartbeatRunId (so run counts stay right), the run's issue and project (so
+// it lands under the right project; see scopeOf), and
 // the run's provider, biller and model (so it lands in the same Costs rows).
 //
 // Posted events count toward budgets and can't be deleted, so idempotency is
@@ -240,6 +241,33 @@ export function createCostSync(ctx) {
     }
   }
 
+  // Where the run's cost belongs: its issue, project and billing code. Paperclip's
+  // Costs page puts an event under a project only by the event's own projectId:
+  // since cost receipts (2026.10) it no longer falls back to the run's issue for
+  // an event that has a receipt, which every posted event has. So the project
+  // must be on the event. In order of trust: the scope Paperclip fixed for the run
+  // when it started (usageJson.ledgerScope, which its own cost events use), the
+  // run's context (contextSnapshot.issueId / projectId), and, on a Paperclip
+  // without ledger scopes, the issue's current project. Fields that aren't a UUID
+  // are left out. undefined: the issue couldn't be read (try again next pass).
+  async function scopeOf(run, issueProjects) {
+    const ledger = run.usageJson?.ledgerScope && typeof run.usageJson.ledgerScope === "object" ? run.usageJson.ledgerScope : {};
+    const context = run.contextSnapshot && typeof run.contextSnapshot === "object" ? run.contextSnapshot : {};
+    const id = (v) => (typeof v === "string" && UUID.test(v) ? v : null);
+    const issueId = id(ledger.issueId) ?? id(context.issueId);
+    let projectId = id(ledger.projectId) ?? id(context.projectId);
+    if (!projectId && issueId) {
+      if (!issueProjects.has(issueId)) {
+        const issue = await recordOf(`/api/issues/${issueId}`);
+        if (issue === undefined) return undefined;
+        issueProjects.set(issueId, id(issue?.projectId)); // null: gone, or in no project
+      }
+      projectId = issueProjects.get(issueId);
+    }
+    const billingCode = typeof ledger.billingCode === "string" && ledger.billingCode.trim() ? ledger.billingCode : null;
+    return { ...(issueId ? { issueId } : {}), ...(projectId ? { projectId } : {}), ...(billingCode ? { billingCode } : {}) };
+  }
+
   // The run's model for pricing: the recorded one, else (when Paperclip recorded
   // nothing) the agent's configured model. "mixed" (a Claude run that used more
   // than one model) has no single price: see tokenPrice.
@@ -287,7 +315,7 @@ export function createCostSync(ctx) {
   // running cost: when the agent process restarted, the running cost restarted
   // too, and the growth understates the run. A run that stopped before Claude
   // reported a cost (killed, timed out) is priced from its tokens, at its model.
-  async function evaluate(run, agent, table, nowMs) {
+  async function evaluate(run, agent, table, nowMs, issueProjects = new Map()) {
     if (!TERMINAL_RUN.has(run.status)) return { skip: "not finished", final: false };
     const finishedAt = run.finishedAt ?? null;
     if (!finishedAt) return { skip: "not finished", final: false };
@@ -342,7 +370,8 @@ export function createCostSync(ctx) {
       basis = claude ? "token floor" : "estimated";
     }
     if (!(usd > 0)) return { skip: "no cost", final: true };
-    const issueId = run.contextSnapshot?.issueId;
+    const scope = await scopeOf(run, issueProjects);
+    if (scope === undefined) return { skip: "issue details unavailable (Paperclip didn't answer)", final: false };
     return {
       usd,
       basis,
@@ -352,7 +381,7 @@ export function createCostSync(ctx) {
         idempotencyKey: `${IDEMPOTENCY_PREFIX}${run.id}`,
         agentId: run.agentId,
         heartbeatRunId: run.id,
-        ...(typeof issueId === "string" && UUID.test(issueId) ? { issueId } : {}),
+        ...scope,
         provider,
         biller,
         billingType: "subscription_included",
@@ -385,12 +414,13 @@ export function createCostSync(ctx) {
     const cs = companyState(state, companyId);
     const floor = floorOf(state, companyId);
     const items = [];
+    const issueProjects = new Map(); // issue id → its project, read once per pass
     for (const run of [...list, ...(await queuedElsewhere(companyId, state, list))]) {
       if (cs.synced[run.id] !== undefined || state.inflight[run.id] || state.skipped[run.id]) continue;
       // A run queued by --retry-skipped was looked at once already: the floor doesn't hold it back.
       if (floor && !state.retry[run.id] && run.finishedAt && Date.parse(run.finishedAt) < Date.parse(floor)) continue;
       const agent = await agentOf(agents, run.agentId);
-      const verdict = await evaluate(run, agent, table, nowMs);
+      const verdict = await evaluate(run, agent, table, nowMs, issueProjects);
       if (verdict) items.push({ run, agent, ...verdict });
       else delete state.retry[run.id]; // not a subscription run of ours (any more): nothing to post
     }
@@ -484,6 +514,20 @@ export function createCostSync(ctx) {
     return sent;
   }
 
+  // Which link of the event Paperclip refused as missing or not the company's
+  // ("Issue not found", "Project does not belong to company"), so the event can be
+  // posted without it. A refusal that names neither drops the issue, then the project.
+  function goneLink(err, body, dropped) {
+    if (err?.status !== 404 && err?.status !== 422) return null;
+    const text = String(err.body?.error ?? err.message ?? "");
+    const left = ["issueId", "projectId"].filter((f) => body[f] && !dropped.has(f));
+    if (!left.length) return null;
+    if (/^\W*project\b/i.test(text) || /\bproject (not found|does not belong)/i.test(text)) return left.includes("projectId") ? "projectId" : null;
+    if (/^\W*issue\b/i.test(text) || /\bissue (not found|does not belong)/i.test(text)) return left.includes("issueId") ? "issueId" : null;
+    if (/\b(agent|heartbeat run|goal)\b/i.test(text)) return null;
+    return left[0];
+  }
+
   // Paperclip's whole answer to a rejected post, and the fields the post had, once per run.
   function logRejection(runId, err, body) {
     if (rejectionsLogged.has(runId)) return;
@@ -493,7 +537,7 @@ export function createCostSync(ctx) {
 
   async function send(state, companyId, runId, first, carry, finishedAt) {
     let body = first;
-    let withoutIssue = false;
+    const dropped = new Set();
     for (;;) {
       body = compatible(state, runId, body);
       try {
@@ -528,11 +572,14 @@ export function createCostSync(ctx) {
           takesEstimated = false;
           continue;
         }
-        if ((err.status === 404 || err.status === 422) && body.issueId && !withoutIssue) {
-          const { issueId: _gone, ...rest } = body; // the issue may be gone: post without it
+        const gone = goneLink(err, body, dropped);
+        if (gone) {
+          // The issue or project may be gone (or moved to another company): post without it.
+          const { [gone]: _gone, ...rest } = body;
           body = rest;
-          withoutIssue = true;
+          dropped.add(gone);
           if (state.inflight[runId]) state.inflight[runId].body = body;
+          if (gone === "projectId") log.warn("cost sync: Paperclip no longer has the run's project; posting its cost without one", { run: runId, project: _gone });
           continue;
         }
         if (err.status >= 400 && err.status < 500 && !FINAL_REJECTIONS.has(err.status)) {
@@ -707,6 +754,7 @@ export function createCostSync(ctx) {
         sub += row.usd;
       }
       print(`  ${"Total".padEnd(20)} ${String(postable.length).padStart(5)} runs   $${sub.toFixed(2).padStart(9)}`);
+      await printByProject(companyId, postable, print);
       const reasons = new Map();
       for (const i of skipped) reasons.set(i.skip, (reasons.get(i.skip) ?? 0) + 1);
       for (const [reason, n] of reasons) if (reason !== "settling" && reason !== "not finished") print(`  not synced: ${n} runs, ${reason}`);
@@ -721,6 +769,26 @@ export function createCostSync(ctx) {
       runs += postable.length;
     }
     if (companyIds.length > 1) print(`All companies: ${runs} runs, $${total.toFixed(2)}`);
+  }
+
+  // Where the posts will land on the Costs page's "By project": each project's
+  // runs and cost, and "no project" for runs with none (a timer run, say).
+  async function printByProject(companyId, postable, print) {
+    if (!postable.length) return;
+    const rows = new Map();
+    for (const i of postable) {
+      const key = i.post.projectId ?? "";
+      const row = rows.get(key) ?? { runs: 0, usd: 0 };
+      row.runs += 1;
+      row.usd += i.usd;
+      rows.set(key, row);
+    }
+    const projects = await api.request("GET", `/api/companies/${companyId}/projects`).catch(() => null);
+    const names = new Map((Array.isArray(projects) ? projects : []).map((p) => [p.id, p.name]));
+    const parts = [...rows]
+      .sort((a, b) => b[1].usd - a[1].usd)
+      .map(([id, row]) => `${id ? names.get(id) ?? id : "no project"} $${row.usd.toFixed(2)} (${row.runs} run${row.runs === 1 ? "" : "s"})`);
+    print(`  by project: ${parts.join(", ")}`);
   }
 
   // `costs --retry-skipped`: queues the skipped runs that can be posted again for
@@ -750,16 +818,16 @@ export function createCostSync(ctx) {
     return { queued: again.length, kept: kept.length };
   }
 
-  // For each active company or agent budget the posts fall in, show the spend
+  // For each active company, agent or project budget the posts fall in, show the spend
   // before → after, and warn when that reaches the limit, loudly for a hard stop.
   async function budgetImpact(companyId, postable, print) {
     const overview = await api.request("GET", `/api/companies/${companyId}/budgets/overview`).catch(() => null);
     for (const p of overview?.policies ?? []) {
-      if (!p.isActive || p.metric !== "billed_cents" || p.scopeType === "project") continue;
+      if (!p.isActive || p.metric !== "billed_cents") continue;
       const start = Date.parse(p.windowStart) || 0;
       const end = Date.parse(p.windowEnd) || Infinity;
       const adds = postable
-        .filter((i) => p.scopeType === "company" || i.run.agentId === p.scopeId)
+        .filter((i) => p.scopeType === "company" || (p.scopeType === "project" ? i.post.projectId === p.scopeId : i.run.agentId === p.scopeId))
         .filter((i) => {
           const t = Date.parse(i.post.occurredAt);
           return t >= start && t < end;
@@ -771,7 +839,7 @@ export function createCostSync(ctx) {
       const line =
         `  budget "${p.scopeName}" (${p.scopeType}, ${p.windowKind}): $${(p.observedAmount / 100).toFixed(2)} → ` +
         `$${(after / 100).toFixed(2)} of $${(p.amount / 100).toFixed(2)}`;
-      if (over && p.hardStopEnabled) print(`${line}. WARNING: this reaches the hard stop, so Paperclip would pause the ${p.scopeType === "company" ? "company" : "agent"}.`);
+      if (over && p.hardStopEnabled) print(`${line}. WARNING: this reaches the hard stop, so Paperclip would pause the ${p.scopeType}.`);
       else if (over) print(`${line}. Over budget (no hard stop).`);
       else print(line);
     }

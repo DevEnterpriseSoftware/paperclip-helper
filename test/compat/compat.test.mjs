@@ -54,6 +54,7 @@ const HELPER_ENDPOINTS = [
   ["GET", "/api/companies/{companyId}/heartbeat-runs"],
   ["GET", "/api/companies/{companyId}/activity"],
   ["GET", "/api/companies/{companyId}/budgets/overview"],
+  ["GET", "/api/companies/{companyId}/projects"],
   ["POST", "/api/companies/{companyId}/cost-events"],
   ["GET", "/api/heartbeat-runs/{runId}"],
   ["GET", "/api/heartbeat-runs/{runId}/events"],
@@ -795,6 +796,50 @@ if (!BASE) {
         event = await s.ctx.api.request("POST", path, { ...body, costStatus: "reported" });
       }
       assert.equal(Number(event.costCents), 2);
+    });
+
+    test("cost sync: an event lands under its project on the Costs page only by its own projectId", async () => {
+      const runs = await s.ctx.api.request("GET", `/api/companies/${s.company.id}/heartbeat-runs?limit=1000`);
+      const run = runs.find((r) => r.status === "succeeded" && r.contextSnapshot?.issueId);
+      // Where cost sync reads the run's project first: the scope Paperclip fixed for the run (2026.10+).
+      const ledger = run.usageJson?.ledgerScope;
+      if (ledger) {
+        assert.equal(ledger.issueId, run.contextSnapshot.issueId, "usageJson.ledgerScope names the run's issue");
+        assert.ok("projectId" in ledger, "usageJson.ledgerScope has projectId (null when the issue is in no project)");
+      }
+      const issue = await s.ctx.api.request("GET", `/api/issues/${run.contextSnapshot.issueId}`);
+      assert.ok("projectId" in issue, "an issue carries projectId, the fallback without a ledger scope");
+      // The suite's own setup and check (ok()) go around the helper's client: the helper never calls them.
+      const project = await ok("POST", `/api/companies/${s.company.id}/projects`, { name: `Compat cost attribution ${run.id.slice(0, 8)}` });
+      const listed = await s.ctx.api.request("GET", `/api/companies/${s.company.id}/projects`);
+      assert.ok(listed.some((p) => p.id === project.id && p.name === project.name), "the company's project list names it (pch costs' by-project line)");
+      const path = `/api/companies/${s.company.id}/cost-events`;
+      const body = (key, extra) => ({
+        idempotencyKey: `pch-cost-sync:compat-${key}-${run.id}`,
+        agentId: run.agentId,
+        heartbeatRunId: run.id,
+        provider: "anthropic",
+        biller: "anthropic",
+        billingType: "subscription_included",
+        costStatus: "reported",
+        model: "compat-model",
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        costCents: 7,
+        occurredAt: new Date(run.finishedAt).toISOString(),
+        ...extra,
+      });
+      await s.ctx.api.request("POST", path, body("project", { projectId: project.id }));
+      const rows = await ok("GET", `/api/companies/${s.company.id}/costs/by-project`);
+      const row = rows.find((r) => r.projectId === project.id);
+      assert.ok(row, "the event is under its project");
+      assert.equal(Number(row.costCents), 7);
+      // A project that isn't there is refused with 404 and nothing recorded: cost sync then posts without it.
+      await assert.rejects(
+        s.ctx.api.request("POST", path, body("no-such-project", { projectId: "00000000-0000-4000-8000-00000000c0de" })),
+        (err) => err.status === 404 && /project/i.test(String(err.body?.error ?? err.message)),
+      );
     });
 
     test("cost sync: a pass over real runs completes and posts nothing for runs that aren't subscription runs", async () => {

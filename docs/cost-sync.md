@@ -17,11 +17,23 @@ For each finished subscription run, cost sync posts one extra cost event with th
 
 **What it never touches:** runs billed to an API key (`metered_api`), which already carry their real cost, and adapters not listed in `COST_SYNC_ADAPTERS`.
 
-Each event has zero tokens (the run's own event counted them), the run's id, provider, biller and model, the run's finish time, and the idempotency key `pch-cost-sync:<run id>`. Token totals, run counts, project attribution and monthly totals therefore stay right.
+Each event has zero tokens (the run's own event counted them), the run's id, provider, biller and model, the run's issue, project and billing code, the run's finish time, and the idempotency key `pch-cost-sync:<run id>`. Token totals, run counts, the Costs page's *By project* and monthly totals therefore stay right.
+
+### Which project a cost lands under
+
+Paperclip's Costs page puts a cost event under a project only by the event's own `projectId`. (Before Paperclip's cost receipts it also followed the event's run to the issues that run touched; it no longer does that for an event with a receipt, which every posted event has.) So cost sync puts the run's project on each event, taken from, in order:
+
+1. the scope Paperclip fixed for the run when it started (`usageJson.ledgerScope`), which Paperclip's own cost event for the run uses too;
+2. the run's context (`contextSnapshot.projectId`);
+3. on a Paperclip without ledger scopes, the project of the run's issue now, read once per issue per pass. If Paperclip doesn't answer, the run waits for the next pass rather than be posted without its project.
+
+A run with no issue and no project (a timer run, say) is posted without one and shows as *Unattributed*. If Paperclip no longer has the run's project or issue, the event is posted without that one and keeps the other. The run's billing code, when it has one, goes on the event too.
+
+Events posted by 1.15.2 and earlier carry no `projectId`, so their costs stay under *Unattributed*: Paperclip's API can't change an event once it's posted.
 
 ## Before you turn it on
 
-- **The amounts count toward budgets.** A company or agent budget with a hard stop pauses work once the synced amounts reach it. `pch costs` shows each budget before and after.
+- **The amounts count toward budgets.** A company, agent or project budget with a hard stop pauses work once the synced amounts reach it. `pch costs` shows each budget before and after.
 - **Cost events can't be deleted** through Paperclip's API. The helper records every run it posts in `data/cost-synced.json`, and never posts a run twice, even across crashes.
   - Paperclip 2026.10 and later also record each idempotency key once. While the latest post shows that, a post whose answer was lost is posted again with the same key on the next pass (up to 5 times) rather than given up, and a lost state file can't cause double posts; on an older Paperclip such a run is never posted again.
   - If `data/` is lost (or its state file is unreadable), it reads your earlier cost posts from Paperclip's activity log and counts the runs they name as synced. The log shows the latest 500 posts, so when it is full, runs that finished before its oldest entry are left alone; when the posts don't name their runs, or the log can't be read, only runs that finish from then on are synced. This holds whatever `COST_SYNC_SINCE` says.
@@ -37,6 +49,7 @@ Acme: not yet synced (412 runs already synced)
   Reviewer                38 runs   $    61.20
   Engineer                22 runs   $    54.87   (22 estimated from tokens)
   Total                   60 runs   $   116.07
+  by project: Website $98.20 (52 runs), Launch campaign $16.10 (6 runs), no project $1.77 (2 runs)
   not synced: 3 runs, model unknown (set CODEX_DEFAULT_MODEL to price it)
   budget "Engineer" (agent, calendar_month_utc): $0.00 → $54.87 of $50.00. WARNING: this reaches the hard stop, so Paperclip would pause the agent.
 ```

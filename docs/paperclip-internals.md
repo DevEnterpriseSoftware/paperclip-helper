@@ -302,11 +302,13 @@ Suggested text for an issue on paperclipai/paperclip:
   - **What the activity log shows:** each post writes `cost.reported` with the actor, readable at `GET /api/companies/:id/activity?entityType=cost_event`. (live)
 - **Costs page aggregation:**
   - Run counts use `count(distinct heartbeatRunId)` per billing type, so an extra zero-token event with the same run id and billing type doesn't change them.
-  - Project attribution joins on `heartbeatRunId`.
+  - **By project** (`GET /api/companies/:id/costs/by-project`, `costs.byProject`) uses `coalesce(cost_events.project_id, <the run's project>)`, where the run's project comes from the issues its activity-log entries name (only when they are all in one project), but **only for an event whose `receipt_hash` is null**, i.e. one recorded before cost receipts. Every event posted now has a receipt, so it lands under a project only by its own `projectId`; without one it is *Unattributed*, whatever its `heartbeatRunId` or `issueId`. (main at 7b8aa60)
+  - **A run's ledger scope.** When a run starts, Paperclip stores `usageJson.ledgerScope: { issueId, projectId, billingCode }` (`resolveLedgerScopeForRun`, `services/heartbeat/run-state.ts`: the issue's project, else `contextSnapshot.projectId`), and its own cost event for the run takes those three from it (`services/run-cost-accounting.ts`). The run list returns it inside `usageJson`. (main at 7b8aa60)
+  - **`POST /cost-events` checks each link** (`agentId`, `issueId`, `projectId`, `goalId`, `heartbeatRunId`): one that doesn't exist is `404` ("Project not found"), one in another company `422` ("Project does not belong to company"), and nothing is recorded. There's no route that changes an event's project afterwards; the adjustments route changes only its amount.
   - An event without `issueId` doesn't appear in issue cost summaries.
 - **`GET /api/companies/:id/budgets/overview`** returns `policies[]` with `scopeType`, `scopeId`, `scopeName` (the company, agent or project name), `metric` (always `billed_cents`), `windowKind`, `amount`, `observedAmount`, `hardStopEnabled`, `isActive`, `windowStart` and `windowEnd` (`server/src/services/budgets.ts`). (2026.916.1)
   - `observedAmount` sums `costCents` of every billing type, so synced events count.
-  - Project budgets match only an event's `projectId`, which `POST /cost-events` doesn't derive from `issueId`. So synced events never count toward a project budget.
+  - Project budgets match only an event's `projectId`, which `POST /cost-events` doesn't derive from `issueId`. Since 1.15.3 cost sync sets it, so synced events count toward the run's project budget.
 
 - **Resumed sessions report per-run cost.** A resumed run gets a new session id, and its `sessionIdBefore` is the previous run's `sessionIdAfter`. On 2026.916.1 (`claude_local`, CLI engine), resumed runs often cost less than the run they resumed, which a cumulative figure can't do. `pch costs --sessions` runs this check.
 

@@ -42,6 +42,7 @@ Start with `pch status` and, for a stuck issue, `pch why ISSUE`.
 | Where did the **"PR #12 opened by …" comments** go? | Into the issue's **Pull requests** document, which wakes nobody (`RELAY_QUIET_NOTES`). |
 | **Answering a card through the API is refused** ("requires an answer") | Send a typed answer as `otherText`, not `text`, or use `pch answer ISSUE CARD "…"`. |
 | No PR rows on the issue | Turn on **Instance settings → Experimental → External Objects**. |
+| Synced costs under *Unattributed* on the Costs page's *By project* | Events posted by 1.15.2 and earlier carry no project, and Paperclip's API can't add one afterwards; from 1.15.3 each event carries its run's project. A run with no issue and no project (a timer run) is still unattributed. `pch costs` shows where the runs not yet synced will land. See [cost sync](cost-sync.md#which-project-a-cost-lands-under). |
 | Codex costs missing | Look for `pch costs` lines such as `model unknown` or `no price for …`, then set `CODEX_DEFAULT_MODEL` or add the model to `prices.json`. |
 | `cost sync: Paperclip rejected a cost event` | The warning before it, `Paperclip's answer to a rejected cost event`, has Paperclip's whole answer (for a `400: Validation error`, each field it refused and why) and the fields the post had. Once the cause is fixed, `pch costs --retry-skipped` posts those runs again. See [cost sync](cost-sync.md#when-paperclip-rejects-a-cost-event). |
 | Anything else | `docker compose logs --tail 50`. There's one JSON line per event; `LOG_LEVEL=debug` shows more. |

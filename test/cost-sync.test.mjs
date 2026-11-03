@@ -394,3 +394,108 @@ test("a 429 doesn't drop the issue from the event when the retry goes through", 
   await env.sync.tick();
   assert.ok([...byRun(env.db).values()].every((e) => e.issueId === env.issue.id));
 });
+
+// ---------------------------------------------------------------- project attribution
+
+// Paperclip's "By project" uses only an event's own projectId for events with a
+// receipt (every posted one), so the run's project must be on the event.
+function addProject(env, name = "Engineering") {
+  const project = { id: uuid(), companyId: ids.company, name };
+  env.db.projects.push(project);
+  return project;
+}
+
+test("the event carries the project, issue and billing code Paperclip fixed for the run (usageJson.ledgerScope)", async (t) => {
+  const env = await syncEnv(t);
+  const eng = addProject(env, "Engineering");
+  const other = addProject(env, "Marketing");
+  env.issue.projectId = other.id; // the issue moved since: the run's own scope wins
+  env.runs.claude.usageJson.ledgerScope = { issueId: env.issue.id, projectId: eng.id, billingCode: "DM-3" };
+  await env.sync.tick();
+  const claude = byRun(env.db).get(env.runs.claude.id);
+  assert.equal(claude.projectId, eng.id);
+  assert.equal(claude.issueId, env.issue.id);
+  assert.equal(claude.billingCode, "DM-3");
+});
+
+test("without a ledger scope, the run's context project is used, else the issue's project, read once per pass", async (t) => {
+  const env = await syncEnv(t);
+  const eng = addProject(env, "Engineering");
+  const mkt = addProject(env, "Marketing");
+  env.issue.projectId = eng.id;
+  env.runs.codex.contextSnapshot.projectId = mkt.id;
+  await env.sync.tick();
+  const events = byRun(env.db);
+  assert.equal(events.get(env.runs.codex.id).projectId, mkt.id, "context project");
+  assert.equal(events.get(env.runs.claude.id).projectId, eng.id, "the issue's project");
+  assert.equal(events.get(env.runs.fast.id).projectId, eng.id);
+  assert.ok(!("billingCode" in events.get(env.runs.claude.id)));
+  const reads = env.fake.requests.filter((r) => r.method === "GET" && r.path === `/api/issues/${env.issue.id}`);
+  assert.equal(reads.length, 1, "the issue is read once for all its runs");
+});
+
+test("a run with no issue and no project is posted without either", async (t) => {
+  const env = await syncEnv(t);
+  env.runs.claude.contextSnapshot = { wakeReason: "timer" };
+  await env.sync.tick();
+  const claude = byRun(env.db).get(env.runs.claude.id);
+  assert.ok(claude);
+  assert.ok(!("projectId" in claude) && !("issueId" in claude));
+});
+
+test("when Paperclip doesn't answer about the run's issue, the run waits for the next pass rather than lose its project", async (t) => {
+  const env = await syncEnv(t);
+  const eng = addProject(env);
+  env.issue.projectId = eng.id;
+  env.fake.fail("GET", `/api/issues/${env.issue.id}`, 500, { times: 2 }); // a GET is retried once
+  await env.sync.tick();
+  assert.equal(byRun(env.db).has(env.runs.claude.id), false);
+  await env.sync.tick();
+  assert.equal(byRun(env.db).get(env.runs.claude.id).projectId, eng.id);
+});
+
+test("a project Paperclip no longer has: posted without it, keeping the issue", async (t) => {
+  const env = await syncEnv(t);
+  const gone = uuid();
+  env.runs.claude.usageJson.ledgerScope = { issueId: env.issue.id, projectId: gone };
+  await env.sync.tick();
+  const claude = byRun(env.db).get(env.runs.claude.id);
+  assert.ok(claude, "posted");
+  assert.equal(claude.projectId, undefined);
+  assert.equal(claude.issueId, env.issue.id);
+  assert.ok(env.logs.some((l) => l.level === "warn" && /no longer has the run's project/.test(l.msg)));
+});
+
+test("an issue Paperclip no longer has: posted without it, keeping the project", async (t) => {
+  const env = await syncEnv(t);
+  const eng = addProject(env);
+  env.runs.claude.usageJson.ledgerScope = { issueId: uuid(), projectId: eng.id };
+  await env.sync.tick();
+  const claude = byRun(env.db).get(env.runs.claude.id);
+  assert.equal(claude.issueId, undefined);
+  assert.equal(claude.projectId, eng.id);
+});
+
+test("the preview shows where the runs land by project, and counts them toward project budgets", async (t) => {
+  const env = await syncEnv(t);
+  const eng = addProject(env, "Engineering");
+  env.issue.projectId = eng.id;
+  env.runs.codex.contextSnapshot = {}; // a timer run: no project
+  env.db.budgets.policies.push({
+    isActive: true,
+    metric: "billed_cents",
+    scopeType: "project",
+    scopeId: eng.id,
+    scopeName: "Engineering",
+    windowKind: "lifetime",
+    amount: 500,
+    observedAmount: 0,
+    hardStopEnabled: true,
+    windowStart: null,
+    windowEnd: null,
+  });
+  const text = (await captureOutput(() => env.sync.preview())).join("\n");
+  assert.match(text, /by project: Engineering \$9\.28 \(4 runs\), no project \$2\.52 \(1 run\)/);
+  assert.match(text, /budget "Engineering" \(project, lifetime\): \$0\.00 → \$9\.28 of \$5\.00\. WARNING: this reaches the hard stop, so Paperclip would pause the project\./);
+  assert.equal(env.db.costEvents.length, 0);
+});
