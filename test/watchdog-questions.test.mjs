@@ -154,16 +154,18 @@ test("dry run and WATCHDOG_ROUTE_QUESTIONS=false create nothing", async (t) => {
 
 test("cards are looked at once per stall window, not every tick", async (t) => {
   const env = await watchdogEnv(t);
-  strandedQuestion(env.db);
+  const { issue } = strandedQuestion(env.db);
+  // What the card scan costs is a read of each open issue's cards. (Counted at
+  // Paperclip, not from the tick's stats, which list only its five slowest checks:
+  // on a slow machine the card scan may not be among them.)
+  const cardReads = () => env.fake.requests.filter((r) => r.method === "GET" && r.path === `/api/issues/${issue.id}/interactions`).length;
   await env.watchdog.tick();
-  // The open-issue listing is shared by the tick's checks: what the card scan costs is its own requests.
-  const looked = () => env.watchdog.stats.lastTick.checks.find((c) => c.name === "question cards")?.requests ?? 0;
-  assert.ok(looked() > 0);
+  assert.equal(cardReads(), 1);
   await env.watchdog.tick();
-  assert.equal(looked(), 0);
+  assert.equal(cardReads(), 1, "not looked at again within the stall window");
   env.later(4);
   await env.watchdog.tick();
-  assert.ok(looked() > 0);
+  assert.equal(cardReads(), 2, "looked at again once it has passed");
 });
 
 test("hand-offs: a card's cancelled wake is no hand-off, but another never-started run still is", async (t) => {
