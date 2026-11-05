@@ -146,7 +146,9 @@ export async function peopleSince(api, issue, { since, owner }) {
 
 // Check 18. From the watchdog: its records, `record` keys, `agentFor`, `nudge`, and
 // the resume sweep's `settling` and `takeSlot` (resumes).
-export function createPausedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, resumes }) {
+// `otherHolds` (22, unstarted-holds.mjs) is handed every other reconciliation hold the
+// scan finds, so the open issues are read once per stall window for both.
+export function createPausedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, resumes, otherHolds = null }) {
   const { api, config, log } = ctx;
   const now = () => ctx.now();
   const stallMs = config.watchdogStallSec * 1000;
@@ -182,8 +184,14 @@ export function createPausedHoldCheck({ ctx, records, state, stats, dryRunSeen, 
     const full = await api.request("GET", `/api/issues/${row.id}`).catch(() => null);
     if (full?.executionBlocker?.cause !== RECONCILIATION_CAUSE) return;
     const facts = await holdFacts(api, row.id).catch(() => null);
-    // Only a run the pause cancelled: any other hold is 7's, or yours.
-    if (!facts?.hold || !pausedHold(facts) || !facts.hold.agentId) return;
+    if (!facts?.hold) return;
+    // Only a run the pause cancelled: any other hold is 22's (a run that never started,
+    // or one that did, reported), 7's, or yours.
+    if (!pausedHold(facts)) {
+      if (otherHolds && facts.issue.assigneeAgentId) await otherHolds.check(facts, companyId, agents);
+      return;
+    }
+    if (!facts.hold.agentId) return;
     const { issue, hold } = facts;
     const who = issue.identifier ?? issue.id;
     const key = record.pausedHold(issue, hold.runId);

@@ -10,8 +10,10 @@ import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, paused
 import { createCostSync } from "./cost-sync.mjs";
 import { blocked as blockedReport } from "./blocked.mjs";
 import {
-  actsAsUser, continuationText, continuePausedHold, CONVERSATION_ADAPTERS, holdFacts, pausedHold, releaseHold, releaseProblems, RELEASE_OUTCOMES, unprovable,
+  actsAsUser, continuationText, continuePausedHold, CONVERSATION_ADAPTERS, defaultOutcome, holdFacts, neverStarted, pausedHold, releaseHold, releaseProblems,
+  RELEASE_OUTCOMES, unprovable,
 } from "./release.mjs";
+import { unstartedHoldRemedy } from "./unstarted-holds.mjs";
 import {
   clearLink,
   clearProblems,
@@ -258,13 +260,16 @@ export async function ready(ctx) {
 // An execution hold that messages and Interrupt can't clear (see release.mjs).
 // Shows the hold and the held run; --apply records the board's reconciliation
 // (the run has stopped; what it did is unverified unless --outcome says
-// otherwise) and delivers the saved messages.
-export async function release(ctx, identifier, { apply = false, outcome: actionOutcome = "mixed" } = {}) {
+// otherwise, or "not performed" for a run Paperclip cancelled before it started)
+// and delivers the saved messages.
+export async function release(ctx, identifier, { apply = false, outcome = null } = {}) {
   if (!identifier) throw new Error("usage: pch release ISSUE [--apply] [--outcome mixed|completed|not_performed]");
-  if (!RELEASE_OUTCOMES.includes(actionOutcome)) {
+  if (outcome != null && !RELEASE_OUTCOMES.includes(outcome)) {
     throw new Error(`--outcome must be one of ${RELEASE_OUTCOMES.join(", ")}`);
   }
   const facts = await holdFacts(ctx.api, identifier);
+  const actionOutcome = outcome ?? defaultOutcome(facts);
+  const outcomeFlag = outcome != null && outcome !== defaultOutcome(facts) ? ` --outcome ${outcome}` : "";
   const { issue, hold, run, agent, queue } = facts;
   if (!hold) {
     out(`${identifier}: no execution hold. Nothing to release; \`pch why ${identifier}\` says what else is going on.`);
@@ -310,18 +315,24 @@ export async function release(ctx, identifier, { apply = false, outcome: actionO
     out(result.lifted ? "The hold is gone; its run should start within seconds." : `Paperclip still showed the hold a moment later: if no run starts, run \`pch why ${identifier}\`.`);
     return;
   }
-  if (unprovable(facts)) out("Paperclip can't release this by itself: the run recorded no process it could check.");
+  const unstarted = neverStarted(facts);
+  if (unstarted) {
+    out(`Paperclip cancelled this run before it started (${run.errorCode}): no start, process, session, usage, lease or execution event.`);
+    out("There is nothing to reconcile, and Paperclip can't release the hold by itself.");
+  } else if (unprovable(facts)) out("Paperclip can't release this by itself: the run recorded no process it could check.");
 
   const problems = releaseProblems(facts);
   if (problems.length) {
-    throw new Error(`Not releasing: ${problems.join("; ")}. Nothing changed.`);
+    const remedy = unstarted ? ` ${unstartedHoldRemedy({ problems, errorCode: run.errorCode, identifier, ownerName: agent?.name ?? null })}` : "";
+    throw new Error(`Not releasing: ${problems.join("; ")}. Nothing changed.${remedy}`);
   }
   if (!apply) {
     out("");
     out(`--apply records, as the board, that this run has stopped and that what it did is ${actionOutcome === "mixed" ? "unverified (mixed)" : actionOutcome.replace("_", " ")},`);
     out(`moves ${identifier} to todo, and ${saved ? "delivers the saved messages" : "lets the next message start a run"}.`);
-    out("Only do it if no agent process from that run is still running. Have the agent check the branch before it continues.");
-    out(`  pch release ${identifier} --apply${actionOutcome !== "mixed" ? ` --outcome ${actionOutcome}` : ""}`);
+    if (unstarted && actionOutcome === "not_performed") out("The run never started, so the agent has nothing of it to check.");
+    else out("Only do it if no agent process from that run is still running. Have the agent check the branch before it continues.");
+    out(`  pch release ${identifier} --apply${outcomeFlag}`);
     return;
   }
   let result;
@@ -333,6 +344,7 @@ export async function release(ctx, identifier, { apply = false, outcome: actionO
   }
   out(`${identifier}: hold released (${result.status}).`);
   if (result.delivered) out(`Delivered ${result.delivered} saved message(s) to ${agent?.name ?? "the assignee"}.`);
+  else if (result.byPaperclip) out(`Paperclip started the ${result.byPaperclip} saved message(s) itself once the hold was gone.`);
   else if (result.waiting) out(`${result.waiting} saved message(s) are waiting; they start with the next run.`);
   else out(`No saved messages: \`pch comment ${identifier} "..."\` tells the assignee what to do next.`);
 }
@@ -984,7 +996,7 @@ export async function status(ctx) {
         counted(w.nudges, "nudge"),
         counted(w.heals, "blocker repaired", "blockers repaired"),
         counted(w.retries, "deferred wake retried", "deferred wakes retried"),
-        counted(w.releases, "hold released", "holds released"),
+        w.releases ? `${counted(w.releases, "hold released", "holds released")}${w.unstartedHolds ? ` (${w.unstartedHolds} behind a run that never started)` : ""}` : null,
         counted(w.deadLinks, "link to a closed workspace cleared", "links to a closed workspace cleared"),
         counted(w.questions, "undelivered question card routed", "undelivered question cards routed"),
         counted(w.ciReports, "finished CI run reported", "finished CI runs reported"),

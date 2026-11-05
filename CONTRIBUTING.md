@@ -22,14 +22,15 @@ src/
   ci-runs.mjs       watchdog 11: CI runs agents wait on, the backstop monitor that holds the wait, and runners that fail every job's set-up
   board-held.mjs    watchdog 12, 13: issues waiting on your review
   questions.mjs     watchdog 10: question cards addressed to a teammate
-  release.mjs       watchdog 7 and `pch release`: holds Paperclip can't release
+  release.mjs       watchdog 7, 22 and `pch release`: holds Paperclip can't release, and runs that never started
   workspace.mjs     watchdog 8, 9 and `pch workspace`: workspace links
   worktree-links.mjs  watchdog 20, `pch worktrees --links` and `pch why`: runs refused on the workspace (workspace validation)
   self-wakes.mjs    watchdog 21 and `pch why`: agents woken by their own runs' posted final messages
   resume.mjs        watchdog 15: issues blocked while their agent was paused
   limits.mjs        watchdog 16: usage limits (a recogniser per adapter)
   stages.mjs        watchdog 17: wiped review stages
-  paused-holds.mjs  watchdog 18: wakes held by a run an agent's pause cancelled
+  paused-holds.mjs  watchdog 18: wakes held by a run an agent's pause cancelled (and the scan of held issues 22 shares)
+  unstarted-holds.mjs  watchdog 22: holds behind runs Paperclip cancelled before they started; holds behind runs that executed, reported
   ready.mjs         watchdog 19 and `pch ready`: PRs ready to queue
   board-note.mjs    notes for the board (log, and WATCHDOG_NOTIFY_ISSUE)
   cost-sync.mjs     API-equivalent cost events

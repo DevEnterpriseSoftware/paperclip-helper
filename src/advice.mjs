@@ -18,6 +18,7 @@ import { escalatedReview } from "./board-held.mjs";
 import { PARTICIPANT_RECOVERY_CAUSE } from "./resume.mjs";
 import { pausedHoldWhy } from "./paused-holds.mjs";
 import { CONVERSATION_ADAPTERS } from "./release.mjs";
+import { unstartedHoldRemedy, unstartedHoldWhy } from "./unstarted-holds.mjs";
 import { extensionAdvice, validationAdvice } from "./worktree-links.mjs";
 
 const ASLEEP = new Set(["paused", "terminated", "pending_approval"]);
@@ -59,6 +60,7 @@ export function advise(facts) {
     ciBackstop = null, // the watchdog's backstop monitor for that wait stands: { nextCheckAt }
     selfWake = null, // an agent keeps waking itself with its runs' posted final messages (self-wakes.mjs): { name, count }
     pauseHold = null, // the hold is from a run a pause cancelled (watchdog 18): { ownerName, runId, waiting, held }
+    unstartedHold = null, // the hold is from a run Paperclip cancelled before it started (watchdog 22): { ownerName, runId, errorCode, problems }
     workspaceValidation = null, // Paperclip refused the assignee's runs at setup on the workspace (worktree-links.mjs): { reason, reasonCode, paths, repoUrl, nextAction }
     extensionError = null, // an agent's build fails on extensions.relativeWorktrees (worktree-links.mjs): { paths, in }
     config = {},
@@ -279,6 +281,29 @@ export function advise(facts) {
       autoNote:
         `The watchdog does both by itself once ${owner} is resumed and the resume has settled (WATCHDOG_RELEASE_HOLDS), ` +
         "paced by the agent's run limit, and tells the board.",
+    };
+  }
+  // A run Paperclip's dispatch cancelled before it started: nothing to reconcile, and
+  // nothing in Paperclip releases it (watchdog 22).
+  if (hold && unstartedHold) {
+    const { problems = [] } = unstartedHold;
+    const releasing = config.watchdog !== false && config.watchdogReleaseHolds !== false;
+    const what = `${unstartedHoldWhy(unstartedHold)}. Comments and status changes are saved behind it; nothing in Paperclip releases it.`;
+    if (problems.length) {
+      return {
+        what: `${what} It can't be released yet: ${problems.join("; ")}.`,
+        steps: [unstartedHoldRemedy({ problems, errorCode: unstartedHold.errorCode, identifier, ownerName: unstartedHold.ownerName })],
+        watchdog: "manual",
+      };
+    }
+    return {
+      what,
+      steps: [
+        `pch release ${identifier}   (shows the run and what releasing it does)`,
+        `pch release ${identifier} --apply   (records that the run performed nothing, moves the issue to todo and delivers the saved messages)`,
+      ],
+      watchdog: releasing ? "auto" : "manual",
+      autoNote: "The watchdog does this by itself once the run ended a stall window ago and the assignee is available (WATCHDOG_RELEASE_HOLDS), and tells the board.",
     };
   }
   // A run that recorded no process id or stop can never prove it stopped: a

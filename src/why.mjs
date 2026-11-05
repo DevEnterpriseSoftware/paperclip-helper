@@ -10,7 +10,7 @@ import { classifyFailure, labelOf, localZone, resetLabel } from "./limits.mjs";
 import { issueActivity, stagesWipe } from "./stages.mjs";
 import { isBackstop, monitorPending, runRefs, waitingOn } from "./ci-runs.mjs";
 import { selfWakeLoop } from "./self-wakes.mjs";
-import { PAUSE_CANCEL, RECONCILIATION_CAUSE } from "./release.mjs";
+import { holdFacts, neverStarted, PAUSE_CANCEL, RECONCILIATION_CAUSE, releaseProblems } from "./release.mjs";
 import { describeWakes } from "./paused-holds.mjs";
 import { codeLabel, EXTENSION_ERROR, hostPaths, meaningOf, readWorkspace, RECOVERY_KIND, VALIDATION_FAILED, validationOf } from "./worktree-links.mjs";
 import { ts } from "./util.mjs";
@@ -122,6 +122,7 @@ async function whyReport(ctx, identifier, out) {
   if (linkLine) out(`Workspace: ${linkLine}`);
   const hold = full?.executionBlocker;
   let pauseHold = null;
+  let unstartedHold = null;
   if (hold) {
     // Paperclip's recovery is holding the issue: new runs are refused until it's released.
     out(`Execution hold: ${hold.cause ?? "unknown cause"}${hold.runId ? `, source run ${String(hold.runId).slice(0, 8)}` : ""}`);
@@ -143,6 +144,14 @@ async function whyReport(ctx, identifier, out) {
           `Queued wakes held by an unreconciled run from a pause: ${ownerName ?? "an agent"}'s run ${String(hold.runId).slice(0, 8)} was cancelled when ${ownerName ?? "it"} was paused; ` +
             `${held ? `${held} won't start` : "no run starts on the issue"} until it's resolved.`,
         );
+      } else if (source?.status === "cancelled" && !source.startedAt) {
+        // A run Paperclip's dispatch cancelled before it started (watchdog 22).
+        const facts = await holdFacts(api, id).catch(() => null);
+        if (facts && neverStarted(facts)) {
+          const ownerName = await nameOf(hold.agentId ?? source.agentId);
+          unstartedHold = { ownerName, runId: hold.runId, errorCode: source.errorCode, problems: releaseProblems(facts) };
+          out(`Held run never started: Paperclip's dispatch cancelled ${ownerName ?? "the agent"}'s run ${String(hold.runId).slice(0, 8)} before it began (${source.errorCode}).`);
+        }
       }
     }
   }
@@ -340,6 +349,7 @@ async function whyReport(ctx, identifier, out) {
     ciBackstop,
     selfWake,
     pauseHold,
+    unstartedHold,
     recovery,
     queue,
     cards,

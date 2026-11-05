@@ -52,7 +52,12 @@
 //    stall window, the watchdog records the board's reconciliation (the run has
 //    stopped; what it did is unverified) and delivers the saved messages, as
 //    `pch release --apply` does. Once per held run; a hold whose run may still be
-//    running, holds a lease or has a live process is only reported.
+//    running, holds a lease or has a live process is only reported, and so is one
+//    on an issue whose review stage is pending (the release moves the issue to
+//    todo, which Paperclip refuses or does by ending the review), whose held run
+//    is another agent's than the assignee's, or that other issues block. A run that never started is 22's, and
+//    so is one that recorded usage (tokens or a cost): it did work, which only a
+//    person can judge, so 22 reports it.
 //
 // 8. Issues linked to a closed workspace. An issue an agent creates from another
 //    issue's work is linked to that issue's execution workspace (reuse_existing).
@@ -204,13 +209,28 @@
 //    and so on. With WATCHDOG_SELF_WAKES on, five or more such turns on one issue
 //    within an hour tell the board once per issue. The issue is never commented on.
 //
+// 22. Holds behind runs that never started (unstarted-holds.mjs). Paperclip's
+//    dispatch cancels a queued run or a scheduled retry before it starts when the
+//    issue moved on a moment earlier (issue_assignee_changed,
+//    issue_disposition_repair_superseded, …), and up to 2026.1023.0 still holds the
+//    issue for reconciliation behind it ("Recovery needed", only "Inspect run"), for
+//    good. 18's scan hands every other reconciliation hold here. With
+//    WATCHDOG_RELEASE_HOLDS on, one whose run provably never started (no start,
+//    process, session, usage, lease or execution event) is released once its run
+//    ended a stall window ago, recording that it performed nothing, and the saved
+//    messages are delivered once. Never while the issue's review stage is pending
+//    (the release moves it to todo, which Paperclip refuses or does by ending the
+//    review), the run is another agent's than the assignee's, or other issues block it: those are told to the
+//    board once, with what lifts them. A hold from a run that executed is reported
+//    once, an hour after it ended, unless 7 releases it.
+//
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
 import { companyAgents, listIssues } from "./paperclip.mjs";
 import { createTickReads } from "./tick-reads.mjs";
 import { ACTIVE_RUN, agentMention, asleep, every, mapLimit, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
-import { holdFacts, pausedHold, releaseHold, releaseProblems, RECONCILIATION_CAUSE, unprovable } from "./release.mjs";
+import { holdFacts, neverStarted, pausedHold, ranWork, releaseHold, releaseProblems, RECONCILIATION_CAUSE, unprovable } from "./release.mjs";
 import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
 import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue, strandedCard } from "./questions.mjs";
 import { createGitHub } from "./github.mjs";
@@ -222,6 +242,7 @@ import { createStagesCheck } from "./stages.mjs";
 import { findIdentifiers } from "./identifiers.mjs";
 import { createResumeSweep, PARTICIPANT_RECOVERY_CAUSE, reviewParticipantOf } from "./resume.mjs";
 import { createPausedHoldCheck, pausedHoldSteps, pausedHoldWhy } from "./paused-holds.mjs";
+import { createUnstartedHoldCheck } from "./unstarted-holds.mjs";
 import { noteToBoard } from "./board-note.mjs";
 import { createReadyCheck } from "./ready.mjs";
 import { createWorktreeLinksCheck, RECOVERY_KIND as WORKSPACE_VALIDATION, RELATIVE_LINKS, validationOf } from "./worktree-links.mjs";
@@ -243,11 +264,6 @@ const DAY_MS = 24 * 60 * 60_000;
 const SETTLED_RECHECK_MS = 15 * 60_000;
 const latestRun = (runs) =>
   runs.reduce((a, r) => (!a || ts(r.finishedAt ?? r.createdAt) > ts(a.finishedAt ?? a.createdAt) ? r : a), null);
-// Plain text, no URL: Paperclip links every github.com pull-request URL in a
-// comment to the issue as one of its PRs, so a link here would show Paperclip's
-// own PR on every issue the watchdog nudges.
-const HANDOFF_BUG = "paperclipai/paperclip#13880";
-
 
 // What the watchdog has done about each situation, as keys of one map persisted
 // in the state file (state.nudges): { count, at } per key. The key formats are
@@ -286,6 +302,9 @@ const record = {
   resumeRestore: (issue, commentId) => `resume-restore:${issue.id}:${commentId ?? "?"}`, // the one restore of an issue after a pause's recovery block
   pausedHold: (issue, runId) => `paused-hold:${issue.id}:${runId}`, // a hold from a run a pause cancelled: reported, resolved or left to you, once
   pausedHoldNudge: (issue, runId) => `paused-hold-nudge:${issue.id}:${runId}`, // the comment that wakes the assignee after resolving it
+  unstartedLeft: (issue, runId) => `unstarted-left:${issue.id}:${runId}`, // a hold behind a run that never started, left to the board: { told }
+  executedHold: (issue, runId) => `executed-hold:${issue.id}:${runId}`, // a hold behind a run that executed, reported once
+  unstartedFollowUp: (issue, runId) => `unstarted-follow-up:${issue.id}:${runId}`, // after such a release with nothing delivered: { at, companyId, issueId, assigneeId }
   readyToQueue: (issue, pr) => `ready:${issue.id}:${pr.repo}#${pr.number}:${pr.sha}`, // the board's note that a PR is ready to queue
 };
 
@@ -299,7 +318,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   const stats = {
     ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, questions: 0,
     ciReports: 0, ciReruns: 0, ciBackstops: 0, selfWakes: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, pausedHolds: 0,
-    runnerProblems: 0, readyNotes: 0, worktreeLinkNotes: 0, lastError: null,
+    runnerProblems: 0, readyNotes: 0, worktreeLinkNotes: 0, unstartedHolds: 0, lastError: null,
     // The last tick's requests, how many were answered from what the tick had already
     // read, its slowest checks and its slowest kinds of request (for `pch status`).
     lastTick: null,
@@ -470,8 +489,12 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     if (!config.watchdogReleaseHolds) return false;
     const facts = await holdFacts(api, issue.id).catch(() => null);
     // A run a pause cancelled is 18's: its hold is resolved without moving the issue to todo.
-    if (facts?.hold && pausedHold(facts)) return true;
+    // One that never started is 22's, on its scan: nothing to reconcile, and said so.
+    if (facts?.hold && (pausedHold(facts) || neverStarted(facts))) return true;
     if (!facts?.hold || !unprovable(facts)) return false;
+    // A run that did model work without a process record (an adapter with no local
+    // process): what it did is for a person to judge. 22 reports it.
+    if (ranWork(facts.run)) return false;
     const { hold, run } = facts;
     const who = issue.identifier ?? issue.id;
     const key = record.release(issue, hold.runId);
@@ -547,8 +570,9 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       sourceRun: hold.runId,
       sourceRunStatus: run ? `${run.status}${run.errorCode ? ` (${run.errorCode})` : ""}` : null,
       delivered: result.delivered,
+      ...(result.byPaperclip ? { deliveredByPaperclip: result.byPaperclip } : {}),
     });
-    if (!result.delivered && !result.waiting) {
+    if (!result.delivered && !result.waiting && !result.byPaperclip) {
       await nudge(
         issue,
         record.releaseNudge(issue, hold.runId),
@@ -662,7 +686,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       deferredMin: Math.round((now() - ts(wake.requestedAt)) / 60_000),
       previousRun: previous?.runId ?? null,
       previousRunLease: previous?.environmentLease?.status ?? null,
-      hint: `Paperclip is waiting for an earlier run to release execution (${HANDOFF_BUG}). See \`pch why ${issue.identifier ?? issue.id}\`.`,
+      hint: `Paperclip is waiting for an earlier run to release execution. See \`pch why ${issue.identifier ?? issue.id}\`.`,
     });
   }
 
@@ -921,7 +945,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
           stall.agent,
           `this issue is yours now (${issue.status}), but no run has started since the hand-off. ` +
             `Paperclip most likely refused the hand-off wake while the previous run released its environment lease, ` +
-            `and nothing retried it (${HANDOFF_BUG}). Please pick it up.`,
+            `and nothing retried it. Please pick it up.`,
           { reason: "dropped hand-off", sinceRunSec: stall.sinceRunSec },
         );
       } catch (err) {
@@ -1354,7 +1378,10 @@ export function createWatchdog(outerCtx, state, deps = {}) {
 
   // ---------------------------------------------------------------- 18. holds from a pause
 
-  const pausedHolds = createPausedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, resumes });
+  // 22. Holds behind runs that never started, and reports of holds behind runs that did:
+  // handed over by 18's scan, which reads every held issue once per stall window.
+  const unstartedHolds = createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, nudge });
+  const pausedHolds = createPausedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, resumes, otherHolds: unstartedHolds });
 
   // ---------------------------------------------------------------- 19. PRs ready to queue
 
@@ -1396,6 +1423,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
         }
         // Before the checks that comment: a comment waits behind such a hold too.
         await run("paused-run holds", companyId, () => pausedHolds.check(companyId, agents));
+        await run("unstarted-hold follow-ups", companyId, () => unstartedHolds.followUp(companyId, agents));
         await run("blocked issues", companyId, () => checkBlocked(companyId, agents));
         await run("hand-offs", companyId, () => checkHandOffs(companyId, agents));
         if (config.watchdogRouteQuestions) await run("question cards", companyId, () => checkQuestions(companyId, agents));

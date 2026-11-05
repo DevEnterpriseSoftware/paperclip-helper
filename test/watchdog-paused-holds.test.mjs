@@ -255,13 +255,17 @@ test("the resume's settle window holds it back, and the agent's run limit paces 
   assert.equal(busy.db.patches.length, 0);
 });
 
-test("a cancellation for another reason is left alone", async (t) => {
+test("a cancellation for another reason is left alone: a run that executed is only reported to the board (22), once", async (t) => {
   const e = await env(t);
-  const { issue } = heldReview(e.db, { errorCode: "issue_reassigned" });
+  const { issue, runId } = heldReview(e.db, { errorCode: "issue_reassigned" });
   await e.watchdog.tick();
   assert.ok(issue.executionBlocker);
   assert.equal(e.db.patches.filter((p) => p.issueId === issue.id).length, 0);
-  assert.equal(notes(e).length, 0);
+  assert.equal(e.db.resolutions, undefined);
+  assert.equal(issueComments(e, issue).length, 0);
+  const [note, ...more] = notes(e);
+  assert.equal(more.length, 0);
+  assert.match(note.body, new RegExp(`^ACM-77: Paperclip holds execution on this issue behind Dinesh's run ${runId.slice(0, 8)}, which ended cancelled \\(issue_reassigned\\) without a record of what it did\\. That is for a person to judge`));
 });
 
 test("a helper key that doesn't comment as a board user: the two steps go to the board and on the issue, nothing else", async (t) => {

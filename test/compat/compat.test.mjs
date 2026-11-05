@@ -33,6 +33,7 @@ import { createCostSync } from "../../src/cost-sync.mjs";
 import * as commands from "../../src/commands.mjs";
 import { approvalWaitingOn } from "../../src/util.mjs";
 import { backstopMonitor, isBackstop, monitorAttempts } from "../../src/ci-runs.mjs";
+import { holdFacts, neverStarted } from "../../src/release.mjs";
 
 const BASE = (process.env.PAPERCLIP_COMPAT_API ?? "").replace(/\/+$/, "");
 const COMPANY_PREFIX = "pch-compat";
@@ -726,6 +727,23 @@ if (!BASE) {
       assert.ok(Array.isArray(invoke.payload?.commandArgs), "adapter.invoke carries payload.commandArgs, where Codex fast mode is read");
       assert.ok(events[0].seq <= events.at(-1).seq, "events are listed oldest first");
 
+      // What watchdog 22 reads to tell a run that never started (release.mjs neverStarted):
+      // every field must be there, set on a run that ran, so a missing one never passes for null.
+      hasKeys(
+        detail,
+        ["startedAt", "runtimeMode", "errorCode", "runtimeModeResolvedAt", "processPid", "processGroupId", "processStartedAt",
+          "nativeIssueId", "nativeSessionId", "sessionIdAfter", "controllerBootId", "controllerLeaseExpiresAt", "executionStage"],
+        "a heartbeat run's detail",
+      );
+      assert.ok(isIso(detail.startedAt), "a run that ran has a start time");
+      assert.ok(events.every((e) => "eventType" in e && "sourceEventId" in e), "each run event has eventType and sourceEventId");
+      const ranFacts = {
+        issue: { id: run.contextSnapshot.issueId },
+        hold: { cause: "legacy_execution_requires_reconciliation", runId: run.id },
+        run: { ...detail, status: "cancelled", errorCode: "issue_assignee_changed", detailRead: true, events },
+      };
+      assert.equal(neverStarted(ranFacts), false, "a run that ran never reads as unstarted, whatever its code");
+
       // Exactly the body cost-sync.mjs posts.
       const body = {
         idempotencyKey: `pch-cost-sync:compat-${run.id}`,
@@ -906,6 +924,73 @@ if (!BASE) {
       assert.ok(!listed.some((a) => a.id === s.modelled.id), "terminated agents are left out of the list");
       const direct = await s.ctx.api.request("GET", `/api/agents/${s.modelled.id}`);
       assert.equal(direct.status, "terminated", "which is why cost sync reads them one by one");
+    });
+
+    // Watchdog 22, for real (DIR-1230): a disposition repair Paperclip scheduled, then
+    // suppressed at its gate before it started because the issue gained a live path
+    // (issue_disposition_repair_superseded). Up to 2026.1023.0 that leaves a hold for
+    // reconciliation that nothing in Paperclip releases.
+    test("watchdog 22: a repair suppressed before it started holds the issue, and the watchdog releases it as not performed", async (t) => {
+      // An agent that comments with its run's own token and ends its run, leaving the issue
+      // in progress: no disposition, so Paperclip repairs it at once, then schedules a second
+      // repair about a minute later (seen on 2026.1023.0).
+      const created = await issue({ title: "Suppressed repair", status: "todo" });
+      const script =
+        "const e = process.env; fetch(e.PAPERCLIP_API_URL + '/api/issues/' + e.HELD_ISSUE + '/comments', { method: 'POST', " +
+        "headers: { authorization: 'Bearer ' + e.PAPERCLIP_API_KEY, 'content-type': 'application/json', 'x-paperclip-run-id': e.PAPERCLIP_RUN_ID }, " +
+        "body: JSON.stringify({ body: 'Still looking into it.' }) }).then((r) => console.log('comment', r.status), (err) => console.log('comment failed', err.message));";
+      const quiet = await agent("Erlich", script, { env: { HELD_ISSUE: created.id } });
+      await until("the new agent to be ready", async () => {
+        const a = await ok("GET", `/api/agents/${quiet.id}`);
+        return !("lifecycleState" in a) || a.lifecycleState === "ready";
+      });
+      await ok("PATCH", `/api/issues/${created.id}`, { assigneeAgentId: quiet.id, status: "in_progress" });
+      const repair = await until(
+        "a disposition repair to be scheduled",
+        async () => (await runsOf(created.id)).find((r) => r.status === "scheduled_retry"),
+        { timeoutMs: 240_000, everyMs: 1000 },
+      ).catch(() => null);
+      if (!repair) return t.skip("this Paperclip scheduled no disposition repair");
+      // A live path before the repair is due: the board's monitor. Its gate then suppresses it.
+      const run = { id: 1, html_url: "https://github.com/org/app/actions/runs/1" };
+      const full = await s.ctx.api.request("GET", `/api/issues/${created.id}`);
+      const monitor = backstopMonitor({ run, now: Date.now(), backstopMs: 6 * 60 * 60_000, attemptCount: monitorAttempts(full) });
+      await s.ctx.api.request("PATCH", `/api/issues/${created.id}`, { executionPolicy: { ...(full.executionPolicy ?? {}), monitor } });
+      const repairId = repair.runId ?? repair.id;
+      const ended = await until("the scheduled repair to end", async () => {
+        const r = (await runsOf(created.id)).find((x) => (x.runId ?? x.id) === repairId);
+        return r && !ACTIVE_RUN.has(r.status) ? r : null;
+      }, { timeoutMs: 240_000, everyMs: 2000 });
+      t.diagnostic(`the repair ended ${ended.status} (${ended.errorCode ?? "no code"})`);
+      if (ended.status !== "cancelled" || ended.errorCode !== "issue_disposition_repair_superseded") {
+        return t.skip(`this Paperclip didn't suppress the repair at its gate (${ended.status}, ${ended.errorCode ?? "no code"})`);
+      }
+      let hold = null;
+      for (let look = 0; look < 20 && !hold; look += 1) {
+        hold = (await ok("GET", `/api/issues/${created.id}`)).executionBlocker;
+        if (!hold) await sleep(500);
+      }
+      if (!hold) return t.skip("this Paperclip doesn't hold an issue behind a repair it suppressed before it started");
+
+      assert.equal(hold.cause, "legacy_execution_requires_reconciliation");
+      assert.equal(hold.runId, repairId, "the hold is the suppressed repair's");
+      const facts = await holdFacts(s.ctx.api, created.id);
+      assert.equal(facts.run.startedAt, null, "the repair never started");
+      assert.equal(neverStarted(facts), true, `the helper reads it as never started: ${JSON.stringify({ ...facts.run, events: facts.run.events?.map((e) => e.eventType) })}`);
+
+      // A board message is saved behind the hold, as on the live instance.
+      await s.ctx.api.request("POST", `/api/issues/${created.id}/comments`, { body: "compat: please continue" });
+      await until("the message to be saved", async () => (await ok("GET", `/api/issues/${created.id}/queued-comments`)).entries?.length);
+      const before = (await runsOf(created.id)).length;
+
+      const watchdog = createWatchdog(s.ctx, s.state);
+      s.skew = 10 * 60_000;
+      await watchdog.tick();
+      s.skew = 0;
+      assert.equal(watchdog.stats.unstartedHolds, 1, `released (log: ${JSON.stringify(s.logs.filter((l) => /hold|note for the board/.test(l.msg ?? "")).slice(-3))})`);
+      assert.equal((await ok("GET", `/api/issues/${created.id}`)).executionBlocker, null, "Paperclip no longer holds the issue");
+      await until("the saved message to start the agent", async () => (await runsOf(created.id)).length > before);
+      await settled(created.id).catch(() => {});
     });
 
     // Watchdog 11's backstop, and the disposition guard it answers. Last, so the

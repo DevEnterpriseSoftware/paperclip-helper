@@ -637,7 +637,7 @@ $network
     $s.WATCHDOG_HEAL_FAILED_FINALIZE = if (Confirm 'Repair blockers stuck on a failed workspace clean-up?' (Truthy $s.WATCHDOG_HEAL_FAILED_FINALIZE)) { 'true' } else { 'false' }
     Say 'A wake deferred behind a stopped run waits forever. Paperclip''s "send queued messages now" retries it.'
     $s.WATCHDOG_RETRY_DEFERRED = if (Confirm 'Press it for such wakes (never interrupts a running run)?' (Truthy $s.WATCHDOG_RETRY_DEFERRED)) { 'true' } else { 'false' }
-    Say 'A run that stopped without a record Paperclip can verify leaves its issue held for good.'
+    Say 'A run that stopped without a record Paperclip can verify, or that Paperclip cancelled before it started, leaves its issue held for good.'
     $s.WATCHDOG_RELEASE_HOLDS = if (Confirm 'Release such holds (the run has stopped; the agent checks its branch before continuing)?' (Truthy $s.WATCHDOG_RELEASE_HOLDS)) { 'true' } else { 'false' }
     Say 'An issue created from another issue''s work is linked to that issue''s workspace. Once that'
     Say 'workspace is closed, every run on the issue fails at setup until the link is cleared.'

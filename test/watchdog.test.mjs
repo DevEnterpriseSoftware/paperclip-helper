@@ -38,7 +38,6 @@ test("a dropped hand-off gets one mention comment per stall window, up to the ca
   assert.equal(env.db.comments.length, 1);
   const body = env.db.comments[0].body;
   assert.ok(body.startsWith(`[@Reviewer](agent://${reviewer.id}) this issue is yours now (in_review)`));
-  assert.match(body, /paperclipai\/paperclip#13880/);
   // No URL: Paperclip would link it to the issue as a pull request.
   assert.doesNotMatch(body, /github\.com/);
   assert.match(body, /nudge 1\/2/);

@@ -35,7 +35,8 @@ export const SPECS = {
   release: {
     usage: "release ISSUE [--apply] [--outcome mixed|completed|not_performed]",
     args: ["issue"],
-    options: { apply: "boolean", outcome: { type: "string", choices: ["mixed", "completed", "not_performed"], default: "mixed" } },
+    // No default: a run that never started is "not_performed", any other "mixed" (release.mjs).
+    options: { apply: "boolean", outcome: { type: "string", choices: ["mixed", "completed", "not_performed"] } },
   },
   workspace: { usage: "workspace ISSUE [--apply]", args: ["issue"], options: { apply: "boolean" } },
   worktrees: {

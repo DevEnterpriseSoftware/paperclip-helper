@@ -662,6 +662,11 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         if (hold.settled && !r) return send(200, { issue, recoveryAction: { id: hold.recoveryActionId, status: "resolved" } });
         db.resolutions = [...(db.resolutions ?? []), { issueId: issue.id, body }];
         issue.executionBlocker = null;
+        // Paperclip 2026.1023.0: the move to todo is either refused while a stage is pending
+        // (a safe hand-back to the hold's owner) or a board override that clears
+        // executionState, return assignee and all. Modelled as the clearing, the worse of
+        // the two: the helper must never get here.
+        if (issue.executionState?.status === "pending" && body.sourceIssueStatus !== issue.status) issue.executionState = null;
         issue.status = body.sourceIssueStatus;
         return send(200, { issue, replayed: false });
       }

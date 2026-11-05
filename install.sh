@@ -665,7 +665,7 @@ main() {
     say "A wake deferred behind a stopped run waits forever. Paperclip's \"send queued messages now\" retries it."
     if confirm "Press it for such wakes (never interrupts a running run)?" "$retry"; then WATCHDOG_RETRY_DEFERRED=true; else WATCHDOG_RETRY_DEFERRED=false; fi
     local holds=y; truthy "$WATCHDOG_RELEASE_HOLDS" || holds=n
-    say "A run that stopped without a record Paperclip can verify leaves its issue held for good."
+    say "A run that stopped without a record Paperclip can verify, or that Paperclip cancelled before it started, leaves its issue held for good."
     if confirm "Release such holds (the run has stopped; the agent checks its branch before continuing)?" "$holds"; then WATCHDOG_RELEASE_HOLDS=true; else WATCHDOG_RELEASE_HOLDS=false; fi
     local links=y; truthy "$WATCHDOG_CLEAR_DEAD_LINKS" || links=n
     say "An issue created from another issue's work is linked to that issue's workspace. Once that"
