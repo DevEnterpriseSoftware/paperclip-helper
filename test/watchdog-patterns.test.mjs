@@ -29,23 +29,23 @@ const agent = (db, name, status = "idle") => {
 // ---------------------------------------------------------------- 11. pure helpers
 
 test("runRefs finds runs by URL or by a run id, never a PR or issue number", () => {
-  assert.deepEqual(runRefs("Waiting on https://github.com/Org/App/actions/runs/39498202022/job/123 to finish"), [
-    { repo: "org/app", id: "39498202022" },
+  assert.deepEqual(runRefs("Waiting on https://github.com/Org/App/actions/runs/30498202022/job/123 to finish"), [
+    { repo: "org/app", id: "30498202022" },
   ]);
-  assert.deepEqual(runRefs("Blocked on a board re-run of CI run 39343878299 (attempt 2)."), [{ repo: null, id: "39343878299" }]);
-  assert.deepEqual(runRefs("waiting on run #39517675740; monitor 12 attempts"), [{ repo: null, id: "39517675740" }]);
-  assert.deepEqual(runRefs("PR #204 for DIR-448, see issue 1234567890 and commit 39517675740"), []);
+  assert.deepEqual(runRefs("Blocked on a board re-run of CI run 30343878299 (attempt 2)."), [{ repo: null, id: "30343878299" }]);
+  assert.deepEqual(runRefs("waiting on run #30517675740; monitor 12 attempts"), [{ repo: null, id: "30517675740" }]);
+  assert.deepEqual(runRefs("PR #204 for ACM-448, see issue 1234567890 and commit 30517675740"), []);
   assert.equal(runRefs("run 111111111 run 222222222 run 333333333 run 444444444").length, 3, "at most three");
 });
 
 test("waitingText reads the agent's latest comment and its monitor's notes", () => {
   const comments = [
     { authorUserId: "u", body: "board says hi" },
-    { authorAgentId: "a1", body: "waiting on run 39498202022" },
+    { authorAgentId: "a1", body: "waiting on run 30498202022" },
     { authorAgentId: "a1", body: "older: run 11111111111" },
   ];
-  assert.deepEqual(runRefs(waitingText(comments, "a1", null)), [{ repo: null, id: "39498202022" }]);
-  assert.deepEqual(runRefs(waitingText([], "a1", { notes: "poll run 39496790108" })), [{ repo: null, id: "39496790108" }]);
+  assert.deepEqual(runRefs(waitingText(comments, "a1", null)), [{ repo: null, id: "30498202022" }]);
+  assert.deepEqual(runRefs(waitingText([], "a1", { notes: "poll run 30496790108" })), [{ repo: null, id: "30496790108" }]);
 });
 
 test("a scheduled monitor still to act is left to Paperclip; a triggered, cleared or overdue one isn't", () => {
@@ -83,11 +83,11 @@ test("when the agent's latest comment names no run, its latest one that does cou
   const comments = [
     { authorAgentId: "a1", body: "Cleared a finished dependency; still waiting on CI.", createdAt: "2026-10-21T13:10:08Z" },
     { authorUserId: "u", body: "run 22222222222 from someone else" },
-    { authorAgentId: "a1", body: "Blocked on [the Windows job](https://github.com/org/app/actions/runs/39498202022/job/1).", createdAt: "2026-10-21T13:09:25Z" },
+    { authorAgentId: "a1", body: "Blocked on [the Windows job](https://github.com/org/app/actions/runs/30498202022/job/1).", createdAt: "2026-10-21T13:09:25Z" },
     { authorAgentId: "a1", body: "older: run 11111111111", createdAt: "2026-10-21T12:00:00Z" },
   ];
   const said = waitingOn(comments, "a1", null);
-  assert.deepEqual(runRefs(said.text), [{ repo: "org/app", id: "39498202022" }]);
+  assert.deepEqual(runRefs(said.text), [{ repo: "org/app", id: "30498202022" }]);
   assert.equal(said.saidAt, "2026-10-21T13:10:08Z", "when the agent last spoke is still its latest comment");
 });
 
@@ -101,9 +101,9 @@ test("only runs whose failed jobs are all known flaky are re-run", () => {
 });
 
 test("the CI message names the run, its result and the failed jobs", () => {
-  const run = { id: 7, name: "ci", run_attempt: 2, head_branch: "acm-1", head_sha: "b61d07a91abc", conclusion: "failure", updated_at: "2026-10-21T01:44:00Z", html_url: "https://github.com/org/app/actions/runs/7" };
+  const run = { id: 7, name: "ci", run_attempt: 2, head_branch: "acm-1", head_sha: "c0de12341abc", conclusion: "failure", updated_at: "2026-10-21T01:44:00Z", html_url: "https://github.com/org/app/actions/runs/7" };
   const text = ciMessage({ run, jobs: [{ name: "dotnet (windows)", conclusion: "failure" }], reruns: 1 });
-  assert.match(text, /ci run 7 \(attempt 2\) on `acm-1` at `b61d07a91`/);
+  assert.match(text, /ci run 7 \(attempt 2\) on `acm-1` at `c0de12341`/);
   assert.match(text, /\*\*failure\*\*/);
   assert.match(text, /Failed jobs: `dotnet \(windows\)`/);
   assert.match(text, /re-ran its failed jobs once/);
@@ -112,24 +112,24 @@ test("the CI message names the run, its result and the failed jobs", () => {
 
 // ---------------------------------------------------------------- 11. CI runs, end to end
 
-// Carla pushed, said she waits on run 39498202022, and stopped. The run finished
+// Carla pushed, said she waits on run 30498202022, and stopped. The run finished
 // 30 minutes ago; her last run on the issue ended before that.
-function waitingOnCi(env, { conclusion = "success", finishedMin = 30, comment = "Pushed b61d07a9. Waiting on run 39498202022 before resubmitting.", status = "blocked" } = {}) {
+function waitingOnCi(env, { conclusion = "success", finishedMin = 30, comment = "Pushed c0de1234. Waiting on run 30498202022 before resubmitting.", status = "blocked" } = {}) {
   const carla = agent(env.db, "Carla");
   const issue = { id: uuid(), identifier: "ACM-192", companyId: ids.company, status, assigneeAgentId: carla.id, updatedAt: minutesAgo(60) };
   env.db.issues.push(issue);
   env.db.comments.push({ issueId: issue.id, identifier: issue.identifier, body: comment, authorAgentId: carla.id, createdAt: minutesAgo(60) });
   env.db.issueRuns[issue.id] = [{ runId: uuid(), agentId: carla.id, status: "succeeded", createdAt: minutesAgo(70), startedAt: minutesAgo(70), finishedAt: minutesAgo(60) }];
   const run = {
-    id: 39498202022,
+    id: 30498202022,
     name: "ci",
     status: "completed",
     conclusion,
     run_attempt: 1,
     head_branch: "acm-192",
-    head_sha: "b61d07a91",
+    head_sha: "c0de12341",
     updated_at: minutesAgo(finishedMin),
-    html_url: "https://github.com/org/app/actions/runs/39498202022",
+    html_url: "https://github.com/org/app/actions/runs/30498202022",
     pull_requests: [{ number: 188 }],
     jobs: conclusion === "success" ? [] : [{ name: "e2e (windows)", conclusion: "failure" }, { name: "ci-gate", conclusion: "failure" }],
   };
@@ -202,7 +202,7 @@ test("a monitor still due that names the finished run is cleared in the same ste
   const env = await watchdogEnv(t);
   const { issue } = waitingOnCi(env);
   const stages = [{ id: "s1", type: "review", participants: [{ type: "user", userId: ids.user }] }];
-  const monitor = { nextCheckAt: new Date(env.clock.now + 30 * 60_000).toISOString(), notes: "Re-check CI run 39498202022", externalRef: "[redacted]" };
+  const monitor = { nextCheckAt: new Date(env.clock.now + 30 * 60_000).toISOString(), notes: "Re-check CI run 30498202022", externalRef: "[redacted]" };
   issue.executionPolicy = { stages, monitor };
   issue.executionState = { monitor: { status: "scheduled", nextCheckAt: monitor.nextCheckAt, notes: monitor.notes } };
   await env.watchdog.tick();
@@ -218,7 +218,7 @@ test("a monitor still due that names the finished run is cleared in the same ste
 test("a monitor that also watches another run, or one without its policy, is left alone; a monitor-only policy clears to none", async (t) => {
   const both = await watchdogEnv(t);
   const { issue } = waitingOnCi(both);
-  const notes = "CI run 39498202022, then the deploy run 39498299999 in org/infra";
+  const notes = "CI run 30498202022, then the deploy run 30498299999 in org/infra";
   const due = new Date(both.clock.now + 30 * 60_000).toISOString();
   issue.executionPolicy = { monitor: { nextCheckAt: due, notes } };
   issue.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes } };
@@ -227,13 +227,13 @@ test("a monitor that also watches another run, or one without its policy, is lef
 
   const orphan = await watchdogEnv(t);
   const lone = waitingOnCi(orphan).issue;
-  lone.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: "CI run 39498202022" } };
+  lone.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: "CI run 30498202022" } };
   await orphan.watchdog.tick();
   assert.equal(orphan.db.patches.length + helperComments(orphan.db, lone).length, 0);
 
   const only = await watchdogEnv(t);
   const solo = waitingOnCi(only).issue;
-  solo.executionPolicy = { monitor: { nextCheckAt: due, notes: "https://github.com/org/app/actions/runs/39498202022" } };
+  solo.executionPolicy = { monitor: { nextCheckAt: due, notes: "https://github.com/org/app/actions/runs/30498202022" } };
   solo.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: solo.executionPolicy.monitor.notes } };
   await only.watchdog.tick();
   assert.equal(only.db.patches.length, 1);
@@ -244,8 +244,8 @@ test("a paused task postpones the report and the clearing together; a dry run do
   const env = await watchdogEnv(t);
   const { issue } = waitingOnCi(env);
   const due = new Date(env.clock.now + 30 * 60_000).toISOString();
-  issue.executionPolicy = { monitor: { nextCheckAt: due, notes: "run 39498202022" } };
-  issue.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: "run 39498202022" } };
+  issue.executionPolicy = { monitor: { nextCheckAt: due, notes: "run 30498202022" } };
+  issue.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: "run 30498202022" } };
   issue.paused = true;
   await env.watchdog.tick();
   assert.equal(issue.executionState.monitor.status, "scheduled");
@@ -257,8 +257,8 @@ test("a paused task postpones the report and the clearing together; a dry run do
 
   const dry = await watchdogEnv(t, { DRY_RUN: "true" });
   const other = waitingOnCi(dry).issue;
-  other.executionPolicy = { monitor: { nextCheckAt: due, notes: "run 39498202022" } };
-  other.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: "run 39498202022" } };
+  other.executionPolicy = { monitor: { nextCheckAt: due, notes: "run 30498202022" } };
+  other.executionState = { monitor: { status: "scheduled", nextCheckAt: due, notes: "run 30498202022" } };
   await dry.watchdog.tick();
   assert.equal(dry.db.patches.length, 0);
   assert.equal(other.executionState.monitor.status, "scheduled");
@@ -267,7 +267,7 @@ test("a paused task postpones the report and the clearing together; a dry run do
 test("a monitor still due that names another run is left alone, and nothing is said", async (t) => {
   const env = await watchdogEnv(t);
   const { issue } = waitingOnCi(env);
-  const monitor = { nextCheckAt: new Date(env.clock.now + 30 * 60_000).toISOString(), notes: "Watching the release run 39498209999" };
+  const monitor = { nextCheckAt: new Date(env.clock.now + 30 * 60_000).toISOString(), notes: "Watching the release run 30498209999" };
   issue.executionPolicy = { monitor };
   issue.executionState = { monitor: { status: "scheduled", nextCheckAt: monitor.nextCheckAt, notes: monitor.notes } };
   await env.watchdog.tick();
@@ -279,7 +279,7 @@ test("a monitor still due that names another run is left alone, and nothing is s
 test("a run named only in a monitor's notes counts too", async (t) => {
   const env = await watchdogEnv(t);
   const { issue } = waitingOnCi(env, { comment: "Handing off to the monitor." });
-  issue.executionState = { monitor: { status: "triggered", serviceName: "github-actions", notes: "CI run 39498202022 on acm-192" } };
+  issue.executionState = { monitor: { status: "triggered", serviceName: "github-actions", notes: "CI run 30498202022 on acm-192" } };
   await env.watchdog.tick();
   assert.equal(helperComments(env.db, issue).length, 1);
 });
@@ -288,19 +288,19 @@ test("a run named only in a monitor's notes counts too", async (t) => {
 // had used up its attempts and fired for the last time before the run finished.
 test("a run named before the agent's latest comment is reported once its monitor has given up", async (t) => {
   const env = await watchdogEnv(t);
-  const { carla, issue } = waitingOnCi(env, { comment: "Blocked on queued CI: https://github.com/org/app/actions/runs/39498202022/job/1. The monitor's attempts are used up." });
+  const { carla, issue } = waitingOnCi(env, { comment: "Blocked on queued CI: https://github.com/org/app/actions/runs/30498202022/job/1. The monitor's attempts are used up." });
   env.db.comments.find((c) => c.issueId === issue.id).createdAt = minutesAgo(61);
   env.db.comments.push({ issueId: issue.id, body: "Cleared a finished dependency; still waiting on CI. Monitor exhausted.", authorAgentId: carla.id, createdAt: minutesAgo(60) });
   const ago = (min) => new Date(env.clock.now - min * 60_000).toISOString();
   issue.executionState = { monitor: { status: "triggered", notes: null, nextCheckAt: null, timeoutAt: ago(20), attemptCount: 12, maxAttempts: 12 } };
   await env.watchdog.tick();
   assert.equal(helperComments(env.db, issue).length, 1);
-  assert.match(helperComments(env.db, issue)[0].body, /run 39498202022/);
+  assert.match(helperComments(env.db, issue)[0].body, /run 30498202022/);
 });
 
 test("a run that finished before the agent's latest comment isn't reported, even when that comment names no run", async (t) => {
   const env = await watchdogEnv(t);
-  const { carla, issue } = waitingOnCi(env, { comment: "Waiting on run 39498202022." });
+  const { carla, issue } = waitingOnCi(env, { comment: "Waiting on run 30498202022." });
   env.db.comments.push({ issueId: issue.id, body: "Saw CI; resubmitting.", authorAgentId: carla.id, createdAt: minutesAgo(20) });
   await env.watchdog.tick();
   assert.equal(helperComments(env.db, issue).length, 0);
@@ -365,7 +365,7 @@ test("why a finished run isn't reported is logged at debug level, once per run a
 
 test("a token that may not read a repository's runs is warned about once", async (t) => {
   const env = await watchdogEnv(t);
-  const { issue } = waitingOnCi(env, { comment: "waiting on https://github.com/org/app/actions/runs/39498202022" });
+  const { issue } = waitingOnCi(env, { comment: "waiting on https://github.com/org/app/actions/runs/30498202022" });
   env.gh.fail["GET run"] = 403;
   await env.watchdog.tick();
   env.later(10);
@@ -386,12 +386,12 @@ test("without a GitHub token the check is off; a run outside GITHUB_REPOS is nev
   const carla = agent(off.db, "Carla");
   const issue = { id: uuid(), identifier: "ACM-1", companyId: ids.company, status: "blocked", assigneeAgentId: carla.id, updatedAt: minutesAgo(60) };
   off.db.issues.push(issue);
-  off.db.comments.push({ issueId: issue.id, body: "waiting on run 39498202022", authorAgentId: carla.id });
+  off.db.comments.push({ issueId: issue.id, body: "waiting on run 30498202022", authorAgentId: carla.id });
   await off.watchdog.tick();
   assert.equal(helperComments(off.db, issue).length, 0);
 
   const env = await watchdogEnv(t);
-  const { issue: other } = waitingOnCi(env, { comment: "waiting on https://github.com/elsewhere/repo/actions/runs/39498202022" });
+  const { issue: other } = waitingOnCi(env, { comment: "waiting on https://github.com/elsewhere/repo/actions/runs/30498202022" });
   await env.watchdog.tick();
   assert.equal(helperComments(env.db, other).length, 0);
   assert.ok(!env.gh.requests.some((r) => r.path.includes("elsewhere")));
@@ -497,11 +497,11 @@ test("the default branch is read once per repository; while GitHub won't say, a 
 test("known flaky jobs are re-run first, then the passing attempt is reported", async (t) => {
   const env = await watchdogEnv(t, { WATCHDOG_CI_RERUN_JOBS: "\\(windows\\)|^ci-gate$" });
   const { issue, run } = waitingOnCi(env, { conclusion: "failure" });
-  env.gh.pulls["org/app"] = [{ number: 188, state: "open", head: { sha: "b61d07a91" }, base: { ref: "main" } }];
+  env.gh.pulls["org/app"] = [{ number: 188, state: "open", head: { sha: "c0de12341" }, base: { ref: "main" } }];
   run.onRerun = (r) => Object.assign(r, { status: "queued", run_attempt: 2 });
 
   await env.watchdog.tick();
-  assert.deepEqual(env.gh.reruns, [{ repo: "org/app", id: "39498202022" }]);
+  assert.deepEqual(env.gh.reruns, [{ repo: "org/app", id: "30498202022" }]);
   assert.equal(helperComments(env.db, issue).length, 0, "no comment for the re-run itself");
   assert.equal(env.watchdog.stats.ciReruns, 1);
 
@@ -535,7 +535,7 @@ test("a re-run GitHub refuses is reported instead, once", async (t) => {
   const env = await watchdogEnv(t, { WATCHDOG_CI_RERUN_JOBS: "windows" });
   const { issue, run } = waitingOnCi(env, { conclusion: "failure" });
   run.jobs = [{ name: "e2e (windows)", conclusion: "failure" }];
-  env.gh.pulls["org/app"] = [{ number: 188, state: "open", head: { sha: "b61d07a91" }, base: { ref: "main" } }];
+  env.gh.pulls["org/app"] = [{ number: 188, state: "open", head: { sha: "c0de12341" }, base: { ref: "main" } }];
   env.gh.fail["POST rerun"] = 403;
   await env.watchdog.tick();
   assert.equal(helperComments(env.db, issue).length, 1);
@@ -577,8 +577,8 @@ function answeredOnReview(env, { answeredMin = 40, agentRanSince = false } = {})
     resolvedByUserId: ids.user,
     resolvedAt: minutesAgo(answeredMin),
     createdAt: minutesAgo(600),
-    payload: { questions: [{ id: "q1", prompt: "Paste the elevated Windows run's verifier line", options: [{ id: "o1", label: "GREEN" }, { id: "o2", label: "RED" }] }] },
-    result: { version: 1, answers: [{ questionId: "q1", optionIds: ["o1"], otherText: "69/0/0 at 2bfde26" }] },
+    payload: { questions: [{ id: "q1", prompt: "Paste the test run's summary line", options: [{ id: "o1", label: "GREEN" }, { id: "o2", label: "RED" }] }] },
+    result: { version: 1, answers: [{ questionId: "q1", optionIds: ["o1"], otherText: "69/0/0 at 0123abc" }] },
   };
   env.db.interactions[issue.id] = [card];
   env.db.issueRuns[issue.id] = [{ runId: uuid(), agentId: carla.id, status: "succeeded", createdAt: minutesAgo(700), startedAt: minutesAgo(700) }];
@@ -593,8 +593,8 @@ test("an answer given while the issue waited on your review goes back to the age
   assert.equal(env.db.patches.length, 1);
   const { body } = env.db.patches[0];
   assert.equal(body.status, "in_progress", "your 'changes requested' decision: Paperclip returns it to returnAssignee");
-  assert.ok(body.comment.startsWith(`[@Carla](agent://${carla.id}) your card on this issue ("Paste the elevated Windows run's verifier line") was answered`));
-  assert.match(body.comment, /> Paste the elevated Windows run's verifier line: GREEN; 69\/0\/0 at 2bfde26/);
+  assert.ok(body.comment.startsWith(`[@Carla](agent://${carla.id}) your card on this issue ("Paste the test run's summary line") was answered`));
+  assert.match(body.comment, /> Paste the test run's summary line: GREEN; 69\/0\/0 at 0123abc/);
   assert.match(body.comment, /_Paperclip Helper watchdog\._$/);
   assert.equal(env.watchdog.stats.returned, 1);
 
@@ -638,7 +638,7 @@ test("answerText renders every kind of answer", () => {
 
 function escalated(env, { pendingCardForYou = false } = {}) {
   const carla = agent(env.db, "Carla");
-  const jian = agent(env.db, "Jian-Yang");
+  const monica = agent(env.db, "Monica");
   const issue = {
     id: uuid(),
     identifier: "ACM-622",
@@ -647,7 +647,7 @@ function escalated(env, { pendingCardForYou = false } = {}) {
     assigneeUserId: ids.user,
     assigneeAgentId: null,
     updatedAt: minutesAgo(30),
-    executionPolicy: { stages: [{ id: "s1", type: "review", participants: [{ type: "agent", agentId: jian.id }] }, { id: "s2", type: "approval", participants: [{ type: "user", userId: ids.user }] }] },
+    executionPolicy: { stages: [{ id: "s1", type: "review", participants: [{ type: "agent", agentId: monica.id }] }, { id: "s2", type: "approval", participants: [{ type: "user", userId: ids.user }] }] },
     executionState: {
       status: "pending",
       currentStageId: "s1",
@@ -659,10 +659,10 @@ function escalated(env, { pendingCardForYou = false } = {}) {
     },
   };
   env.db.issues.push(issue);
-  env.db.comments.push({ issueId: issue.id, body: "Revision 5 still lacks the four proofs.", authorAgentId: jian.id, createdAt: minutesAgo(31) });
-  env.db.issueRuns[issue.id] = [{ runId: uuid(), agentId: jian.id, status: "succeeded", createdAt: minutesAgo(35), startedAt: minutesAgo(35) }];
+  env.db.comments.push({ issueId: issue.id, body: "Revision 5 still lacks the four proofs.", authorAgentId: monica.id, createdAt: minutesAgo(31) });
+  env.db.issueRuns[issue.id] = [{ runId: uuid(), agentId: monica.id, status: "succeeded", createdAt: minutesAgo(35), startedAt: minutesAgo(35) }];
   if (pendingCardForYou) env.db.interactions[issue.id] = [{ id: uuid(), kind: "ask_user_questions", status: "pending", addresseeUserId: ids.user, createdByAgentId: carla.id, createdAt: minutesAgo(40) }];
-  return { carla, jian, issue };
+  return { carla, monica, issue };
 }
 
 test("escalatedReview spots Paperclip's review-round escalation and nothing else", () => {
@@ -692,7 +692,7 @@ test("with it on, the review goes back to the implementer with the reviewer's re
   assert.equal(env.db.patches.length, 1);
   const { body } = env.db.patches[0];
   assert.equal(body.status, "in_progress");
-  assert.ok(body.comment.startsWith(`[@Carla](agent://${carla.id}) Jian-Yang requested changes again, and after 3 rounds`));
+  assert.ok(body.comment.startsWith(`[@Carla](agent://${carla.id}) Monica requested changes again, and after 3 rounds`));
   assert.match(body.comment, /> Revision 5 still lacks the four proofs\./);
 
   // Escalated again, with a new decision: the budget (WATCHDOG_MAX_NUDGES = 1) is used up.
@@ -741,24 +741,24 @@ test("an issue blocked by a cancelled issue is told why, once", async (t) => {
 // ---------------------------------------------------------------- review findings
 
 test("runRefs puts the newest run first and ignores check-run ids", () => {
-  assert.deepEqual(runRefs("the failure in https://github.com/org/app/actions/runs/39400000000 is fixed; waiting on run 39500000000").map((r) => r.id), [
-    "39500000000",
-    "39400000000",
+  assert.deepEqual(runRefs("the failure in https://github.com/org/app/actions/runs/30400000000 is fixed; waiting on run 30500000000").map((r) => r.id), [
+    "30500000000",
+    "30400000000",
   ]);
   assert.deepEqual(runRefs("see check run 41234567890"), []);
 });
 
 test("while the newest run named is still going, an older finished one isn't reported", async (t) => {
   const env = await watchdogEnv(t);
-  const { issue } = waitingOnCi(env, { comment: "Run 39498202022 failed, fixed it; waiting on run 39598202022 now." });
-  env.gh.runs["org/app"][39598202022] = { id: 39598202022, status: "in_progress", run_attempt: 1, updated_at: minutesAgo(1) };
+  const { issue } = waitingOnCi(env, { comment: "Run 30498202022 failed, fixed it; waiting on run 30598202022 now." });
+  env.gh.runs["org/app"][30598202022] = { id: 30598202022, status: "in_progress", run_attempt: 1, updated_at: minutesAgo(1) };
   await env.watchdog.tick();
   assert.equal(helperComments(env.db, issue).length, 0);
 });
 
 test("a run the agent wrote about after it finished, or one cancelled, isn't reported", async (t) => {
   const env = await watchdogEnv(t);
-  const { issue } = waitingOnCi(env, { comment: "CI run 39498202022 passed, submitting." });
+  const { issue } = waitingOnCi(env, { comment: "CI run 30498202022 passed, submitting." });
   env.db.comments.find((c) => c.issueId === issue.id).createdAt = minutesAgo(20); // after the run finished (30 min ago)
   await env.watchdog.tick();
   assert.equal(helperComments(env.db, issue).length, 0, "it watched the run itself");
@@ -838,7 +838,7 @@ function runnerDown(env, prs = 3) {
   const out = [];
   for (let i = 0; i < prs; i += 1) {
     const a = agent(env.db, `Agent ${i + 1}`);
-    const id = 39600000000 + i;
+    const id = 30600000000 + i;
     const issue = { id: uuid(), identifier: `ACM-${300 + i}`, companyId: ids.company, status: "in_progress", assigneeAgentId: a.id, updatedAt: minutesAgo(60) };
     env.db.issues.push(issue);
     env.db.comments.push({ issueId: issue.id, identifier: issue.identifier, body: `Pushed. Waiting on run ${id}.`, authorAgentId: a.id, createdAt: minutesAgo(60) });
@@ -850,7 +850,7 @@ function runnerDown(env, prs = 3) {
     };
     out.push({ agent: a, issue, id });
   }
-  env.gh.annotations[(39600000000) * 10] = [{ annotation_level: "failure", message: "Runner quarantined: machine verification failed (TPM attestation)" }];
+  env.gh.annotations[(30600000000) * 10] = [{ annotation_level: "failure", message: "Runner quarantined: machine verification failed (TPM attestation)" }];
   return out;
 }
 

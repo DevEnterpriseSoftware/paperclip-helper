@@ -13,7 +13,7 @@ const ISOLATED = {
   executionWorkspaceSettings: { mode: "isolated_workspace", environmentId: null },
 };
 
-// DIR-318's workspace, closed after DIR-318 finished; DIR-415 and DIR-416 were
+// ACM-318's workspace, closed after ACM-318 finished; ACM-415 and ACM-416 were
 // created from its work and still point at it.
 function seed(db, { wsStatus = "archived", ownerStatus = "done" } = {}) {
   const agent = { id: uuid(), companyId: ids.company, name: "Gilfoyle", status: "idle" };
@@ -62,10 +62,10 @@ const setupFailed = (agentId, wsId, identifier) => ({
 });
 
 test("the dead-link error is recognised, with and without a cause", () => {
-  const id = "0b4a273f-270a-4cfe-8ec4-c4313d91194e";
-  assert.equal(deadLinkWorkspaceId(setupFailed("x", id, "DIR-415").error), id);
+  const id = "1a2b3c4d-0000-4000-8000-000000000004";
+  assert.equal(deadLinkWorkspaceId(setupFailed("x", id, "ACM-415").error), id);
   assert.equal(
-    deadLinkWorkspaceId(`Issue DIR-1 requested inherited execution workspace reuse for ${id.toUpperCase()}, but the workspace could not be restored because ENOENT.`),
+    deadLinkWorkspaceId(`Issue ACM-1 requested inherited execution workspace reuse for ${id.toUpperCase()}, but the workspace could not be restored because ENOENT.`),
     id,
   );
   assert.equal(deadLinkWorkspaceId("Workspace validation failed"), null);

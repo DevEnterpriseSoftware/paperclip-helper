@@ -16,7 +16,7 @@ async function watchdogEnv(t, extra = {}) {
   return { ...env, clock, watchdog: createWatchdog(env.ctx, env.state), later: (min) => (clock.now += min * 60_000) };
 }
 
-// Carla asks Gilfoyle on her own issue, DIR-479; the wake Paperclip sent him
+// Carla asks Gilfoyle on her own issue, ACM-479; the wake Paperclip sent him
 // was cancelled before it started, as it is for every non-assignee.
 function strandedQuestion(db, { askedMinutesAgo = 60, addresseeStatus = "idle", status = "in_review" } = {}) {
   const carla = { id: uuid(), companyId: ids.company, name: "Carla", status: "idle" };

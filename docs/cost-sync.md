@@ -107,10 +107,10 @@ Acme: subscription runs, 2026-10-10 to 2026-10-17 against 2026-10-17 to 2026-10-
 A post Paperclip refuses because of the event itself (`400`, `404`, `422`) wasn't recorded, and posting the same event again won't help, so cost sync skips that run rather than retrying it every pass. The log says what was wrong, once per run:
 
 ```text
-{"level":"warn","msg":"cost sync: Paperclip's answer to a rejected cost event","run":"60e17fd8-…","status":400,
+{"level":"warn","msg":"cost sync: Paperclip's answer to a rejected cost event","run":"11111111-…","status":400,
  "response":{"error":"Validation error","details":[{"code":"invalid_value","values":["reported","unpriced"],"path":["costStatus"],"message":"Invalid option: expected one of \"reported\"|\"unpriced\""}]},
  "fields":["idempotencyKey","agentId","heartbeatRunId","issueId","provider","biller","billingType","costStatus","model","inputTokens","cachedInputTokens","outputTokens","costCents","occurredAt"]}
-{"level":"error","msg":"cost sync: Paperclip rejected a cost event; skipping that run (`pch costs --retry-skipped` posts it again)","run":"60e17fd8-…",
+{"level":"error","msg":"cost sync: Paperclip rejected a cost event; skipping that run (`pch costs --retry-skipped` posts it again)","run":"11111111-…",
  "error":"POST /api/companies/…/cost-events → 400: Validation error (costStatus: Invalid option: expected one of \"reported\"|\"unpriced\")"}
 ```
 
@@ -121,7 +121,7 @@ Once the cause is fixed (a Helper update, a price, Paperclip itself), post those
 ```text
 $ pch costs --retry-skipped
 8 skipped runs are queued to be posted again:
-  60e17fd8-bbeb-4f13-9a6d-e5107c3436de   rejected: POST /api/companies/…/cost-events → 400: Validation error
+  11111111-2222-4333-8444-555555555555   rejected: POST /api/companies/…/cost-events → 400: Validation error
   …
 The service posts them on its next cost-sync pass (every 15 min); `pch status` shows the posts, and the log any rejection again.
 ```

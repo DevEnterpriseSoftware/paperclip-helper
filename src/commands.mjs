@@ -10,8 +10,8 @@ import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, paused
 import { createCostSync } from "./cost-sync.mjs";
 import { blocked as blockedReport } from "./blocked.mjs";
 import {
-  actsAsUser, continuationText, continuePausedHold, CONVERSATION_ADAPTERS, defaultOutcome, holdFacts, neverStarted, pausedHold, releaseHold, releaseProblems,
-  RELEASE_OUTCOMES, unprovable,
+  actsAsUser, claimedOnly, continuationText, continuePausedHold, CONVERSATION_ADAPTERS, defaultOutcome, handOnRoute, handOnText, heldReviewRoute, holdFacts,
+  neverStarted, pausedHold, releaseHandedOn, releaseHeldReview, releaseHold, releaseProblems, releaseRebuiltReview, RELEASE_OUTCOMES, unprovable,
 } from "./release.mjs";
 import { unstartedHoldRemedy } from "./unstarted-holds.mjs";
 import {
@@ -316,15 +316,94 @@ export async function release(ctx, identifier, { apply = false, outcome = null }
     return;
   }
   const unstarted = neverStarted(facts);
-  if (unstarted) {
+  if (unstarted && claimedOnly(run)) {
+    out(`Paperclip claimed this run, then cancelled it while it was still preparing, before it reached its adapter (${run.errorCode}):`);
+    out("no process, adapter invocation, session, usage, lease or execution event. There is nothing to reconcile, and Paperclip can't release the hold by itself.");
+  } else if (unstarted) {
     out(`Paperclip cancelled this run before it started (${run.errorCode}): no start, process, session, usage, lease or execution event.`);
     out("There is nothing to reconcile, and Paperclip can't release the hold by itself.");
   } else if (unprovable(facts)) out("Paperclip can't release this by itself: the run recorded no process it could check.");
 
-  const problems = releaseProblems(facts);
+  // A held review, released without ending it (release.mjs heldReviewRoute).
+  const route = heldReviewRoute(facts);
+  const stage = issue.executionState;
+  // The issue belongs to someone else: the held run's agent is asked to hand it on (release.mjs handOnRoute).
+  const handOn = route ? null : handOnRoute(facts);
+  const target = handOn ? await ctx.api.request("GET", `/api/agents/${handOn.targetAgentId}`).catch(() => null) : null;
+  const problems = releaseProblems(facts, { heldReview: true, handOn: Boolean(handOn) });
+  if (handOn && (!target || target.status === "terminated")) problems.push(`the issue is to go to ${target?.name ?? "an agent"} that ${target ? "is terminated" : "couldn't be read"}`);
+  if (route === "lossless" && issue.status === "blocked" && apply && !actsAsUser(await ctx.identity())) {
+    problems.push("only a board user's comment moves a blocked review to todo with its stage kept, and this key doesn't comment as one");
+  }
   if (problems.length) {
-    const remedy = unstarted ? ` ${unstartedHoldRemedy({ problems, errorCode: run.errorCode, identifier, ownerName: agent?.name ?? null })}` : "";
+    const returnId = stage?.returnAssignee?.agentId;
+    const returnName = returnId ? (await ctx.api.request("GET", `/api/agents/${returnId}`).catch(() => null))?.name ?? null : null;
+    const remedy = unstarted
+      ? ` ${unstartedHoldRemedy({ problems, errorCode: run.errorCode, identifier, ownerName: agent?.name ?? null, returnName, claimed: claimedOnly(run) })}`
+      : "";
     throw new Error(`Not releasing: ${problems.join("; ")}. Nothing changed.${remedy}`);
+  }
+  if (route === "lossless") {
+    if (!apply) {
+      out("");
+      out(`${identifier} is in a review (${stage.currentStageType ?? "review"} stage ${(stage.currentStageIndex ?? 0) + 1}) that Paperclip keeps while it holds the issue.`);
+      out(`--apply ${issue.status === "blocked" ? "comments, as you, asking the reviewer to carry on (which moves it to todo with the review kept), then " : ""}records, as the board, that this run`);
+      out(`${actionOutcome === "not_performed" ? "performed nothing" : `has stopped and that what it did is ${actionOutcome === "mixed" ? "unverified (mixed)" : actionOutcome.replace("_", " ")}`}, puts ${identifier} back in review with the same stage, reviewer`);
+      out(`and return assignee, and ${saved ? "delivers the saved messages" : "lets the next message start a run"}. Each step is checked; the review is never ended.`);
+      out(`  pch release ${identifier} --apply${outcomeFlag}`);
+      return;
+    }
+    const result = await releaseHeldReview(ctx.api, facts, {
+      actionOutcome,
+      signature: `\n\n${COMMAND_SIGNATURE}`,
+      comment:
+        "Paperclip held this review behind a run of yours that can't be continued, so nothing reached you. It is released now, with the review as it was: please carry on with your review. " +
+        `If a message here asks for changes to the work (merge conflicts, say), those are for the implementer: request changes rather than making them yourself.\n\n${COMMAND_SIGNATURE}`,
+    });
+    out(`${identifier}: hold released, review kept (${result.status}).`);
+    if (result.delivered) out(`Delivered ${result.delivered} saved message(s) to ${agent?.name ?? "the reviewer"}.`);
+    else if (result.byPaperclip) out(`Paperclip started the ${result.byPaperclip} saved message(s) itself once the hold was gone.`);
+    return;
+  }
+  if (route === "rebuild") {
+    const name = (id) => (id === agent?.id ? agent.name : id);
+    if (!apply) {
+      out("");
+      out(`${identifier} is in review, at its first stage with nothing in it completed. Paperclip releases a hold there only by ending the review,`);
+      out(`so --apply ends it, records, as the board, that this run ${actionOutcome === "not_performed" ? "performed nothing" : `is ${actionOutcome.replace("_", " ")}`}, gives the issue to its implementer a moment`);
+      out(`(in backlog, so no run starts), and asks for the review again with ${agent?.name ?? "the same reviewer"}: Paperclip starts the same first stage,`);
+      out(`returning to the same implementer${stage.reviewRequest ? ", with the review request passed back" : ""}. Saved messages stay on the issue for the review run.`);
+      out(`  pch release ${identifier} --apply${outcomeFlag}`);
+      return;
+    }
+    const result = await releaseRebuiltReview(ctx.api, facts, { actionOutcome, signature: `\n\n${COMMAND_SIGNATURE}` });
+    out(`${identifier}: hold released, review started again at its first stage with ${name(stage.currentParticipant.agentId)} (${result.status}).`);
+    return;
+  }
+  if (handOn) {
+    const owner = agent?.name ?? "the held run's agent";
+    if (!apply) {
+      out("");
+      out(
+        handOn.kind === "owner-moved"
+          ? `${identifier} is ${target.name}'s now, and Paperclip accepts the release only while it is ${owner}'s. --apply gives it back to ${owner} a moment,`
+          : `The held run was ${owner}'s review, which has ended, so the saved messages are ${target.name}'s work, not ${owner}'s. --apply`,
+      );
+      out(`comments, as you, asking ${owner} to reassign it to ${target.name} and change nothing else, records, as the board, that this run`);
+      out(`${actionOutcome === "not_performed" ? "performed nothing" : `is ${actionOutcome.replace("_", " ")}`}, and delivers the saved messages, so ${owner}'s run starts now and hands it on. That reassignment, from`);
+      out(`${owner}'s own run, is what leaves no new hold: a board reassignment while ${owner} has a run queued or starting on it cancels that run and holds it again.`);
+      out(`  pch release ${identifier} --apply${outcomeFlag}`);
+      return;
+    }
+    const result = await releaseHandedOn(ctx.api, facts, {
+      route: handOn,
+      actionOutcome,
+      signature: `\n\n${COMMAND_SIGNATURE}`,
+      comment: handOnText({ route: handOn, holdAgent: agent, target, errorCode: run?.errorCode ?? "cancelled", signature: `\n\n${COMMAND_SIGNATURE}` }),
+    });
+    out(`${identifier}: hold released${result.reassigned ? `, given back to ${owner} a moment` : ""}, and ${owner} asked to reassign it to ${target.name} (${result.status}).`);
+    out(`In a few minutes, check that ${target.name} has it (\`pch why ${identifier}\`). If not, and nothing of ${owner}'s is queued or running there, assign it to ${target.name} yourself.`);
+    return;
   }
   if (!apply) {
     out("");
@@ -771,7 +850,7 @@ export async function models(ctx) {
 
 // Why a paused agent is paused, as far as Paperclip shows: its holds (or, before
 // 2026.10, its pause reason), a pause or resume Paperclip hasn't finished, and since when.
-// " (no hold, still pausing, since 2026-10-31 21:48 UTC)": nothing holds it, but its pause
+// " (no hold, still pausing, since 2026-01-15 09:30 UTC)": nothing holds it, but its pause
 // never finished, so a resume can't take effect yet (docs/paperclip-internals.md, Agents).
 export function pauseDetail(agent) {
   if (agent?.status !== "paused") return "";
@@ -880,7 +959,7 @@ function ago(iso) {
   return `${Math.round(s / 3600)} h ago`;
 }
 
-// Paperclip's version and build commit, e.g. "2026.1001.0, commit 8f8a0ab".
+// Paperclip's version and build commit, e.g. "2026.1001.0, commit 0123abc".
 // Its health endpoint reports them only to an authenticated caller, so this
 // asks with the helper's key. Null when it reports neither.
 export async function paperclipBuild(ctx) {

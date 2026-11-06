@@ -18,7 +18,9 @@ import { escalatedReview } from "./board-held.mjs";
 import { PARTICIPANT_RECOVERY_CAUSE } from "./resume.mjs";
 import { pausedHoldWhy } from "./paused-holds.mjs";
 import { CONVERSATION_ADAPTERS } from "./release.mjs";
-import { unstartedHoldRemedy, unstartedHoldWhy } from "./unstarted-holds.mjs";
+import { HAND_ON_CHECK_MS, unstartedHoldRemedy, unstartedHoldWhy } from "./unstarted-holds.mjs";
+
+const HAND_ON_CHECK_MIN = Math.round(HAND_ON_CHECK_MS / 60_000);
 import { extensionAdvice, validationAdvice } from "./worktree-links.mjs";
 
 const ASLEEP = new Set(["paused", "terminated", "pending_approval"]);
@@ -60,7 +62,7 @@ export function advise(facts) {
     ciBackstop = null, // the watchdog's backstop monitor for that wait stands: { nextCheckAt }
     selfWake = null, // an agent keeps waking itself with its runs' posted final messages (self-wakes.mjs): { name, count }
     pauseHold = null, // the hold is from a run a pause cancelled (watchdog 18): { ownerName, runId, waiting, held }
-    unstartedHold = null, // the hold is from a run Paperclip cancelled before it started (watchdog 22): { ownerName, runId, errorCode, problems }
+    unstartedHold = null, // the hold is from a run Paperclip cancelled before it started (watchdog 22): { ownerName, runId, errorCode, problems, route }
     workspaceValidation = null, // Paperclip refused the assignee's runs at setup on the workspace (worktree-links.mjs): { reason, reasonCode, paths, repoUrl, nextAction }
     extensionError = null, // an agent's build fails on extensions.relativeWorktrees (worktree-links.mjs): { paths, in }
     config = {},
@@ -292,15 +294,48 @@ export function advise(facts) {
     if (problems.length) {
       return {
         what: `${what} It can't be released yet: ${problems.join("; ")}.`,
-        steps: [unstartedHoldRemedy({ problems, errorCode: unstartedHold.errorCode, identifier, ownerName: unstartedHold.ownerName })],
+        steps: [unstartedHoldRemedy({ problems, errorCode: unstartedHold.errorCode, identifier, ownerName: unstartedHold.ownerName, returnName: unstartedHold.returnName, claimed: unstartedHold.claimed })],
         watchdog: "manual",
       };
     }
+    // The issue belongs to someone else (release.mjs handOnRoute): the held run's agent is asked to hand it on.
+    if (unstartedHold.handOn) {
+      const owner = unstartedHold.ownerName ?? "the held run's agent";
+      const target = unstartedHold.targetName ?? "its owner";
+      const moved = unstartedHold.handOn.kind === "owner-moved";
+      return {
+        what:
+          `${what} ` +
+          (moved
+            ? `It is ${target}'s now, and Paperclip releases the hold only while it is ${owner}'s: the release gives it back to ${owner} a moment and asks ${owner} to reassign it to ${target}, so the board's reassignment can't cancel a run of ${owner}'s and hold the issue again.`
+            : `It was ${owner}'s review, which has ended: the release asks ${owner} to give the issue back to ${target}, rather than handing ${owner} the saved messages, which are ${target}'s work.`),
+        steps: [
+          `pch release ${identifier}   (shows what that does)`,
+          `pch release ${identifier} --apply   (does it; check a few minutes later that ${target} has the issue)`,
+        ],
+        watchdog: releasing ? "auto" : "manual",
+        autoNote: `The watchdog does this by itself (WATCHDOG_RELEASE_HOLDS), tells the board, and if ${owner} hasn't handed it on ${HAND_ON_CHECK_MIN} minutes later and nothing of ${owner}'s runs there, reassigns it to ${target} itself.`,
+      };
+    }
+    // A held review (release.mjs heldReviewRoute): released without ending it.
+    if (unstartedHold.route === "rebuild") {
+      return {
+        what: `${what} It is in review, at its first stage with nothing in it completed: Paperclip releases a hold there only by ending the review, so the release starts the same first stage again, with the same reviewer and implementer.`,
+        steps: [
+          `pch release ${identifier}   (shows what that does)`,
+          `pch release ${identifier} --apply   (releases the hold and starts the review again; saved messages stay on the issue for the review run)`,
+        ],
+        watchdog: releasing ? "auto" : "manual",
+        autoNote: "The watchdog does this by itself (WATCHDOG_RELEASE_HOLDS) and tells the board.",
+      };
+    }
     return {
-      what,
+      what: unstartedHold.route === "lossless" ? `${what} The review is kept: Paperclip parked it with its stage pending.` : what,
       steps: [
         `pch release ${identifier}   (shows the run and what releasing it does)`,
-        `pch release ${identifier} --apply   (records that the run performed nothing, moves the issue to todo and delivers the saved messages)`,
+        unstartedHold.route === "lossless"
+          ? `pch release ${identifier} --apply   (records that the run performed nothing and puts the issue back in review with the same stage, reviewer and return assignee, then delivers the saved messages)`
+          : `pch release ${identifier} --apply   (records that the run performed nothing, moves the issue to todo and delivers the saved messages)`,
       ],
       watchdog: releasing ? "auto" : "manual",
       autoNote: "The watchdog does this by itself once the run ended a stall window ago and the assignee is available (WATCHDOG_RELEASE_HOLDS), and tells the board.",

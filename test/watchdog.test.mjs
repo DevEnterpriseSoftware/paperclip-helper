@@ -113,7 +113,7 @@ test("wakes deferred for other agents don't hide a dropped hand-off from the ass
 });
 
 test("runs Paperclip refused before they started don't count as the owner having run", async (t) => {
-  // DIR-91: the reviewer's runs after the hand-off were cancelled at admission
+  // The reviewer's runs after the hand-off were cancelled at admission
   // (execution_reconciliation_required) and its wakes skipped. The hold cleared
   // later, and nothing woke the reviewer again.
   const env = await watchdogEnv(t);
@@ -452,7 +452,7 @@ test("finalize failures younger than the stall window, or healing turned off, ar
   assert.equal(env.db.patches.length, 0);
 });
 
-// DIR-86: Paperclip's recovery gave up on a run cancelled at a hand-off and marked
+// Paperclip's recovery gave up on a run cancelled at a hand-off and marked
 // the issue blocked, with no linked blocker and a saved message waiting.
 function recoveryHold(env, { errorCode = "issue_reassigned" } = {}) {
   const { engineer, reviewer } = agents(env.db);
@@ -543,7 +543,7 @@ test("a blocked issue with no linked blocker and no recovery hold is left alone"
 });
 
 test("no repair and no hold release while the assignee is paused", async (t) => {
-  // DIR-109: the repair moved the issue to todo while its assignee was paused, and
+  // The repair moved the issue to todo while its assignee was paused, and
   // Paperclip's recovery blocked it again for a board decision.
   // (No settle window after the resume here: watchdog-resume.test.mjs covers it.)
   const env = await watchdogEnv(t, { WATCHDOG_RESUME_SETTLE_MIN: "0" });
@@ -572,7 +572,7 @@ test("no repair and no hold release while the assignee is paused", async (t) => 
   assert.equal(env.db.interrupts.length, 1);
 });
 
-// DIR-109: Paperclip's recovery sweep ran while the assignee was paused, recorded a
+// Paperclip's recovery sweep ran while the assignee was paused, recorded a
 // recovery action for the board and marked the issue blocked. Nothing un-parks it.
 function parkedIssue(env, action = {}) {
   const { engineer } = agents(env.db);
@@ -618,7 +618,7 @@ test("an issue Paperclip's recovery parked is nudged once its assignee is availa
 });
 
 test("the nudge budget for a parked issue survives a new recovery action", async (t) => {
-  // DIR-268: every failed retry chain made a new recovery action, and a budget per action never ran out.
+  // Every failed retry chain made a new recovery action, and a budget per action never ran out.
   const env = await watchdogEnv(t);
   const { issue, engineer } = parkedIssue(env);
   for (let i = 0; i < 4; i++) {
@@ -704,7 +704,7 @@ test("any other kind of recovery action, or a running run, is left to the board"
   assert.equal(env2.db.comments.length, 0);
 });
 
-// DIR-52: Carla's run was cut off at a hand-off and recorded no process, so
+// Carla's run was cut off at a hand-off and recorded no process, so
 // Paperclip held the issue for reconciliation and saved every message behind
 // it ("no verified stop record"). Gilfoyle ran after; Carla never could.
 function unprovableHold(env, { ownRun = false, saved = true, finishedMin = 60, pid = null, lease = null } = {}) {

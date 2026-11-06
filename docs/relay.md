@@ -40,9 +40,9 @@ GitHub waits 10 seconds for an answer. A delivery that takes longer (a PR naming
 
 > **Your `/changes` was not recorded as a decision.**
 >
-> This PR names DIR-251, DIR-419. None of those issues, their subtasks or their blockers has a decision waiting on you, so the relay used the first one, DIR-251 (blocked, review stage).
+> This PR names ACM-251, ACM-419. None of those issues, their subtasks or their blockers has a decision waiting on you, so the relay used the first one, ACM-251 (blocked, review stage).
 >
-> Your text was added to DIR-251 as a comment. Nothing else changed.
+> Your text was added to ACM-251 as a comment. Nothing else changed.
 >
 > To decide on the issue you meant, run `pch changes <issue> "…"` (`pch check <issue>` shows who its decision is waiting on).
 

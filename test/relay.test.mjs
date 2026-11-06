@@ -90,7 +90,7 @@ test("a merge by the owner approves the child whose approval waits on them", asy
 });
 
 test("a merge that only clears your escalated review also approves your approval stage that follows", async (t) => {
-  // DIR-68: the review stage hit its round cap and went to the operator; approving it
+  // The review stage hit its round cap and went to the operator; approving it
   // moved the issue to the approval stage, again the operator's, and left it in review.
   const { relay, db } = await relayEnv(t);
   const { child } = seed(db);
@@ -223,7 +223,7 @@ test("when the decision isn't waiting on the owner, a merge only comments", asyn
 });
 
 test("a merge naming a blocked issue approves its blocker when that waits on the owner", async (t) => {
-  // DIR-157/DIR-159: the PR named the blocked issue; the work in review was the
+  // The PR named the blocked issue; the work in review was the
   // issue blocking it, which is neither named nor a subtask of the one named.
   const { relay, db } = await relayEnv(t);
   const blocker = { id: uuid(), identifier: "ACM-5", companyId: ids.company, status: "in_review", executionState: waitingOnMe };
@@ -368,7 +368,7 @@ test("with a parent/subtask split, the URL goes to the subtask waiting on you", 
 });
 
 test("an opened PR's URL goes to its own issue, never to a blocker or another issue its body mentions that waits on you", async (t) => {
-  // DIR-448's PR #204 was linked on DIR-478, which waited on the board: the link
+  // A PR was linked on another issue, which waited on the board: the link
   // followed the merge-decision search out to an issue that wasn't the PR's.
   const { relay, db } = await relayEnv(t);
   const blocker = { id: uuid(), identifier: "ACM-5", companyId: ids.company, status: "in_review", executionState: waitingOnMe };

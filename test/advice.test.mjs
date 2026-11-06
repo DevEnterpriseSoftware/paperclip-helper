@@ -64,9 +64,9 @@ test("advice: blocked issues — open blocker, done blockers, an agent's own not
   assert.match(done.what, /Every blocker is done/);
   assert.equal(done.watchdog, "auto");
 
-  const note = advise(base({ issue: blocked, runs: [run(A, "succeeded", 600)], lastComment: { body: "Blocked: approval eb404903 still pending." } }));
+  const note = advise(base({ issue: blocked, runs: [run(A, "succeeded", 600)], lastComment: { body: "Blocked: approval a1b2c3d4 still pending." } }));
   assert.match(note.what, /blocked this issue with a note of its own/);
-  assert.match(note.what, /approval eb404903/);
+  assert.match(note.what, /approval a1b2c3d4/);
   assert.equal(note.watchdog, "manual");
 
   const loop = advise(base({ issue: blocked, runs: [run(A, "succeeded", 5), run(A, "succeeded", 12), run(A, "succeeded", 19), run(A, "succeeded", 26)] }));
@@ -100,12 +100,12 @@ test("pch why ends with a recommendation, and --prompt wraps it for an LLM", asy
   env.db.issueRuns[issue.id] = [{ runId: uuid(), agentId: agent.id, status: "succeeded", createdAt: minutesAgo(3000) }];
   env.db.blockerDiagnostics[issue.id] = { readiness: { allBlockersDone: true, isDependencyReady: true }, blockers: [] };
   env.db.recoveryActions[issue.id] = { id: uuid(), kind: "stranded_assigned_issue", ownerType: "board", createdAt: minutesAgo(180), nextAction: "Board operator: inspect the evidence." };
-  env.db.comments.push({ issueId: issue.id, body: "DIR-111 is done, but its workspace clean-up failed.", authorUserId: ids.user });
+  env.db.comments.push({ issueId: issue.id, body: "ACM-111 is done, but its workspace clean-up failed.", authorUserId: ids.user });
 
   const lines = (await captureOutput(() => cmd.why(env.ctx, "ACM-109"))).join("\n");
   assert.match(lines, /^ACM-109: blocked — User detection/);
   assert.match(lines, /Recovery: stranded_assigned_issue, waiting on board/);
-  assert.match(lines, /Last comment: you: DIR-111 is done/);
+  assert.match(lines, /Last comment: you: ACM-111 is done/);
   assert.match(lines, /Recommendation: Paperclip's recovery parked this issue for a board decision/);
   assert.match(lines, /1\. pch comment ACM-109 "Gilfoyle, please continue this issue\."/);
   assert.match(lines, /The watchdog does this by itself/);
@@ -114,7 +114,7 @@ test("pch why ends with a recommendation, and --prompt wraps it for an LLM", asy
   assert.match(prompt, /^I run a self-hosted Paperclip/);
   assert.match(prompt, /## pch why\nACM-109: blocked/);
   assert.match(prompt, /## Helper's recommendation\nPaperclip's recovery parked/);
-  assert.match(prompt, /## Latest comments \(newest first\)\n- you: DIR-111 is done/);
+  assert.match(prompt, /## Latest comments \(newest first\)\n- you: ACM-111 is done/);
   assert.doesNotMatch(prompt, /^Recommendation:/m);
 });
 
@@ -225,9 +225,9 @@ test("advice: in review with no stage pending, and stages an agent wiped", () =>
 });
 
 test("advice: an agent waiting on a CI run", () => {
-  const facts = { runs: [run(A, "succeeded", 30)], ciRun: "acme/app#39498202022", lastComment: { body: "Waiting on run 39498202022." } };
+  const facts = { runs: [run(A, "succeeded", 30)], ciRun: "acme/app#30498202022", lastComment: { body: "Waiting on run 30498202022." } };
   const a = advise(base({ ...facts, config: { watchdog: true, githubToken: "t" } }));
-  assert.match(a.what, /finished 30 min ago, waiting on CI run acme\/app#39498202022/);
+  assert.match(a.what, /finished 30 min ago, waiting on CI run acme\/app#30498202022/);
   assert.equal(a.watchdog, "auto");
   assert.equal(advise(base(facts)).watchdog, "manual", "without a GitHub token the watchdog can't read the run");
 });

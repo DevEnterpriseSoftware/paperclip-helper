@@ -156,9 +156,9 @@ test("status and health read the service's status file", async (t) => {
   assert.match(lines, /as Operator; key "paperclip-helper", no expiry/);
   // A Paperclip that reports no version or commit adds nothing to the line.
   assert.match(lines, /^Paperclip: \S+ as Operator/m);
-  env.db.build = { version: "2026.1001.0", commit: "8f8a0ab7effbd6a0584107d8038736c134ee5047" };
+  env.db.build = { version: "2026.1001.0", commit: "0123abc4567890abcdef0123456789abcdef0123" };
   const withBuild = (await captureOutput(() => cmd.status(env.ctx))).join("\n");
-  assert.match(withBuild, /^Paperclip: \S+ \(2026\.1001\.0, commit 8f8a0ab\) as Operator/m);
+  assert.match(withBuild, /^Paperclip: \S+ \(2026\.1001\.0, commit 0123abc\) as Operator/m);
   process.exitCode = 0;
 });
 
@@ -398,13 +398,13 @@ test("models says why a paused agent is paused: its holds, a pause Paperclip has
   const env = await setup();
   t.after(env.close);
   const make = (name, extra) => env.db.agents.push({ id: uuid(), companyId: ids.company, name, adapterType: "claude_local", adapterConfig: { model: "claude-opus-5" }, ...extra });
-  make("Stuck", { status: "paused", lifecycleState: "pausing", lifecycleHolds: [], pauseReason: null, pausedAt: "2026-10-31T21:48:35.346Z" });
+  make("Stuck", { status: "paused", lifecycleState: "pausing", lifecycleHolds: [], pauseReason: null, pausedAt: "2026-01-15T09:30:35.346Z" });
   make("Yours", { status: "paused", lifecycleState: "paused", lifecycleHolds: ["manual"], pauseReason: "manual", pausedAt: "2026-09-29T09:40:16.521Z" });
   make("Older", { status: "paused", pauseReason: "budget", pausedAt: "2026-10-01T08:00:00Z" }); // a Paperclip before lifecycle holds
   make("Working", { status: "idle", lifecycleState: "ready", lifecycleHolds: [] });
   const lines = await captureOutput(() => cmd.models(env.ctx));
   const line = (name) => lines.find((l) => l.startsWith(name));
-  assert.match(line("Stuck"), /paused \(no hold, still pausing, since 2026-10-31 21:48 UTC\)$/);
+  assert.match(line("Stuck"), /paused \(no hold, still pausing, since 2026-01-15 09:30 UTC\)$/);
   assert.match(line("Yours"), /paused \(manual, since 2026-09-29 09:40 UTC\)$/);
   assert.match(line("Older"), /paused \(budget, since 2026-10-01 08:00 UTC\)$/);
   assert.match(line("Working"), /idle$/);

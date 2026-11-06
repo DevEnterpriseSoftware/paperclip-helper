@@ -1,7 +1,7 @@
 // GitHub Actions runs an agent is waiting on (watchdog, 11).
 //
 // An agent that pushes and waits for CI usually says so ("waiting on run
-// 39498202022", a link to the run) and stops, or schedules a Paperclip monitor
+// 1234567890", a link to the run) and stops, or schedules a Paperclip monitor
 // to look again later. Monitors give up after a timeout or a number of attempts,
 // and a run that queues behind others (one self-hosted runner, a busy org) can
 // finish long after that. Nothing then wakes the agent: the issue sits blocked

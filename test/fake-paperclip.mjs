@@ -422,6 +422,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         if (body.comment && issue.paused) return send(409, { error: "Task is paused. Resume it before sending a message." });
         db.patches.push({ issueId: issue.id, identifier: issue.identifier, body });
         const before = issue.status;
+        let workflowAssigned = false;
         // Paperclip's applyIssueExecutionStageTransition (services/issue-execution-policy.ts):
         // with a stage pending, its participant decides; anyone else on the board who
         // moves the issue out of review dissolves the stage and decides nothing.
@@ -455,6 +456,21 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           // Like Paperclip's drifted-stage repair: moving an issue back to review re-pends
           // its stage and assigns it to the stage's participant.
           Object.assign(issue, { status: "in_review", assigneeAgentId: stage.currentParticipant.agentId, assigneeUserId: null });
+        } else if (body.status === "in_review" && !stage && issue.executionPolicy?.stages?.[0]?.participants?.length && issue.status !== "in_review") {
+          // Paperclip's workflow start (2026.1023.0): the first pending stage, the named
+          // assignee as its participant when eligible (else the first), whoever had the
+          // issue as the return assignee, the review request from the PATCH.
+          const first = issue.executionPolicy.stages.find((st) => !(issue.executionState?.completedStageIds ?? []).includes(st.id)) ?? issue.executionPolicy.stages[0];
+          const named = first.participants.find((pp) => pp.type === "agent" && pp.agentId === body.assigneeAgentId);
+          const participant = named ?? first.participants.find((pp) => !(pp.type === "agent" && pp.agentId === issue.assigneeAgentId)) ?? first.participants[0];
+          issue.executionState = {
+            status: "pending", currentStageId: first.id ?? null, currentStageIndex: issue.executionPolicy.stages.indexOf(first), currentStageType: first.type,
+            currentParticipant: { type: participant.type, agentId: participant.agentId ?? null, userId: participant.userId ?? null },
+            returnAssignee: issue.assigneeAgentId ? { type: "agent", agentId: issue.assigneeAgentId, userId: null } : null,
+            reviewRequest: body.reviewRequest ?? null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null, monitor: null, changesRequestedCount: 0,
+          };
+          Object.assign(issue, { status: "in_review", assigneeAgentId: participant.agentId ?? null, assigneeUserId: participant.userId ?? null });
+          workflowAssigned = true; // the workflow assigns it
         } else if (body.status) {
           // Like Paperclip's policy transition: leaving done or cancelled clears the execution state.
           if (["done", "cancelled"].includes(issue.status) && !["done", "cancelled"].includes(body.status)) issue.executionState = null;
@@ -462,7 +478,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         }
         if (body.blockedByIssueIds) issue.blockedBy = body.blockedByIssueIds.map((id) => ({ id }));
         // A reassignment on its own: the stage and the hold stay as they are.
-        if ("assigneeAgentId" in body) Object.assign(issue, { assigneeAgentId: body.assigneeAgentId, assigneeUserId: body.assigneeAgentId ? null : issue.assigneeUserId });
+        if ("assigneeAgentId" in body && !workflowAssigned) Object.assign(issue, { assigneeAgentId: body.assigneeAgentId, assigneeUserId: body.assigneeAgentId ? null : issue.assigneeUserId });
         if ("executionPolicy" in body) {
           // Like Paperclip's applyMonitorTransition: a policy sent without its monitor clears it ("manual").
           const had = issue.executionPolicy?.monitor;
@@ -470,7 +486,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           const asked = policy?.monitor ?? null;
           if (asked && JSON.stringify(asked) !== JSON.stringify(had ?? null)) {
             // A new monitor (prepareIssueMonitorUpdate, applyMonitorTransition and
-            // exhaustedMonitorClearReason, services/issue-execution-policy.ts at 1b4c8038):
+            // exhaustedMonitorClearReason, services/issue-execution-policy.ts in 2026.1023.0):
             // only on an issue in progress or in review assigned to an agent; nextCheckAt
             // ahead and timeoutAt after it; refused when the issue's attempt count, kept
             // across every monitor it has had, already reaches maxAttempts. The externalRef
@@ -536,7 +552,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         const comment = boardComment(issue, body.body, "comment", who);
         db.comments.push(comment);
         issue.updatedAt = new Date().toISOString();
-        // Paperclip's admitExplicitNativeContinuation (main at e5c9e60): a hold a cancelled run
+        // Paperclip's admitExplicitNativeContinuation (on main): a hold a cancelled run
         // left (legacy_execution_requires_reconciliation) lifts only on a board user's comment
         // while the issue is assigned to that run's own agent, invokable, on a conversation
         // adapter; the comment's wake starts its run. Any other comment waits behind the hold.
@@ -559,6 +575,17 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           } else {
             (db.wakes[issue.id] ??= []).unshift({ kind: "wake_request", agentId: issue.assigneeAgentId, status: "deferred_issue_execution", reason: "issue_commented", requestedAt: new Date().toISOString() });
           }
+          return send(201, { id: comment.id, body: body.body });
+        }
+        // The same reopen on a held review its recovery set to blocked (measured on 2026.1023.0):
+        // a direct status update, so the stage stays pending; the comment's wake is saved
+        // behind the hold.
+        if (issue.status === "blocked" && hold?.cause === "legacy_execution_requires_reconciliation" && issue.executionState?.status === "pending" &&
+            !/^agent/.test(db.meSource ?? "board_key") && !(issue.blockedBy ?? []).some((b) => !["done", "cancelled"].includes(b.status))) {
+          issue.status = "todo";
+          (db.wakes[issue.id] ??= []).unshift({ kind: "wake_request", agentId: issue.assigneeAgentId, status: "deferred_issue_execution", reason: "issue_commented", requestedAt: new Date().toISOString() });
+          const q = db.queuedComments[issue.id];
+          if (q) q.entries = [...(q.entries ?? []), { comment: { id: comment.id, body: body.body }, position: q.entries?.length ?? 0 }];
           return send(201, { id: comment.id, body: body.body });
         }
         // Paperclip's comment reopen (routes/issues.ts, 2026.1023.0): a board user's comment on
@@ -650,7 +677,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           return send(400, { error: "Validation error" });
         }
         if (!hold || hold.recoveryActionId !== body.actionId || (r && r.runId !== hold.runId)) return send(409, { error: "Recovery action is not active" });
-        // Paperclip (routes/issues.ts, main at e5c9e60): a reconciliation record goes with a
+        // Paperclip (routes/issues.ts, main): a reconciliation record goes with a
         // move to todo, and a move to todo for a reconciliation cause needs one; it must come
         // from the run's own agent as the assignee ("The recovery source or task owner changed").
         const reconcile = hold.cause === "legacy_execution_requires_reconciliation" && body.sourceIssueStatus === "todo";
@@ -661,7 +688,9 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         // the request is answered as a replay and changes nothing.
         if (hold.settled && !r) return send(200, { issue, recoveryAction: { id: hold.recoveryActionId, status: "resolved" } });
         db.resolutions = [...(db.resolutions ?? []), { issueId: issue.id, body }];
-        issue.executionBlocker = null;
+        // Paperclip can hold an issue behind several recovery actions for the same run
+        // (seen on 2026.1023.0); the next one shows once this one is resolved.
+        issue.executionBlocker = issue.moreHolds?.length ? issue.moreHolds.shift() : null;
         // Paperclip 2026.1023.0: the move to todo is either refused while a stage is pending
         // (a safe hand-back to the hold's owner) or a board override that clears
         // executionState, return assignee and all. Modelled as the clearing, the worse of

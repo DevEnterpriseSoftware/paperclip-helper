@@ -218,11 +218,14 @@
 //    WATCHDOG_RELEASE_HOLDS on, one whose run provably never started (no start,
 //    process, session, usage, lease or execution event) is released once its run
 //    ended a stall window ago, recording that it performed nothing, and the saved
-//    messages are delivered once. Never while the issue's review stage is pending
-//    (the release moves it to todo, which Paperclip refuses or does by ending the
-//    review), the run is another agent's than the assignee's, or other issues block it: those are told to the
-//    board once, with what lifts them. A hold from a run that executed is reported
-//    once, an hour after it ended, unless 7 releases it.
+//    messages are delivered once. A held review whose reviewer is the run's agent is
+//    released keeping it when Paperclip has parked it in blocked (a board comment
+//    moves it to todo with its stage kept, the release changes no status, review is
+//    asked for again), or started again at the same first stage when it is still in
+//    review with nothing in it to lose (release.mjs heldReviewRoute). Never while the
+//    run is another agent's than the assignee's, other issues block it, or any other
+//    review is pending: those are told to the board once, with what lifts them. A hold from a run that executed is
+//    reported once, an hour after it ended, unless 7 releases it.
 //
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
@@ -305,6 +308,7 @@ const record = {
   unstartedLeft: (issue, runId) => `unstarted-left:${issue.id}:${runId}`, // a hold behind a run that never started, left to the board: { told }
   executedHold: (issue, runId) => `executed-hold:${issue.id}:${runId}`, // a hold behind a run that executed, reported once
   unstartedFollowUp: (issue, runId) => `unstarted-follow-up:${issue.id}:${runId}`, // after such a release with nothing delivered: { at, companyId, issueId, assigneeId }
+  unstartedHandOn: (issue, runId) => `unstarted-hand-on:${issue.id}:${runId}`, // after a hand-on release: { at, companyId, issueId, holdAgentId, targetId, kind }
   readyToQueue: (issue, pr) => `ready:${issue.id}:${pr.repo}#${pr.number}:${pr.sha}`, // the board's note that a PR is ready to queue
 };
 
@@ -456,7 +460,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   // cancelled at a hand-off and its agent can no longer be invoked. The saved
   // messages then wait forever. For that one cause the cancelled run did nothing
   // that needs reconciling, so deliver the saved messages to the current owner,
-  // as the board's Interrupt button does (DIR-86). Any other cause means Paperclip
+  // as the board's Interrupt button does. Any other cause means Paperclip
   // is unsure what the run did: that stays the board's call, and is logged once.
   async function releaseHandOffHold(issue, blocker, runs, agents = new Map()) {
     if (await releaseUnprovableHold(issue, agents)) return;
@@ -608,9 +612,9 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
     const list = Array.isArray(runs) ? runs : [];
     if (list.some((r) => ACTIVE_RUN.has(r.status))) return;
-    // DIR-268: the last run hit a provider limit (or what Paperclip took for a transient error) and
+    // The last run hit a provider limit (or what Paperclip took for a transient error) and
     // Paperclip's own retries are spent. A nudge only starts the same failing run again, and its
-    // recovery then parks the issue under a new action: 333 runs in 17 hours. Leave it to the board.
+    // recovery then parks the issue under a new action, run after run. Leave it to the board.
     // Only while the failure is recent: once the limit has reset (the agent is resumed the next
     // day, say), the issue gets its nudge as before.
     const last = latestRun(list);
@@ -745,7 +749,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     // A run Paperclip cancelled before it started, because the issue was held for
     // reconciliation after a hand-off, did no work. It doesn't count as the owner
     // having run: the hold clears on its own, but the wakes were skipped, so
-    // nothing wakes the owner again (DIR-91, DIR-95).
+    // nothing wakes the owner again.
     const worked = runs.filter((r) => !refused(r));
     if (!worked.length) return null;
     const latest = newest(worked);
@@ -812,7 +816,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     if (!pending.length || nodes.some((b) => b.status !== "done")) return false;
     // Moving the issue to todo for an agent Paperclip can't invoke makes its
     // recovery give up on the issue ("Automatic recovery blocked") and block it
-    // again, this time for a board decision (DIR-109). Wait until it's back.
+    // again, this time for a board decision. Wait until it's back.
     if (issue.assigneeAgentId && asleep(await agentFor(issue.assigneeAgentId, agents).catch(() => null))) return false;
     const stuck = [];
     for (const b of pending) {

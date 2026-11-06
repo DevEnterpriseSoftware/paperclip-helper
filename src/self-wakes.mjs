@@ -5,8 +5,8 @@
 // (heartbeat/run-completion.ts: activity "issue.comment_added" with
 // details.source "run_presentation_resolver"). That comment wakes the issue's
 // assignee within seconds, the same agent included, and a run that ends the same
-// way starts the next: one quiet run becomes dozens (38 runs on one issue in an
-// hour has been seen). The watchdog tells the board once per issue. It never
+// way starts the next: one quiet run becomes dozens within an hour. The watchdog
+// tells the board once per issue. It never
 // comments on the issue itself: that would wake the agent once more.
 
 import { listIssues } from "./paperclip.mjs";

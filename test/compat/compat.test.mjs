@@ -31,9 +31,9 @@ import { createWatchdog } from "../../src/watchdog.mjs";
 import { createRelay } from "../../src/relay.mjs";
 import { createCostSync } from "../../src/cost-sync.mjs";
 import * as commands from "../../src/commands.mjs";
-import { approvalWaitingOn } from "../../src/util.mjs";
+import { approvalWaitingOn, ts } from "../../src/util.mjs";
 import { backstopMonitor, isBackstop, monitorAttempts } from "../../src/ci-runs.mjs";
-import { holdFacts, neverStarted } from "../../src/release.mjs";
+import { claimedOnly, handOnRoute, holdFacts, neverStarted } from "../../src/release.mjs";
 
 const BASE = (process.env.PAPERCLIP_COMPAT_API ?? "").replace(/\/+$/, "");
 const COMPANY_PREFIX = "pch-compat";
@@ -88,7 +88,7 @@ const HELPER_ENDPOINTS = [
   ["GET", "/api/instance/settings/experimental"],
 ];
 // Endpoints the helper calls that Paperclip serves but its OpenAPI document doesn't
-// list (main at d69631b). Covered by the last test, not by the OpenAPI check.
+// list (on main). Covered by the last test, not by the OpenAPI check.
 const UNDOCUMENTED_ENDPOINTS = [
   ["GET", "/api/companies/{companyId}/costs/by-agent"], // pch usage
 ];
@@ -896,7 +896,7 @@ if (!BASE) {
     test("pch worktrees --links reads blocked issues and their recovery actions, and posts nothing", async () => {
       // A workspace validation that fails needs git worktrees under a project checkout, which
       // these process agents don't have, so the failure itself isn't reproduced here. Paperclip
-      // 2026.1023.0 (commit 1b4c8038) refused every run on worktrees git had linked by relative
+      // 2026.1023.0 refused every run on worktrees git had linked by relative
       // path (worktree.useRelativePaths) with workspace_validation_failed and
       // source_registration_unproven: what this command lists and `pch why` names. What is
       // checked is the reading: the company's blocked issues, each one's recovery actions (or a
@@ -926,7 +926,7 @@ if (!BASE) {
       assert.equal(direct.status, "terminated", "which is why cost sync reads them one by one");
     });
 
-    // Watchdog 22, for real (DIR-1230): a disposition repair Paperclip scheduled, then
+    // Watchdog 22, for real: a disposition repair Paperclip scheduled, then
     // suppressed at its gate before it started because the issue gained a live path
     // (issue_disposition_repair_superseded). Up to 2026.1023.0 that leaves a hold for
     // reconciliation that nothing in Paperclip releases.
@@ -978,7 +978,7 @@ if (!BASE) {
       assert.equal(facts.run.startedAt, null, "the repair never started");
       assert.equal(neverStarted(facts), true, `the helper reads it as never started: ${JSON.stringify({ ...facts.run, events: facts.run.events?.map((e) => e.eventType) })}`);
 
-      // A board message is saved behind the hold, as on the live instance.
+      // A board message is saved behind the hold.
       await s.ctx.api.request("POST", `/api/issues/${created.id}/comments`, { body: "compat: please continue" });
       await until("the message to be saved", async () => (await ok("GET", `/api/issues/${created.id}/queued-comments`)).entries?.length);
       const before = (await runsOf(created.id)).length;
@@ -993,6 +993,171 @@ if (!BASE) {
       await settled(created.id).catch(() => {});
     });
 
+    // Watchdog 22 on a held review: the reviewer's never-started run holds the
+    // issue while he has its review. Built the way it arose here: the reviewer's own
+    // repair suppressed before it started (as above), then the board hands the issue to
+    // its implementer and asks for review. Paperclip refuses a release that would leave
+    // the review (recovery_governed_stage_pending). The watchdog releases it all the
+    // same: keeping the review as it was if Paperclip has parked it in blocked, or
+    // starting its first stage again with the same reviewer and implementer.
+    test("watchdog 22: a held review is released, kept as it was or its untouched first stage started again", async (t) => {
+      const created = await issue({ title: "Held review", status: "todo" });
+      const script =
+        "const e = process.env; fetch(e.PAPERCLIP_API_URL + '/api/issues/' + e.HELD_ISSUE + '/comments', { method: 'POST', " +
+        "headers: { authorization: 'Bearer ' + e.PAPERCLIP_API_KEY, 'content-type': 'application/json', 'x-paperclip-run-id': e.PAPERCLIP_RUN_ID }, " +
+        "body: JSON.stringify({ body: 'Looking at it.' }) }).then((r) => console.log('comment', r.status), (err) => console.log('comment failed', err.message));";
+      const reviewer = await agent("Monica", script, { env: { HELD_ISSUE: created.id } });
+      const implementer = await agent("Carla", 'console.log("nothing to do")');
+      for (const a of [reviewer, implementer]) {
+        await until("the new agent to be ready", async () => {
+          const x = await ok("GET", `/api/agents/${a.id}`);
+          return !("lifecycleState" in x) || x.lifecycleState === "ready";
+        });
+      }
+      await ok("PATCH", `/api/issues/${created.id}`, { executionPolicy: { stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewer.id }] }] } });
+      await ok("PATCH", `/api/issues/${created.id}`, { assigneeAgentId: reviewer.id, status: "in_progress" });
+      const repair = await until("a disposition repair to be scheduled", async () => (await runsOf(created.id)).find((r) => r.status === "scheduled_retry"), { timeoutMs: 240_000, everyMs: 1000 }).catch(() => null);
+      if (!repair) return t.skip("this Paperclip scheduled no disposition repair");
+      const before = await s.ctx.api.request("GET", `/api/issues/${created.id}`);
+      const monitor = backstopMonitor({ run: { id: 1, html_url: "https://github.com/org/app/actions/runs/1" }, now: Date.now(), backstopMs: 6 * 60 * 60_000, attemptCount: monitorAttempts(before) });
+      await s.ctx.api.request("PATCH", `/api/issues/${created.id}`, { executionPolicy: { ...(before.executionPolicy ?? {}), monitor } });
+      const held = await until("the suppressed repair to hold the issue", async () => {
+        const f = await ok("GET", `/api/issues/${created.id}`);
+        return f.status === "blocked" && f.executionBlocker ? f : null;
+      }, { timeoutMs: 240_000, everyMs: 2000 }).catch(() => null);
+      if (!held) return t.skip("this Paperclip doesn't hold an issue behind a repair it suppressed before it started");
+      // The implementer hands it on, and the board asks for review with the reviewer.
+      await ok("PATCH", `/api/issues/${created.id}`, { assigneeAgentId: implementer.id });
+      await ok("PATCH", `/api/issues/${created.id}`, { status: "in_review", assigneeAgentId: reviewer.id });
+      const review = (await ok("GET", `/api/issues/${created.id}`)).executionState;
+      assert.equal(review?.status, "pending");
+      assert.equal(review.currentParticipant?.agentId, reviewer.id);
+      assert.equal(review.returnAssignee?.agentId, implementer.id);
+      const facts = await holdFacts(s.ctx.api, created.id);
+      assert.equal(neverStarted(facts), true);
+      // What 1.15.3 got: Paperclip won't release it out of review.
+      const refused = await s.ctx.api.request("POST", `/api/issues/${created.id}/recovery-actions/resolve`, {
+        actionId: facts.hold.recoveryActionId, outcome: "restored", sourceIssueStatus: "todo", resolutionNote: "compat: the old release",
+        executionReconciliation: { runId: facts.hold.runId, providerStopped: true, actionOutcome: "not_performed", outcomeEvidence: "compat: the run never started." },
+      }).then(() => null, (err) => err);
+      if (!refused) return t.skip("this Paperclip released a held review out of review by itself");
+      assert.equal(refused.status, 409);
+      assert.match(refused.message, /recovery_governed_stage_pending|cannot bypass a pending execution review/);
+
+      // Paperclip may park it in blocked by itself (a later refused wake): then the review
+      // is kept as it was; still in review, its first stage is started again.
+      const parked = await until("Paperclip to park the review, if it does", async () => {
+        const f = await ok("GET", `/api/issues/${created.id}`);
+        return f.status === "blocked" ? f : null;
+      }, { timeoutMs: 20_000, everyMs: 2000 }).catch(() => null);
+      t.diagnostic(parked ? "parked in blocked: the review is kept" : "still in review: its first stage is started again");
+      const monitorBefore = (await ok("GET", `/api/issues/${created.id}`)).executionPolicy?.monitor ?? null;
+      t.diagnostic(`policy monitor before: ${monitorBefore ? monitorBefore.nextCheckAt : "none"}`);
+      const watchdog = createWatchdog(s.ctx, s.state);
+      s.skew = 10 * 60_000;
+      await watchdog.tick();
+      s.skew = 0;
+      const after = await ok("GET", `/api/issues/${created.id}`);
+      assert.equal(after.executionBlocker, null, `released (log: ${JSON.stringify(s.logs.filter((l) => /hold|board|review/.test(l.msg ?? "")).slice(-3))})`);
+      assert.equal(after.status, "in_review");
+      assert.equal(after.assigneeAgentId, reviewer.id);
+      const kept = parked
+        ? ["status", "currentStageId", "currentStageIndex", "currentParticipant", "returnAssignee", "reviewRequest", "completedStageIds", "changesRequestedCount"]
+        : ["status", "currentStageId", "currentStageIndex", "returnAssignee", "completedStageIds", "changesRequestedCount"];
+      for (const k of kept) assert.equal(JSON.stringify(after.executionState?.[k] ?? null), JSON.stringify(review[k] ?? null), `the review's ${k}`);
+      assert.equal(after.executionState?.currentParticipant?.agentId, reviewer.id);
+      if (monitorBefore) assert.ok(after.executionPolicy?.monitor, "the policy monitor is there afterwards");
+      assert.equal(watchdog.stats.unstartedHolds, 1);
+      await until("the reviewer to run in the review", async () => (await runsOf(created.id)).some((r) => r.agentId === reviewer.id && ts(r.createdAt) > ts(after.updatedAt) - 5000));
+      assert.ok(!(await runsOf(created.id)).some((r) => r.agentId === implementer.id && r.startedAt), "the implementer never ran");
+      await ok("POST", `/api/agents/${reviewer.id}/pause`, {}).catch(() => {}); // the stand-in never decides
+    });
+
+    // Watchdog 22's hand-on: the board gave the held issue to another
+    // agent, so Paperclip accepts the release only once the held run's agent has it again,
+    // and a board reassignment back while that agent's run is queued or starting would
+    // cancel the run and hold the issue again. The watchdog gives it back to that agent,
+    // asks it to reassign the issue itself, releases the hold and delivers the messages;
+    // the agent's own reassignment is its run's disposition. What has to hold: the issue
+    // reaches the other agent, and no hold behind the first agent's runs follows, through
+    // more than two of Paperclip's delivery sweeps.
+    test("watchdog 22: a hold whose issue moved to another agent is handed on by the held run's agent, and no new hold follows", async (t) => {
+      const created = await issue({ title: "Handed on", status: "todo" });
+      const monica = await agent("Monica", 'console.log("picked up")');
+      const script =
+        "const e = process.env; const h = { authorization: 'Bearer ' + e.PAPERCLIP_API_KEY, 'content-type': 'application/json', 'x-paperclip-run-id': e.PAPERCLIP_RUN_ID }; " +
+        "const u = e.PAPERCLIP_API_URL + '/api/issues/' + e.HELD_ISSUE; " +
+        "fetch(u + '/comments', { headers: h }).then((r) => r.json()).then(async (list) => { " +
+        "const asked = (Array.isArray(list) ? list : []).some((c) => String(c.body).includes('Please reassign this issue to')); " +
+        "if (asked) { const r = await fetch(u, { method: 'PATCH', headers: h, body: JSON.stringify({ assigneeAgentId: e.HAND_TO }) }); console.log('handed on', r.status, (await r.text()).slice(0, 200)); } " +
+        "else { const r = await fetch(u + '/comments', { method: 'POST', headers: h, body: JSON.stringify({ body: 'Still looking into it.' }) }); console.log('comment', r.status); } " +
+        "}).catch((err) => console.log('failed', err.message));";
+      const gilfoyle = await agent("Gilfoyle", script, { env: { HELD_ISSUE: created.id, HAND_TO: monica.id } });
+      for (const a of [gilfoyle, monica]) {
+        await until("the new agent to be ready", async () => {
+          const x = await ok("GET", `/api/agents/${a.id}`);
+          return !("lifecycleState" in x) || x.lifecycleState === "ready";
+        });
+      }
+      await ok("PATCH", `/api/issues/${created.id}`, { assigneeAgentId: gilfoyle.id, status: "in_progress" });
+      const repair = await until("a disposition repair to be scheduled", async () => (await runsOf(created.id)).find((r) => r.status === "scheduled_retry"), { timeoutMs: 240_000, everyMs: 1000 }).catch(() => null);
+      if (!repair) return t.skip("this Paperclip scheduled no disposition repair");
+      const full = await s.ctx.api.request("GET", `/api/issues/${created.id}`);
+      const monitor = backstopMonitor({ run: { id: 1, html_url: "https://github.com/org/app/actions/runs/1" }, now: Date.now(), backstopMs: 6 * 60 * 60_000, attemptCount: monitorAttempts(full) });
+      await s.ctx.api.request("PATCH", `/api/issues/${created.id}`, { executionPolicy: { ...(full.executionPolicy ?? {}), monitor } });
+      // Settled (blocked, replay blocked): an action still active when the issue changes
+      // hands is Paperclip's own recovery to finish, and isn't the case tested here.
+      const held = await until("the suppressed repair to hold the issue", async () => {
+        const f = await ok("GET", `/api/issues/${created.id}`);
+        return f.status === "blocked" && f.executionBlocker ? f : null;
+      }, { timeoutMs: 240_000, everyMs: 2000 }).catch(() => null);
+      if (!held) return t.skip("this Paperclip doesn't hold an issue behind a repair it suppressed before it started");
+      // The board gives it to Monica: what 1.16.0 left to the board ("another agent's run").
+      await ok("PATCH", `/api/issues/${created.id}`, { assigneeAgentId: monica.id });
+      const facts = await holdFacts(s.ctx.api, created.id);
+      if (!facts.hold) {
+        const recovery = await ok("GET", `/api/issues/${created.id}/recovery-actions`).catch((err) => err.message);
+        assert.fail(`the board's reassignment cleared the hold: issue ${facts.issue.status}, recovery actions ${JSON.stringify(recovery).slice(0, 600)}`);
+      }
+      assert.equal(facts.hold.agentId, gilfoyle.id);
+      assert.equal(neverStarted(facts), true);
+      assert.equal(claimedOnly(facts.run), false);
+      assert.deepEqual(handOnRoute(facts), { kind: "owner-moved", targetAgentId: monica.id, reassign: true });
+      const refused = await s.ctx.api.request("POST", `/api/issues/${created.id}/recovery-actions/resolve`, {
+        actionId: facts.hold.recoveryActionId, outcome: "restored", sourceIssueStatus: "todo", resolutionNote: "compat: the release with the issue elsewhere",
+        executionReconciliation: { runId: facts.hold.runId, providerStopped: true, actionOutcome: "not_performed", outcomeEvidence: "compat: the run never started." },
+      }).then(() => null, (err) => err);
+      assert.ok(refused, "Paperclip refuses the release while another agent has the issue");
+      assert.equal(refused.status, 409);
+      t.diagnostic(`refused: ${refused.message}`);
+
+      const releasedAt = Date.now();
+      const watchdog = createWatchdog(s.ctx, s.state);
+      s.skew = 10 * 60_000;
+      await watchdog.tick();
+      s.skew = 0;
+      assert.equal(watchdog.stats.unstartedHolds, 1, `released (log: ${JSON.stringify(s.logs.filter((l) => /hold|board/.test(l.msg ?? "")).slice(-3))})`);
+      const ask = (await commentsOf(created.id)).find((c) => /Please reassign this issue to/.test(c.body));
+      assert.ok(ask, "the hand-on comment is on the issue");
+      const handed = await until("Gilfoyle's run to give the issue to Monica", async () => {
+        const f = await ok("GET", `/api/issues/${created.id}`);
+        return f.assigneeAgentId === monica.id ? f : null;
+      }, { timeoutMs: 120_000, everyMs: 2000 }).catch(() => null);
+      const runs = async () => (await runsOf(created.id)).map((r) => `${r.agentId === gilfoyle.id ? "Gilfoyle" : r.agentId === monica.id ? "Monica" : "?"} ${r.status}${r.errorCode ? ` (${r.errorCode})` : ""}${ts(r.createdAt) >= releasedAt - 2000 ? " after" : ""}`).join("; ");
+      if (!handed) {
+        const log = await board("GET", `/api/heartbeat-runs/${(await runsOf(created.id)).find((r) => r.agentId === gilfoyle.id)?.runId}/log?limitBytes=8192`).catch(() => null);
+        assert.fail(`the issue didn't reach Monica: runs ${await runs()}; Gilfoyle's last log: ${JSON.stringify(log?.data ?? null).slice(0, 400)}`);
+      }
+      // More than two delivery sweeps (15 s each), and Paperclip's stranded-work check.
+      await sleep(40_000);
+      const after = await ok("GET", `/api/issues/${created.id}`);
+      t.diagnostic(`runs: ${await runs()}`);
+      assert.ok(!after.executionBlocker || after.executionBlocker.agentId !== gilfoyle.id, `no hold behind Gilfoyle's runs: ${JSON.stringify(after.executionBlocker)}`);
+      const cancelled = (await runsOf(created.id)).filter((r) => r.agentId === gilfoyle.id && ts(r.createdAt) >= releasedAt - 2000 && r.status === "cancelled" && r.errorCode !== "issue_reassigned");
+      assert.deepEqual(cancelled.map((r) => r.errorCode), [], "none of Gilfoyle's runs after the release was cancelled at dispatch");
+      for (const a of [gilfoyle, monica]) await ok("POST", `/api/agents/${a.id}/pause`, {}).catch(() => {});
+    });
+
     // Watchdog 11's backstop, and the disposition guard it answers. Last, so the
     // repairs the control issue gets touch no other test. Each agent does what a real
     // one waiting on CI does: posts "waiting on <run>" through the API with its run's
@@ -1001,7 +1166,7 @@ if (!BASE) {
     // going, as the watchdog's does: the guard looks the moment the run ends
     // (heartbeat/run-completion.ts → reconcileLegacyContinuation).
     test("CI backstop: a board key's monitor is the live path the disposition guard wants; its attempts count across monitors; the report clears it", async (t) => {
-      const run = { id: 39498202022, html_url: "https://github.com/org/app/actions/runs/39498202022" };
+      const run = { id: 30498202022, html_url: "https://github.com/org/app/actions/runs/30498202022" };
       // The agent says first where it will post and whether it got a run token, then the
       // comment's status: the run's log is how a failed precondition explains itself.
       const script =

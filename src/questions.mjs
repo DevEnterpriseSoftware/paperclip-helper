@@ -8,7 +8,7 @@
 // review participant or a comment/mention wake may run on an issue, and the
 // card's wake is none of them (decideQueuedRunStaleness in
 // server/src/modules/run-dispatch/domain/policy.ts; checked against Paperclip
-// 2026.1012.0 and main at f553471). The card then waits for good, and so does
+// 2026.1012.0 and its main branch). The card then waits for good, and so does
 // everything blocked behind the asker. Upstream: paperclipai/paperclip#11932
 // (fixes open in #11939, #14378, #15991).
 //

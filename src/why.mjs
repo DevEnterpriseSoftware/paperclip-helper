@@ -10,7 +10,7 @@ import { classifyFailure, labelOf, localZone, resetLabel } from "./limits.mjs";
 import { issueActivity, stagesWipe } from "./stages.mjs";
 import { isBackstop, monitorPending, runRefs, waitingOn } from "./ci-runs.mjs";
 import { selfWakeLoop } from "./self-wakes.mjs";
-import { holdFacts, neverStarted, PAUSE_CANCEL, RECONCILIATION_CAUSE, releaseProblems } from "./release.mjs";
+import { claimedOnly, handOnRoute, heldReviewRoute, holdFacts, neverStarted, PAUSE_CANCEL, RECONCILIATION_CAUSE, releaseProblems } from "./release.mjs";
 import { describeWakes } from "./paused-holds.mjs";
 import { codeLabel, EXTENSION_ERROR, hostPaths, meaningOf, readWorkspace, RECOVERY_KIND, VALIDATION_FAILED, validationOf } from "./worktree-links.mjs";
 import { ts } from "./util.mjs";
@@ -144,13 +144,23 @@ async function whyReport(ctx, identifier, out) {
           `Queued wakes held by an unreconciled run from a pause: ${ownerName ?? "an agent"}'s run ${String(hold.runId).slice(0, 8)} was cancelled when ${ownerName ?? "it"} was paused; ` +
             `${held ? `${held} won't start` : "no run starts on the issue"} until it's resolved.`,
         );
-      } else if (source?.status === "cancelled" && !source.startedAt) {
-        // A run Paperclip's dispatch cancelled before it started (watchdog 22).
+      } else if (source?.status === "cancelled") {
+        // A run cancelled before it started, or claimed and cancelled before it reached its adapter (watchdog 22).
         const facts = await holdFacts(api, id).catch(() => null);
         if (facts && neverStarted(facts)) {
           const ownerName = await nameOf(hold.agentId ?? source.agentId);
-          unstartedHold = { ownerName, runId: hold.runId, errorCode: source.errorCode, problems: releaseProblems(facts) };
-          out(`Held run never started: Paperclip's dispatch cancelled ${ownerName ?? "the agent"}'s run ${String(hold.runId).slice(0, 8)} before it began (${source.errorCode}).`);
+          const route = heldReviewRoute(facts);
+          const handOn = route ? null : handOnRoute(facts);
+          const problems = releaseProblems(facts, { heldReview: true, handOn: Boolean(handOn) });
+          const claimed = claimedOnly(facts.run);
+          const targetName = handOn ? await nameOf(handOn.targetAgentId) : null;
+          const returnName = full?.executionState?.returnAssignee?.agentId ? await nameOf(full.executionState.returnAssignee.agentId) : null;
+          unstartedHold = { ownerName, runId: hold.runId, errorCode: source.errorCode, problems, route, handOn, targetName, returnName, claimed };
+          out(
+            claimed
+              ? `Held run never ran: ${ownerName ?? "the agent"}'s run ${String(hold.runId).slice(0, 8)} was claimed, then cancelled while still preparing, before it reached its adapter (${source.errorCode}).`
+              : `Held run never started: Paperclip's dispatch cancelled ${ownerName ?? "the agent"}'s run ${String(hold.runId).slice(0, 8)} before it began (${source.errorCode}).`,
+          );
         }
       }
     }

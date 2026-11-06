@@ -23,7 +23,7 @@
 | `pch costs --audit [--days N]` | Checks the cost figures of the last N days (default 7): tokens, reported cost, what the tokens cost at list price, what cost sync posts, and duplicates. Changes nothing. See [cost sync](cost-sync.md#checking-the-figures). |
 | `pch costs --compare-days N` | The last N days against the N days before, each costed as cost sync posts it now and as it did before 1.12: how much of a change is usage, and how much the new costing. Changes nothing; after `--audit`, both. See [cost sync](cost-sync.md#comparing-two-periods). |
 | `pch costs --retry-skipped` | Lists the runs cost sync skipped and why, and queues those Paperclip rejected to be posted again on the service's next pass. See [cost sync](cost-sync.md#when-paperclip-rejects-a-cost-event). |
-| `pch models` | Every agent's adapter, model, effort and status. A paused agent also shows why, as far as Paperclip says: its holds (`manual`, `budget`, …, or `no hold`), a pause or resume Paperclip hasn't finished (`still pausing`), and since when: `paused (no hold, still pausing, since 2026-10-31 21:48 UTC)` is an agent whose resume can't take effect yet ([watchdog 16](watchdog.md#a-resume-that-doesnt-take-effect)). |
+| `pch models` | Every agent's adapter, model, effort and status. A paused agent also shows why, as far as Paperclip says: its holds (`manual`, `budget`, …, or `no hold`), a pause or resume Paperclip hasn't finished (`still pausing`), and since when: `paused (no hold, still pausing, since 2026-01-15 09:30 UTC)` is an agent whose resume can't take effect yet ([watchdog 16](watchdog.md#a-resume-that-doesnt-take-effect)). |
 | `pch set-model FROM TO [--apply]` | Moves every agent on model `FROM` to `TO`. It previews unless you pass `--apply`. |
 | `pch run` | Runs the service in the foreground, as its container does. It refuses to start while another helper is running on the same data directory (see [Troubleshooting](troubleshooting.md)). You don't need it with the installer's setup: the service already runs in its own container. |
 | `pch login`, `pch revoke` | Create the helper's key; revoke and delete it. |
@@ -78,7 +78,7 @@ ACM: 96 blocked issues
   95 wait on other open issues. Those chains end at 13 issues:
     ACM-479    in_review    Carla          holds 31  ← a question card to Gilfoyle, 30 h old, never delivered (routed to ACM-530)
     ACM-517    in_review                   holds 12  ← its approval is waiting on you (Decisions)
-    ACM-284    in_review    Jian-Yang      holds 9   ← review by Jian-Yang
+    ACM-284    in_review    Monica         holds 9   ← review by Monica
     …
   1 blocked by their agent with no blocking issue linked. These wait on someone, often you:
     ACM-490    Carla          "Which signing certificate should the installer use?"
@@ -86,7 +86,7 @@ ACM: 96 blocked issues
 
   8 question cards addressed to an agent that isn't the issue's assignee. Paperclip never wakes that agent for them:
     ACM-413    Carla → Gilfoyle         2 days   routed to ACM-529
-      DIR-413 is implemented at 299bc3fbc (PR #130), but verification is red. Please route…
+      ACM-413 is implemented at 0123abc (PR #130), but verification is red. Please route…
     …
 ```
 
@@ -184,9 +184,9 @@ Paperclip holds an issue (`legacy_execution_requires_reconciliation`) when a run
 
 `pch release ISSUE` shows the hold, the held run (status, process, lease) and the saved messages, and changes nothing. `--apply` records the board's reconciliation (`POST /api/issues/:id/recovery-actions/resolve`): the run has stopped, and what it did is unverified (`--outcome=mixed`, the default; or `completed`, `not_performed`). Paperclip moves the issue to `todo`, and the command then delivers the saved messages, as Interrupt does.
 
-**A run Paperclip cancelled before it started** (its dispatch refused it a moment after it was queued: `issue_assignee_changed`, `issue_disposition_repair_superseded`, …) is held the same way, though it did nothing. The command says so ("Paperclip cancelled this run before it started … no start, process, session, usage, lease or execution event") and records `not_performed` by default, with that as the evidence; there is nothing of it for the agent to check. `--outcome` still overrides.
+**A run Paperclip cancelled before it started** (its dispatch refused it a moment after it was queued: `issue_assignee_changed`, `issue_disposition_repair_superseded`, …) is held the same way, though it did nothing. The command says so ("Paperclip cancelled this run before it started … no start, process, session, usage, lease or execution event") and records `not_performed` by default, with that as the evidence; there is nothing of it for the agent to check. `--outcome` still overrides. A run that Paperclip claimed and a reassignment then cancelled while it was still preparing, before it reached its adapter (`issue_reassigned`), counts the same, and the command says that instead.
 
-It refuses while the run is still active, its environment lease is unreleased, or its process is alive on the helper's host. It also refuses while the issue's review stage is pending, whatever its status: Paperclip's release moves the issue to `todo`, and that ends the review (the stage and its return assignee are cleared). Likewise while the held run is another agent's than the assignee's (Paperclip refuses that), or other issues still block the issue. For a run that never started on a review, it says what lifts it ([22](watchdog.md#22-holds-behind-runs-that-never-started)). Since nobody verified what an executed run did, have the agent check the branch before it builds on it.
+It refuses while the run is still active, its environment lease is unreleased, or its process is alive on the helper's host. It also refuses on any other pending review, whatever its status: Paperclip's release moves the issue to `todo`, which it refuses while a review is pending, or does by ending the review. Likewise while other issues still block the issue. **When the issue belongs to another agent** (someone gave it on after the run, or the held run was its reviewer's and that review has since ended), the release needs the issue with the held run's agent, and reassigning it back while that agent's run is queued or starting would hold it again. So `--apply` gives it back to that agent a moment if needed (only while nothing runs on the issue), comments, as you, asking it to reassign the issue to the agent it belongs to and change nothing else, releases the hold and delivers the saved messages, so that agent's run hands it on. Check a few minutes later that it arrived; the watchdog checks its own. **A held review** (the run is its reviewer's, and the reviewer has the issue) is released without ending it: on one Paperclip has parked in `blocked` (or `todo`), `--apply` comments, as you, for the reviewer (which moves it to `todo` with the review kept), releases every recovery action for the run, and asks for review again, which brings back the same stage, reviewer and return assignee; each step is checked. On one still `in_review` at its first stage with nothing in it completed, `--apply` ends the review, releases the hold and starts the same first stage again with the same reviewer and implementer, the review request passed back; saved messages stay on the issue for the review run. The watchdog does either by itself ([22](watchdog.md#22-holds-behind-runs-that-never-started)). Since nobody verified what an executed run did, have the agent check the branch before it builds on it.
 
 The [watchdog](watchdog.md#7-holds-paperclip-can-never-release-by-itself) does this by itself for a hold whose run recorded no process at all, and for one whose run [never started](watchdog.md#22-holds-behind-runs-that-never-started) (`WATCHDOG_RELEASE_HOLDS`). Use the command for a hold it leaves to you, or to release one without waiting.
 
@@ -204,7 +204,7 @@ When an agent creates an issue from another issue's work (a follow-up, a sub-iss
 ```text
 $ pch workspace ACM-416
 ACM-416: blocked — Intermittent: SelfTest on elevated Windows
-Workspace: reuses ACM-318's workspace 0b4a273f (archived 2026-10-16T06:36:12.000Z, branch ACM-318-recovery): every run fails at setup
+Workspace: reuses ACM-318's workspace 1a2b3c4d (archived 2026-10-16T06:36:12.000Z, branch ACM-318-recovery): every run fails at setup
 Also linked to it: ACM-415 (in_review)
 
 --apply gives these 2 issues a new isolated workspace on the next run,
@@ -251,7 +251,7 @@ ACM: 231 open workspaces, 162 of them worktrees of issues finished 1+ days ago
   Paperclip won't close 23:
     ACM-305    done        6d  still linked to open issue ACM-318 (in_progress)  ACM-305-…
                /srv/app/.paperclip/worktrees/ACM-305-…
-    ACM-311    cancelled   4d  run 3f2a91c0 still holds the issue although it ended (cancelled 4d ago): see pch why ACM-311  ACM-311-…
+    ACM-311    cancelled   4d  run 5e6f7a8b still holds the issue although it ended (cancelled 4d ago): see pch why ACM-311  ACM-311-…
                /srv/app/.paperclip/worktrees/ACM-311-…
   Left alone: 31 of open issues (18 in_progress, 9 blocked, 4 todo), 2 of issues finished in the last day.
   --verbose lists each of them, and why.
@@ -308,7 +308,7 @@ Once the repair has run on the host:
 ```
 
 - **The check** prints the worktree's own link: `gitdir: ../../../.git/worktrees/…` (relative) confirms the cause. A folder instead of a file means the worktree was replaced by a separate clone, which the repair doesn't fix.
-- **The repair** sets `worktree.useRelativePaths false` in that repository's own config, so worktrees Paperclip creates there from now on get absolute links whatever the user's global setting says, and rewrites the links of every worktree git lists for the checkout as absolute paths. For Paperclip's own layout that is `git -C "$B" worktree repair --no-relative-paths "$B"/.paperclip/worktrees/*/`, the form that fixed it on a live instance; going by `git worktree list` also catches a worktree a branch name with a slash nests a level down, and never another repository's. Run it as the user Paperclip runs as, so the files keep their owner. Both counts must print 0. It needs GNU `xargs` (`-r`), as on any Linux host.
+- **The repair** sets `worktree.useRelativePaths false` in that repository's own config, so worktrees Paperclip creates there from now on get absolute links whatever the user's global setting says, and rewrites the links of every worktree git lists for the checkout as absolute paths. For Paperclip's own layout that is `git -C "$B" worktree repair --no-relative-paths "$B"/.paperclip/worktrees/*/`, the form that fixes it; going by `git worktree list` also catches a worktree a branch name with a slash nests a level down, and never another repository's. Run it as the user Paperclip runs as, so the files keep their owner. Both counts must print 0. It needs GNU `xargs` (`-r`), as on any Linux host.
 - **The last line** removes `extensions.relativeWorktrees` from the checkout's config. Git turns that repository extension on when it writes relative links, and `git worktree repair --no-relative-paths` leaves it on. Git and Paperclip don't mind it, but tools with their own git reader refuse the whole repository: .NET SourceLink fails every `dotnet build` with "Unsupported repository extension 'relativeworktrees'", and libgit2-based tools can fail the same way. It runs only when both counts are 0, so a half-finished repair never leaves relative links without the extension git needs to read them; a key that is already gone (`git config --unset` exits 5) counts as done. (`pch` prints the counting pipeline in full where this shows `…`.)
 - **Repaired with 1.14.0, and builds now fail** with "Unsupported repository extension 'relativeworktrees'": run only that last line (with `B` set to the checkout). `pch why` recommends it when an agent's comment or its last run's error carries that message.
 - **For worktrees outside Paperclip's own layout** (a project whose workspace strategy sets `worktreeParentDir`), the checkout can't be told from the path, so the first line asks git for it.

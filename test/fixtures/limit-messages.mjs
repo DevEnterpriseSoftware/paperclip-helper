@@ -2,7 +2,7 @@
 // word for word from where they come from. A run's `error` is the adapter's own
 // message, so these are what Paperclip stores.
 //
-// Codex: openai/codex at 970111f (2026-10-23), codex-rs/protocol/src/error.rs
+// Codex: openai/codex as of 2026-10-23, codex-rs/protocol/src/error.rs
 // (UsageLimitReachedError's Display and the CodexErr messages) and its tests
 // (error_tests.rs), and codex-rs/codex-api/src/sse/responses.rs for the API's own
 // quota message. Codex writes the reset time with format_retry_timestamp: "3:45 PM"

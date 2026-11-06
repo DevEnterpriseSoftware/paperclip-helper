@@ -10,8 +10,9 @@
 // the board's reconciliation (POST /recovery-actions/resolve) releases it.
 //
 // A run Paperclip's dispatch gate cancelled before it started is held the same way
-// (up to 2026.1023.0), though it did nothing: neverStarted() says so from the run's
-// own record, and its release records "not performed".
+// (up to 2026.1023.0), though it did nothing, and so is one a reassignment cancelled
+// after its claim but before its dispatch: neverStarted() says so from the run's own
+// record, and its release records "not performed".
 //
 // `pch release` and the watchdog share this module: the command for any such
 // hold, after you've looked; the watchdog only for one Paperclip can never
@@ -72,6 +73,16 @@ const STARTED_EVENTS = new Set([
   "session.resumed", "session.updated", "turn.started", "provider.event", "provider.rpc_result", "tool.execution.started",
 ]);
 
+// A claim gives a legacy run a start time, a controller lease and the "preparing" stage
+// (legacyControllerClaim), and nothing more until it is dispatched to its adapter
+// ("dispatching", then the adapter.invoke event).
+const CLAIM_FIELDS = new Set(["controllerBootId", "controllerLeaseExpiresAt", "executionStage"]);
+// What cancels a claimed run before dispatch without its adapter ever acknowledging a
+// stop: the board's reassignment (routes/issues.ts, "Cancelled before issue
+// reassignment"). Seen on 2026.1023.0: a disposition repair claimed, then cancelled by
+// a board reassignment a few seconds later, still preparing.
+export const CLAIMED_CANCEL_CODES = new Set(["issue_reassigned"]);
+
 const tokensIn = (usage) => {
   if (!usage || typeof usage !== "object") return 0;
   return ["inputTokens", "outputTokens", "cachedInputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "totalTokens"]
@@ -82,17 +93,23 @@ const tokensIn = (usage) => {
 // says, what it did is unverified and for a person to judge (watchdog 7 leaves it).
 export const ranWork = (run) => tokensIn(run?.usageJson) > 0 || Number(run?.usageJson?.costUsd) > 0;
 
-// The run, as far as its own record goes, was cancelled by a dispatch gate before
-// anything ran: no start, process, session, controller, stage, usage or retained
-// workspace. Whether its events and lease agree is checked separately (neverStarted).
+// The run, as far as its own record goes, was cancelled before anything ran: by a
+// dispatch gate before it was claimed (no start, controller or stage), or by a
+// reassignment after its claim but before its dispatch (still "preparing"); either way
+// no process, session, usage or retained workspace. Whether its events and lease agree
+// is checked separately (neverStarted).
 function looksUnstarted(run) {
   if (!run || run.status !== "cancelled" || !run.finishedAt) return false;
-  // Present and null: a run Paperclip claimed has a start time, and a record without
-  // the field proves nothing.
-  if (!("startedAt" in run) || run.startedAt !== null) return false;
+  // A record without the field proves nothing either way.
+  if (!("startedAt" in run)) return false;
   if (run.runtimeMode === "native") return false;
-  if (!DISPATCH_GATE_CODES.has(run.errorCode)) return false;
-  if (STARTED_FIELDS.some((k) => run[k] != null)) return false;
+  // Never claimed: a dispatch gate's code. Claimed: cancelled by a reassignment while
+  // still preparing, with nothing beyond what a claim sets.
+  const claimed = run.startedAt !== null;
+  if (claimed) {
+    if (!CLAIMED_CANCEL_CODES.has(run.errorCode) || (run.executionStage != null && run.executionStage !== "preparing")) return false;
+  } else if (!DISPATCH_GATE_CODES.has(run.errorCode)) return false;
+  if (STARTED_FIELDS.some((k) => run[k] != null && !(claimed && CLAIM_FIELDS.has(k)))) return false;
   if (ranWork(run)) return false;
   const result = run.resultJson ?? {};
   if (result.workspaceRestoreFailure || result.workspaceRestoreRecovery) return false;
@@ -118,16 +135,25 @@ export async function holdFacts(api, issueRef) {
   }
   const agent = hold.agentId ? await api.request("GET", `/api/agents/${hold.agentId}`).catch(() => null) : null;
   const queue = await api.request("GET", `/api/issues/${id}/queued-comments`).catch(() => null);
-  return { issue, hold, run, agent, queue, activeRun: list.some((r) => ACTIVE_RUN.has(r.status)) };
+  // The issue is the held run's agent's, with no review pending: was it their review that ended?
+  let endedReview = null;
+  if (hold.cause === RECONCILIATION_CAUSE && hold.agentId && issue.assigneeAgentId === hold.agentId && !reviewPending(issue)) {
+    const activity = await api.request("GET", `/api/issues/${id}/activity`).catch(() => null);
+    endedReview = endedReviewOf(activity, hold.agentId);
+  }
+  return { issue, hold, run, agent, queue, endedReview, activeRun: list.some((r) => ACTIVE_RUN.has(r.status)) };
 }
 
-// A hold left by a run Paperclip cancelled before it started (DIR-1294, DIR-1230): a
+// A hold left by a run Paperclip cancelled before it started: a
 // dispatch gate refused it (the issue changed hands a second earlier, a scheduled
 // repair was no longer needed), and Paperclip still holds the issue for
 // reconciliation as if it had run. There is nothing to reconcile: no start, process,
 // session, usage, lease or execution event. Paperclip can't release it by itself:
 // the run's agent never runs on the issue again to supersede it, and a message is
 // saved behind it for good ("no verified stop record").
+// A never-started run that Paperclip had claimed (cancelled while preparing), for the wording.
+export const claimedOnly = (run) => run?.startedAt != null;
+
 export function neverStarted(facts) {
   const { hold, run, issue } = facts ?? {};
   if (hold?.cause !== RECONCILIATION_CAUSE || !run?.detailRead || !looksUnstarted(run)) return false;
@@ -149,8 +175,158 @@ export const reviewPending = (issue) => issue?.executionState?.status === "pendi
 const openBlockers = (issue) =>
   (Array.isArray(issue?.blockedBy) ? issue.blockedBy : []).filter((b) => !["done", "cancelled"].includes(b?.status));
 
-// Why this hold can't be released at all right now; empty when it can.
-export function releaseProblems(facts) {
+// A held review that can be released without ending it (measured on 2026.1023.0).
+// Paperclip's settle sweep sets a held review to blocked with a direct status update,
+// so its stage stays pending; a board user's comment then moves it to todo the same
+// way (the comment reopen), still pending. From todo the release needs no status
+// change, so neither the hand-back gate nor the stage transition runs, and a board
+// move back to in_review re-pends the very same stage (the drifted-stage repair):
+// participant, return assignee, review request, completed stages and round count all
+// kept. "lossless" for such an issue in blocked or todo.
+//
+// One still in review can't get there on demand (no board move out of review keeps the
+// stage, and Paperclip parks it only sometimes). "rebuild" for one whose review has
+// nothing in it to lose: its first stage, none completed, no rounds, no decision, no
+// agent to return to (a monitor on it is put back). The board's move to todo ends it, the hold is
+// released from todo, the implementer has the issue a moment (in backlog, so no run
+// starts), and review is asked for with the reviewer named: Paperclip starts the first
+// stage again with that reviewer and that implementer, and the review request passed
+// back. Measured on 2026.1023.0: the same stage, reviewer and return assignee, the
+// reviewer's run at once. Its saved wakes are cancelled as the issue leaves them (the
+// comments stay, and their review run reads them). null for any other review.
+const firstStageUntouched = (state) =>
+  (state.currentStageIndex ?? 0) === 0 && !(state.completedStageIds ?? []).length && !(state.changesRequestedCount ?? 0) &&
+  !state.lastDecisionId && !state.lastDecisionOutcome && state.returnAssignee?.type === "agent" && Boolean(state.returnAssignee.agentId);
+
+// A monitor on the issue's policy (the CI backstop's, say) is cleared by Paperclip when
+// the issue leaves in_progress and in_review (monitorClearReasonForIssue). Put back as
+// it was, a minute out if its check is already due; returns whether it was.
+async function restoreMonitor(api, id, monitor) {
+  if (!monitor) return false;
+  const now = await api.request("GET", `/api/issues/${id}`);
+  if (now.executionPolicy?.monitor) return false;
+  const due = Date.parse(monitor.nextCheckAt ?? "");
+  const nextCheckAt = Number.isFinite(due) && due > Date.now() + 30_000 ? monitor.nextCheckAt : new Date(Date.now() + 60_000).toISOString();
+  await api.request("PATCH", `/api/issues/${id}`, { executionPolicy: { ...(now.executionPolicy ?? {}), monitor: { ...monitor, nextCheckAt } } });
+  return true;
+}
+export function heldReviewRoute(facts) {
+  const { issue, hold } = facts ?? {};
+  if (!reviewPending(issue) || !hold?.agentId) return null;
+  const participant = issue.executionState.currentParticipant;
+  if (participant?.type !== "agent" || participant.agentId !== hold.agentId || issue.assigneeAgentId !== hold.agentId) return null;
+  if (issue.status === "blocked" || issue.status === "todo") return "lossless";
+  if (issue.status === "in_review" && firstStageUntouched(issue.executionState) && issue.executionState.returnAssignee.agentId !== hold.agentId) return "rebuild";
+  return null;
+}
+
+// A board reassignment cancels the old owner's running run, and Paperclip cancels their
+// queued one at dispatch once they no longer have the issue. Up to 2026.1023.0 either can
+// hold the issue again: at once (a run claimed but still preparing), or when they next
+// own it while nothing runs and that cancelled run is still their latest there (the
+// stranded-work sweep: a continuation queued for them after a release, cancelled when
+// the board reassigned the issue, held again once they became its reviewer again). A run that reaches its adapter is stopped with a receipt and holds
+// nothing, and so is a run whose own agent reassigns the issue.
+//
+// So where the release needs the issue with the held run's agent and the work belongs
+// to someone else, the watchdog doesn't move it on itself while their run may be queued:
+// it asks them to. "Hand-on" routes:
+//   owner-moved   the issue was given to another agent after the run (no review
+//                 pending): back to the run's agent a moment, who is asked to reassign
+//                 it to that agent; the release is accepted while it is theirs.
+//   review-ended  the run was its reviewer's, and the board ended that review with the
+//                 issue still theirs (a move to todo clears the stage): they are
+//                 asked to give it back to the implementer the review would have
+//                 returned to, rather than being handed the saved messages, which are
+//                 the implementer's work.
+// Null for anything else.
+export function handOnRoute(facts) {
+  const { issue, hold } = facts ?? {};
+  if (!hold?.agentId || !issue || reviewPending(issue) || ["done", "cancelled"].includes(issue.status)) return null;
+  if (issue.assigneeAgentId && issue.assigneeAgentId !== hold.agentId) {
+    return { kind: "owner-moved", targetAgentId: issue.assigneeAgentId, reassign: true };
+  }
+  if (issue.assigneeAgentId === hold.agentId && facts.endedReview?.returnAssigneeAgentId) {
+    return { kind: "review-ended", targetAgentId: facts.endedReview.returnAssigneeAgentId, reassign: false };
+  }
+  return null;
+}
+
+// The review an agent was the participant of, ended without a decision, from the issue's
+// activity log (newest first): the newest entry whose executionState change starts or
+// ends a pending stage decides. { returnAssigneeAgentId, endedAt } when it ended a stage
+// pending with `agentId`, returning to another agent; else null.
+export function endedReviewOf(activity, agentId) {
+  for (const entry of Array.isArray(activity) ? activity : []) {
+    const change = entry?.action === "issue.updated" ? entry.details?.changes?.executionState : null;
+    if (!change) continue;
+    const { from, to } = change;
+    if (from?.status !== "pending" && to?.status !== "pending") continue; // a monitor's change, say
+    if (to?.status === "pending") return null; // a stage started (again)
+    if (from.currentParticipant?.type !== "agent" || from.currentParticipant.agentId !== agentId) return null;
+    if (to?.lastDecisionId && to.lastDecisionId !== from.lastDecisionId) return null; // decided, not ended
+    const back = from.returnAssignee;
+    if (back?.type !== "agent" || !back.agentId || back.agentId === agentId) return null;
+    return { returnAssigneeAgentId: back.agentId, endedAt: entry.createdAt ?? null };
+  }
+  return null;
+}
+
+// The comment that asks the held run's agent to hand the issue on.
+export function handOnText({ route, holdAgent, target, errorCode, signature = "" }) {
+  const mention = (a, fallback) => (a?.id ? `[@${a.name ?? fallback}](agent://${a.id})` : fallback);
+  const them = target?.name ?? "them";
+  return (
+    `${mention(holdAgent, "")} Paperclip held this issue behind a run of yours that was cancelled before it did anything (${errorCode}), ` +
+    `and it releases that hold only while the issue is yours${route.kind === "owner-moved" ? ", so it is yours again for a moment" : ""}.` +
+    (route.kind === "review-ended" ? ` The review that run was for has ended, and the work here is ${mention(target, "its implementer")}'s.` : "") +
+    ` Please reassign this issue to ${mention(target, "its owner")} and change nothing else: don't work on it or answer the messages here, which are for ${them}.` +
+    signature
+  ).trim();
+}
+
+// The hand-on release (handOnRoute): the issue to the held run's agent if it isn't theirs
+// (a PATCH of assigneeAgentId alone, nothing running to cancel: releaseProblems refuses
+// any active run), the comment asking them to hand it on, the release, and the saved
+// messages delivered, so their run starts now. Their own reassignment is the run's
+// disposition, so no repair follows. If anything fails after the issue was moved, it
+// goes back to where it was. Returns deliverAfterRelease's answer plus { handOn, reassigned }.
+export async function releaseHandedOn(api, facts, { route, comment, actionOutcome = defaultOutcome(facts), note, signature = "" }) {
+  const { issue, hold } = facts;
+  const id = encodeURIComponent(issue.id ?? issue.identifier);
+  let reassigned = false;
+  const back = async () => {
+    if (reassigned) await api.request("PATCH", `/api/issues/${id}`, { assigneeAgentId: route.targetAgentId }).catch(() => {});
+  };
+  try {
+    if (route.reassign) {
+      await api.request("PATCH", `/api/issues/${id}`, { assigneeAgentId: hold.agentId });
+      reassigned = true;
+      const now = await api.request("GET", `/api/issues/${id}`);
+      if (now.assigneeAgentId !== hold.agentId) throw new Error("Paperclip didn't give the issue to the held run's agent");
+      if (reviewPending(now)) throw new Error("giving the issue to the held run's agent started a review stage");
+    }
+    await api.request("POST", `/api/issues/${id}/comments`, { body: comment });
+    await resolveRun(api, id, facts, { actionOutcome, note, signature });
+  } catch (err) {
+    await back();
+    throw err;
+  }
+  return { ...(await deliverAfterRelease(api, id)), handOn: route.kind, reassigned };
+}
+
+// What a review is, for telling whether a step changed it.
+const REVIEW_KEYS = [
+  "status", "currentStageId", "currentStageIndex", "currentStageType", "currentParticipant", "returnAssignee", "reviewRequest",
+  "completedStageIds", "lastDecisionId", "lastDecisionOutcome", "changesRequestedCount",
+];
+export const sameReview = (a, b) => REVIEW_KEYS.every((k) => JSON.stringify(a?.[k] ?? null) === JSON.stringify(b?.[k] ?? null));
+
+// Why this hold can't be released at all right now; empty when it can. With
+// { heldReview: true }, a pending review heldReviewRoute has a route for isn't one.
+// An active run (queued or running) on the issue always is: it would supersede the
+// hold, and a reassignment now would cancel it and hold the issue again.
+export function releaseProblems(facts, { heldReview = false, handOn = false } = {}) {
   const { hold, run, activeRun, issue } = facts;
   const problems = [];
   if (!hold.runId || !hold.recoveryActionId) problems.push("the hold names no source run or recovery action");
@@ -163,13 +339,16 @@ export function releaseProblems(facts) {
   }
   // Paperclip's reconciliation moves the issue to todo. While a review stage is pending
   // it refuses that when the hold's owner still has the issue ("Safe recovery hand-back
-  // cannot bypass a pending execution review or approval stage", 409, seen live on
-  // DIR-1294 and DIR-1355), and otherwise applies it as a board override that ends the
+  // cannot bypass a pending execution review or approval stage", 409, seen on
+  // 2026.1023.0), and otherwise applies it as a board override that ends the
   // review (executionState cleared, its return assignee with it) (routes/issues.ts,
   // recovery-actions/resolve, 2026.1023.0). Neither keeps the review moving.
-  if (reviewPending(issue)) problems.push("the issue's review stage is pending, and the release moves it to todo, which Paperclip either refuses or does by ending the review");
+  if (reviewPending(issue) && !(heldReview && heldReviewRoute(facts))) {
+    problems.push("the issue's review stage is pending, and the release moves it to todo, which Paperclip either refuses or does by ending the review");
+  }
   // It accepts a reconciliation only from the run's own agent as the assignee.
-  if (hold.agentId && issue?.assigneeAgentId && hold.agentId !== issue.assigneeAgentId) {
+  // With { handOn: true }, one handOnRoute gives back to the run's agent first isn't one.
+  if (hold.agentId && issue?.assigneeAgentId && hold.agentId !== issue.assigneeAgentId && !(handOn && handOnRoute(facts)?.reassign)) {
     problems.push("the held run is another agent's than the assignee's, and Paperclip releases it only while the run's agent has the issue");
   }
   // The move to todo would also unblock an issue blocked by other issues.
@@ -200,7 +379,7 @@ export function pausedHold(facts) {
 }
 
 // What lifts it: an explicit continuation (admitExplicitNativeContinuation,
-// server/src/services/explicit-native-continuation.ts, main at e5c9e60). A board
+// server/src/services/explicit-native-continuation.ts, on main). A board
 // user's plain comment on the issue (wake reason issue_commented or
 // issue_reopened_via_comment) while the issue is assigned to the hold's own agent
 // (executionBlocker.agentId, whose run the pause cancelled), that agent invokable, on
@@ -244,8 +423,8 @@ export function continuationText(agent, signature = "") {
 // After a release: is the hold gone, and do saved messages still wait? Paperclip may
 // start them by itself; they are pressed only if they still wait. Once the hold is
 // gone, Paperclip can promote the saved wakes between our read of the queue and the
-// press (409 "The queued message is no longer pending", seen live on DIR-861 and
-// DIR-631): the release has worked, so that is read again, never reported as failing.
+// press (409 "The queued message is no longer pending", seen on 2026.1023.0):
+// the release has worked, so that is read again, never reported as failing.
 async function deliverAfterRelease(api, id) {
   const after = await api.request("GET", `/api/issues/${id}`);
   if (after.executionBlocker) {
@@ -282,29 +461,147 @@ export const defaultOutcome = (facts) => (neverStarted(facts) ? "not_performed" 
 
 // Records the board's reconciliation, then delivers the saved messages the way
 // Interrupt does. Returns { status, delivered, waiting }.
-export async function releaseHold(api, facts, { actionOutcome = defaultOutcome(facts), note, signature = "" } = {}) {
-  const { issue, hold, run } = facts;
-  const id = encodeURIComponent(issue.id ?? issue.identifier);
+// Paperclip can record more than one recovery action for the same held run (its
+// sweep makes another when a later wake is refused behind the hold; seen on
+// 2026.1023.0), and the hold lasts until every one is reconciled. Resolves them in
+// turn, up to a few, while the hold is still the same run's.
+const MAX_ACTIONS_PER_RUN = 5;
+async function resolveRun(api, id, facts, { actionOutcome, note, signature }) {
+  const { hold, run } = facts;
   const ended = run ? `${run.status}${run.errorCode ? ` (${run.errorCode})` : ""}` : "stopped";
   const unstarted = neverStarted(facts);
-  await api.request("POST", `/api/issues/${id}/recovery-actions/resolve`, {
-    actionId: hold.recoveryActionId,
-    outcome: "restored",
-    sourceIssueStatus: "todo",
-    resolutionNote: `${note ?? "Released by the board: the held run has stopped."}${signature}`,
-    executionReconciliation: {
-      runId: hold.runId,
-      providerStopped: true,
-      actionOutcome,
-      outcomeEvidence: unstarted
-        ? `Run ${hold.runId} was cancelled by Paperclip's dispatch gate before it started (${run.errorCode}): ` +
-          "it has no start time, process, session, usage, environment lease or execution event, so it performed no actions." +
-          (actionOutcome === "not_performed" ? "" : ` The board recorded its actions as ${actionOutcome.replace("_", " ")}.`)
-        : `Run ${hold.runId} ended ${ended} and recorded no process that is still running. ` +
-          (actionOutcome === "mixed"
-            ? "What it did before stopping is unverified; the assignee checks the workspace and branch before continuing."
-            : `The board verified its actions as ${actionOutcome.replace("_", " ")}.`),
-    },
-  });
+  let actionId = hold.recoveryActionId;
+  let resolved = 0;
+  for (; resolved < MAX_ACTIONS_PER_RUN && actionId; resolved += 1) {
+    await api.request("POST", `/api/issues/${id}/recovery-actions/resolve`, {
+      actionId,
+      outcome: "restored",
+      sourceIssueStatus: "todo",
+      resolutionNote: `${note ?? "Released by the board: the held run has stopped."}${signature}`,
+      executionReconciliation: {
+        runId: hold.runId,
+        providerStopped: true,
+        actionOutcome,
+        outcomeEvidence: unstarted
+          ? (claimedOnly(run)
+            ? `Run ${hold.runId} was cancelled after Paperclip claimed it, while still preparing, before it was dispatched to its adapter (${run.errorCode}): ` +
+              "it has no process, adapter invocation, session, usage, environment lease or execution event, so it performed no actions."
+            : `Run ${hold.runId} was cancelled by Paperclip's dispatch gate before it started (${run.errorCode}): ` +
+              "it has no start time, process, session, usage, environment lease or execution event, so it performed no actions.") +
+            (actionOutcome === "not_performed" ? "" : ` The board recorded its actions as ${actionOutcome.replace("_", " ")}.`)
+          : `Run ${hold.runId} ended ${ended} and recorded no process that is still running. ` +
+            (actionOutcome === "mixed"
+              ? "What it did before stopping is unverified; the assignee checks the workspace and branch before continuing."
+              : `The board verified its actions as ${actionOutcome.replace("_", " ")}.`),
+      },
+    });
+    const now = await api.request("GET", `/api/issues/${id}`);
+    const next = now.executionBlocker;
+    actionId = next && next.runId === hold.runId && next.recoveryActionId && next.recoveryActionId !== actionId ? next.recoveryActionId : null;
+  }
+  return resolved;
+}
+
+export async function releaseHold(api, facts, { actionOutcome = defaultOutcome(facts), note, signature = "" } = {}) {
+  const { issue } = facts;
+  const id = encodeURIComponent(issue.id ?? issue.identifier);
+  await resolveRun(api, id, facts, { actionOutcome, note, signature });
   return deliverAfterRelease(api, id);
+}
+
+// The rebuilt review (heldReviewRoute "rebuild"), for one still in review with nothing
+// in it to lose. Each step is checked: the stage must come back with the same id,
+// reviewer and return assignee, the review request passed back. If the release fails
+// after the review was ended, the review is asked for again before giving up.
+// Returns deliverAfterRelease's answer plus { review: "rebuilt" }.
+export async function releaseRebuiltReview(api, facts, { actionOutcome = defaultOutcome(facts), note, signature = "" }) {
+  const { issue, hold } = facts;
+  const id = encodeURIComponent(issue.id ?? issue.identifier);
+  const review = issue.executionState;
+  const monitor = issue.executionPolicy?.monitor ?? null;
+  const read = () => api.request("GET", `/api/issues/${id}`);
+  const askAgain = async () => {
+    await api.request("PATCH", `/api/issues/${id}`, { status: "backlog", assigneeAgentId: review.returnAssignee.agentId });
+    await api.request("PATCH", `/api/issues/${id}`, { status: "in_review", assigneeAgentId: hold.agentId, ...(review.reviewRequest ? { reviewRequest: review.reviewRequest } : {}) });
+  };
+  await api.request("PATCH", `/api/issues/${id}`, { status: "todo" });
+  const cleared = await read();
+  if (cleared.status !== "todo" || cleared.assigneeAgentId !== hold.agentId) {
+    await askAgain().catch(() => {});
+    throw new Error(`Paperclip didn't take the review to todo with the reviewer still assigned (it is ${cleared.status})`);
+  }
+  try {
+    await resolveRun(api, id, facts, { actionOutcome, note, signature });
+  } catch (err) {
+    await askAgain().catch(() => {});
+    throw err;
+  }
+  try {
+    await askAgain();
+  } catch (first) {
+    await askAgain().catch(() => {
+      const err = new Error(`the hold is released, but asking for the review again failed (${first.message}): assign the issue to its implementer, then move it to in_review with the reviewer`);
+      err.reviewChanged = true;
+      throw err;
+    });
+  }
+  const after = await read();
+  const now = after.executionState ?? {};
+  const same = after.status === "in_review" && now.status === "pending" && now.currentStageId === review.currentStageId &&
+    JSON.stringify(now.currentParticipant?.agentId ?? null) === JSON.stringify(review.currentParticipant.agentId) &&
+    JSON.stringify(now.returnAssignee?.agentId ?? null) === JSON.stringify(review.returnAssignee.agentId) &&
+    JSON.stringify(now.reviewRequest ?? null) === JSON.stringify(review.reviewRequest ?? null);
+  if (!same) {
+    const err = new Error(`the hold is released, but the review didn't come back as it was (it is ${after.status}); check its stage`);
+    err.reviewChanged = true;
+    throw err;
+  }
+  const monitorRestored = await restoreMonitor(api, id, monitor).catch(() => false);
+  return { ...(await deliverAfterRelease(api, id)), review: "rebuilt", monitorRestored };
+}
+
+// The lossless release of a held review (heldReviewRoute "lossless"): a board user's
+// comment (`comment`) moves a blocked one to todo with its stage kept, the hold's
+// actions are released from todo, and the review is asked for again, which re-pends
+// the same stage. Every step is checked against the review as it was; the first that
+// doesn't leave it the same stops, and an issue left in todo by a failed release is
+// put back in review. Returns deliverAfterRelease's answer plus { review: true }.
+export async function releaseHeldReview(api, facts, { actionOutcome = defaultOutcome(facts), note, signature = "", comment }) {
+  const { issue } = facts;
+  const id = encodeURIComponent(issue.id ?? issue.identifier);
+  const review = issue.executionState;
+  const monitor = issue.executionPolicy?.monitor ?? null;
+  const read = () => api.request("GET", `/api/issues/${id}`);
+  let current = issue;
+  if (current.status === "blocked") {
+    await api.request("POST", `/api/issues/${id}/comments`, { body: comment });
+    current = await read();
+    if (current.status !== "todo" || !sameReview(review, current.executionState)) {
+      throw new Error(`Paperclip didn't move the review to todo with its stage kept (it is ${current.status}${sameReview(review, current.executionState) ? "" : ", its review changed"})`);
+    }
+  }
+  try {
+    await resolveRun(api, id, facts, { actionOutcome, note, signature });
+  } catch (err) {
+    // Back in review, as it was, before giving up.
+    await api.request("PATCH", `/api/issues/${id}`, { status: "in_review" }).catch(() => {});
+    throw err;
+  }
+  try {
+    await api.request("PATCH", `/api/issues/${id}`, { status: "in_review" });
+  } catch (first) {
+    await api.request("PATCH", `/api/issues/${id}`, { status: "in_review" }).catch(() => {
+      const err = new Error(`the hold is released, but putting the issue back in review failed (${first.message}): move it to in_review, which keeps its stage`);
+      err.reviewChanged = true;
+      throw err;
+    });
+  }
+  const after = await read();
+  if (after.status !== "in_review" || !sameReview(review, after.executionState)) {
+    const err = new Error(`the hold is released, but the review didn't come back as it was (it is ${after.status}); check its stage`);
+    err.reviewChanged = true;
+    throw err;
+  }
+  const monitorRestored = await restoreMonitor(api, id, monitor).catch(() => false);
+  return { ...(await deliverAfterRelease(api, id)), review: "kept", monitorRestored };
 }

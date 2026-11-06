@@ -161,7 +161,7 @@ const checkoutLine = (paths) =>
 // every worktree git lists for it (any other with relative links fails on its next run),
 // the two counts that should both print 0, and then, only if they do, the removal of
 // the extension git leaves behind. For Paperclip's own layout this repairs what
-// `"$B"/.paperclip/worktrees/*/` names, the form that fixed it on a live instance.
+// `"$B"/.paperclip/worktrees/*/` names, the form that fixes it.
 export function repairCommands(paths) {
   return [
     checkoutLine(paths),

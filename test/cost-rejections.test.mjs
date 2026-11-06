@@ -14,8 +14,8 @@ import * as commands from "../src/commands.mjs";
 // Validation error), with their usage as it recorded them: ChatGPT plan, no cost
 // reported, about 90% of the input read from cache, no fast mode. Only the times
 // are moved to just now, so they are past the settle window and inside the price table.
-const AGENT = "fc4847f2-ec64-425f-8d03-026170d0fbe2";
-const ISSUE = "7a6c4e1b-ec62-4801-84f7-0c1b1935b783";
+const AGENT = "bbbbbbb1-0000-4000-8000-000000000001";
+const ISSUE = "ccccccc1-0000-4000-8000-000000000001";
 const usage = (input, cached, output) => ({
   model: "gpt-6.1-sol",
   biller: "chatgpt",
@@ -32,14 +32,14 @@ const usage = (input, cached, output) => ({
   freshSession: true,
 });
 const REJECTED = [
-  { id: "137e9527-5163-4be3-ab4a-7a73fdadbbf1", ago: 50, usageJson: usage(894_773, 810_752, 3_712) },
-  { id: "767ee7e9-1444-4891-b39b-2d18989b9236", ago: 40, usageJson: usage(406_398, 332_288, 2_060) },
-  { id: "60e17fd8-bbeb-4f13-9a6d-e5107c3436de", ago: 30, usageJson: usage(946_515, 852_864, 3_432) },
+  { id: "aaaaaaa1-0000-4000-8000-000000000001", ago: 50, usageJson: usage(894_773, 810_752, 3_712) },
+  { id: "aaaaaaa2-0000-4000-8000-000000000002", ago: 40, usageJson: usage(406_398, 332_288, 2_060) },
+  { id: "aaaaaaa3-0000-4000-8000-000000000003", ago: 30, usageJson: usage(946_515, 852_864, 3_432) },
 ];
 // What their tokens cost at gpt-6.1-sol's list price ($2 input, $0.10 cached, $10 output per M):
 // fresh input (input − cached) + cache reads + output.
-// 137e9527: 84,021 × 2 + 810,752 × 0.1 + 3,712 × 10 = $0.2862372 (and so on).
-const EXACT_USD = { "137e9527-5163-4be3-ab4a-7a73fdadbbf1": 0.2862372, "767ee7e9-1444-4891-b39b-2d18989b9236": 0.2020488, "60e17fd8-bbeb-4f13-9a6d-e5107c3436de": 0.3069084 };
+// aaaaaaa1: 84,021 × 2 + 810,752 × 0.1 + 3,712 × 10 = $0.2862372 (and so on).
+const EXACT_USD = { "aaaaaaa1-0000-4000-8000-000000000001": 0.2862372, "aaaaaaa2-0000-4000-8000-000000000002": 0.2020488, "aaaaaaa3-0000-4000-8000-000000000003": 0.3069084 };
 
 function seed(db) {
   db.agents.push({ id: AGENT, companyId: ids.company, name: "Carla", adapterType: "codex_local", adapterConfig: { model: "gpt-6.1-sol" }, status: "idle" });

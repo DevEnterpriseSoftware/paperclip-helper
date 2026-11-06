@@ -23,11 +23,11 @@ async function watchdogEnv(t, extra = {}) {
   return { ...env, gh, clock, watchdog: createWatchdog(env.ctx, env.state), later: (min) => (clock.now += min * 60_000) };
 }
 
-const RUN_URL = "https://github.com/org/app/actions/runs/39498202022";
+const RUN_URL = "https://github.com/org/app/actions/runs/30498202022";
 
 // Carla pushed, named the run she waits on, and ended her run with the issue in
 // progress. The run is still queued.
-function waitingOnCi(env, { status = "in_progress", comment = `Pushed b61d07a9. Waiting on ${RUN_URL} before resubmitting.`, runStatus = "queued" } = {}) {
+function waitingOnCi(env, { status = "in_progress", comment = `Pushed c0de1234. Waiting on ${RUN_URL} before resubmitting.`, runStatus = "queued" } = {}) {
   const carla = { id: uuid(), companyId: ids.company, name: "Carla", status: "idle" };
   env.db.agents.push(carla);
   const stages = [{ id: "s1", type: "review", participants: [{ type: "user", userId: ids.user }] }];
@@ -39,7 +39,7 @@ function waitingOnCi(env, { status = "in_progress", comment = `Pushed b61d07a9. 
   env.db.comments.push({ issueId: issue.id, identifier: issue.identifier, body: comment, authorAgentId: carla.id, createdAt: minutesAgo(5) });
   env.db.issueRuns[issue.id] = [{ runId: uuid(), agentId: carla.id, status: "succeeded", createdAt: minutesAgo(15), startedAt: minutesAgo(15), finishedAt: minutesAgo(5) }];
   const run = {
-    id: 39498202022, name: "ci", status: runStatus, conclusion: null, run_attempt: 1, head_branch: "acm-192", head_sha: "b61d07a91",
+    id: 30498202022, name: "ci", status: runStatus, conclusion: null, run_attempt: 1, head_branch: "acm-192", head_sha: "c0de12341",
     updated_at: minutesAgo(5), html_url: RUN_URL, pull_requests: [{ number: 188 }], jobs: [],
   };
   env.gh.runs["org/app"] = { [run.id]: run };
@@ -54,7 +54,7 @@ const monitorPatches = (db, issue) => db.patches.filter((p) => p.issueId === iss
 
 test("backstopMonitor: one check hours out, the run in its notes, one more attempt than the issue has used", () => {
   const now = Date.parse("2026-10-30T09:00:00Z");
-  const run = { id: 39498202022, html_url: RUN_URL };
+  const run = { id: 30498202022, html_url: RUN_URL };
   const m = backstopMonitor({ run, now, backstopMs: 360 * 60_000, attemptCount: 7 });
   assert.equal(m.kind, "external_service");
   assert.equal(m.serviceName, "github");
@@ -67,17 +67,17 @@ test("backstopMonitor: one check hours out, the run in its notes, one more attem
   assert.equal(backstopMonitor({ run, now, backstopMs: 3_600_000, attemptCount: 100 }).maxAttempts, undefined, "past Paperclip's cap of 100: none");
   assert.ok(isBackstop({ notes: m.notes, scheduledBy: "board" }));
   assert.ok(!isBackstop({ notes: m.notes, scheduledBy: "assignee" }), "an agent copying the notes doesn't make it the Helper's");
-  assert.ok(!isBackstop({ notes: "CI run 39498202022" }));
+  assert.ok(!isBackstop({ notes: "CI run 30498202022" }));
 });
 
 test("agentCiMonitor and polls tell an agent's polling CI monitor from its other waits", () => {
-  const run = { id: 39498202022 };
+  const run = { id: 30498202022 };
   const now = Date.now();
   const at = (min) => new Date(now + min * 60_000).toISOString();
-  assert.ok(agentCiMonitor({ notes: "Re-check CI run 39498202022", nextCheckAt: at(20) }, run));
+  assert.ok(agentCiMonitor({ notes: "Re-check CI run 30498202022", nextCheckAt: at(20) }, run));
   assert.ok(agentCiMonitor({ notes: "Re-check CI", serviceName: "github", nextCheckAt: at(20) }, run), "no run named, on GitHub");
   assert.ok(!agentCiMonitor({ notes: "Vendor sandbox back?", serviceName: "vendor", nextCheckAt: at(20) }, run));
-  assert.ok(!agentCiMonitor({ notes: "CI run 39498202022, then the deploy run 39498299999", nextCheckAt: at(20) }, run));
+  assert.ok(!agentCiMonitor({ notes: "CI run 30498202022, then the deploy run 30498299999", nextCheckAt: at(20) }, run));
   assert.ok(polls({ nextCheckAt: at(20) }, now, 360 * 60_000));
   assert.ok(!polls({ nextCheckAt: at(300) }, now, 360 * 60_000), "an agent's own backstop, hours out");
 });
@@ -109,7 +109,7 @@ test("a run still going gets the Helper's backstop monitor, with the issue's pol
   assert.equal(issue.executionPolicy.monitor.externalRef, "[redacted]", "Paperclip stores it redacted: the notes name the run");
   assert.equal(helperComments(env.db, issue).length, 0);
   assert.equal(env.watchdog.stats.ciBackstops, 1);
-  assert.ok(env.logs.some((l) => l.msg === "watchdog: scheduled a CI backstop monitor" && l.run === 39498202022));
+  assert.ok(env.logs.some((l) => l.msg === "watchdog: scheduled a CI backstop monitor" && l.run === 30498202022));
 
   env.later(1);
   await env.watchdog.tick();
@@ -142,7 +142,7 @@ test("no backstop for a run already finished, an issue not in progress, a run ou
   assert.equal(blocked.db.patches.length, 0, "Paperclip keeps a monitor only in progress or in review");
 
   const elsewhere = await watchdogEnv(t);
-  const c = waitingOnCi(elsewhere, { comment: "Waiting on https://github.com/other/repo/actions/runs/39498202022" });
+  const c = waitingOnCi(elsewhere, { comment: "Waiting on https://github.com/other/repo/actions/runs/30498202022" });
   await elsewhere.watchdog.tick();
   assert.equal(monitorPatches(elsewhere.db, c.issue).length, 0);
 
@@ -243,7 +243,7 @@ test("a newer run named moves the backstop to it; the issue moving to review cle
   await env.watchdog.tick();
   assert.equal(monitorPatches(env.db, issue).length, 1);
 
-  const newer = { id: 39498300001, name: "ci", status: "in_progress", run_attempt: 1, html_url: "https://github.com/org/app/actions/runs/39498300001", updated_at: new Date(env.clock.now).toISOString(), jobs: [] };
+  const newer = { id: 30498300001, name: "ci", status: "in_progress", run_attempt: 1, html_url: "https://github.com/org/app/actions/runs/30498300001", updated_at: new Date(env.clock.now).toISOString(), jobs: [] };
   env.gh.runs["org/app"][newer.id] = newer;
   env.db.comments.push({ issueId: issue.id, body: `Fixed the lint error and pushed; waiting on ${newer.html_url}`, authorAgentId: carla.id, createdAt: new Date().toISOString() });
   issue.updatedAt = new Date().toISOString();
@@ -251,8 +251,8 @@ test("a newer run named moves the backstop to it; the issue moving to review cle
   await env.watchdog.tick();
   const moved = monitorPatches(env.db, issue);
   assert.equal(moved.length, 2);
-  assert.match(moved[1].body.executionPolicy.monitor.notes, /39498300001/);
-  assert.doesNotMatch(moved[1].body.executionPolicy.monitor.notes, /39498202022/);
+  assert.match(moved[1].body.executionPolicy.monitor.notes, /30498300001/);
+  assert.doesNotMatch(moved[1].body.executionPolicy.monitor.notes, /30498202022/);
 
   issue.status = "in_review";
   issue.updatedAt = new Date(Date.now() + 1000).toISOString();
@@ -402,7 +402,7 @@ test("pch why: a self-wake loop comes first, even with a run going; a CI wait na
   const waiting = advise({
     identifier: "ACM-192", issue, assignee: { name: "Carla", status: "idle" },
     runs: [{ runId: "r1", agentId: "a", status: "succeeded", createdAt: minutesAgo(20), finishedAt: minutesAgo(10) }],
-    ciRun: "org/app#39498202022", ciBackstop: { nextCheckAt: "2026-10-30T15:00:00.000Z" },
+    ciRun: "org/app#30498202022", ciBackstop: { nextCheckAt: "2026-10-30T15:00:00.000Z" },
   });
   assert.match(waiting.what, /The Helper's backstop monitor holds the wait \(next check 2026-10-30T15:00:00.000Z\)/);
 });

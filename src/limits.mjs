@@ -172,8 +172,8 @@ export function subscriptionOf(agent) {
 
 // ---------------------------------------------------------------- Codex
 
-// The Codex CLI's messages, word for word (codex-rs protocol/src/error.rs at
-// openai/codex 970111f, 2026-10-23). The plan's limit always starts "You’ve hit your
+// The Codex CLI's messages, word for word (codex-rs protocol/src/error.rs in
+// openai/codex as of 2026-10-23). The plan's limit always starts "You’ve hit your
 // usage limit" and is followed by "." or, for one model's own limit, " for <model>.
 // Switch to another model now"; the reset follows as "Try again at <time>." or
 // "… or try again at <time>.", or "later" when Codex doesn't know it.
