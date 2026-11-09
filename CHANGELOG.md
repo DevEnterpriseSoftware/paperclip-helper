@@ -5,6 +5,7 @@
 - **Prices for Claude Fable 5.2 and Mythos 5.2.** `claude-fable-5-2` and `claude-mythos-5-2` had no list price, so cost sync couldn't check a reported cost against the run's tokens, and skipped a run that stopped before Claude reported one ("no price for claude-fable-5-2"). Both are now priced at Anthropic's published rates: $8 input, $0.20 cache hits, $10 5-minute cache writes and $40 output per million tokens. A fast-mode run keeps the cost Claude reports, which is above this standard price.
 - **docs/cost-sync.md:** Anthropic's prices were checked on 2026-11-09.
 - **Tests:** the published-price check covers both models, and `claude-fable-5.2` and `anthropic/claude-fable-5-2[1m]` resolve to the new entry.
+- **A flaky test fixed.** `endedReviewOf`'s test read the clock twice, once for the activity entry and once for the expected end time, and failed whenever the two calls landed a millisecond apart. It now reads it once.
 
 ## 1.16.1
 

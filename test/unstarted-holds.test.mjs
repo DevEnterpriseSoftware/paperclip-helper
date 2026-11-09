@@ -95,9 +95,10 @@ test("neverStarted: a run claimed and cancelled by a reassignment while still pr
 });
 
 test("endedReviewOf: the newest change to a pending stage decides", () => {
-  const ended = (from, to = null, extra = {}) => ({ action: "issue.updated", createdAt: minutesAgo(5), details: { changes: { executionState: { from, to } } }, ...extra });
+  const at = minutesAgo(5); // once: two calls can land a millisecond apart
+  const ended = (from, to = null, extra = {}) => ({ action: "issue.updated", createdAt: at, details: { changes: { executionState: { from, to } } }, ...extra });
   const stage = { status: "pending", currentParticipant: { type: "agent", agentId: "agent-1" }, returnAssignee: { type: "agent", agentId: "agent-9" } };
-  assert.deepEqual(endedReviewOf([ended(stage)], "agent-1"), { returnAssigneeAgentId: "agent-9", endedAt: minutesAgo(5) });
+  assert.deepEqual(endedReviewOf([ended(stage)], "agent-1"), { returnAssigneeAgentId: "agent-9", endedAt: at });
   const monitorOnly = { action: "issue.updated", details: { changes: { executionState: { from: null, to: { status: "idle", monitor: { status: "scheduled" } } } } } };
   assert.equal(endedReviewOf([monitorOnly, ended(stage)], "agent-1").returnAssigneeAgentId, "agent-9", "a monitor's change after it is skipped");
   assert.equal(endedReviewOf([ended(null, stage), ended(stage)], "agent-1"), null, "a stage started again since");
