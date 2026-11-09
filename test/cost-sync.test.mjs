@@ -66,6 +66,8 @@ test("price table: lookup by date and alias, and OpenAI's cached-input arithmeti
   assert.equal(priceFor(BUILTIN_PRICES, "claude-sonnet-5").cachedInput, 0.2);
   assert.equal(priceFor(BUILTIN_PRICES, "anthropic/claude-opus-5.5[1m]").model, "claude-opus-5-5");
   assert.equal(priceFor(BUILTIN_PRICES, "claude-opus-5-5-20260915").output, 20);
+  assert.equal(priceFor(BUILTIN_PRICES, "claude-fable-5.2").model, "claude-fable-5-2");
+  assert.equal(priceFor(BUILTIN_PRICES, "anthropic/claude-fable-5-2[1m]").output, 40);
   assert.equal(priceFor(BUILTIN_PRICES, "gpt-7"), null);
   const table = { models: { m: [{ from: "2026-01-01", input: 1, cachedInput: 0.1, output: 2 }, { from: "2026-06-01", input: 3, cachedInput: 0.3, output: 6 }] }, aliases: {} };
   assert.equal(priceFor(table, "m", "2026-03-01").input, 1);

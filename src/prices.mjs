@@ -24,7 +24,7 @@
 import fs from "node:fs";
 
 export const BUILTIN_PRICES = {
-  checked: "2026-10-24",
+  checked: "2026-11-09", // Anthropic; OpenAI last checked 2026-10-24
   sources: {
     openai: "https://developers.openai.com/api/docs/pricing",
     anthropic: "https://platform.claude.com/docs/en/about-claude/pricing",
@@ -61,6 +61,8 @@ export const BUILTIN_PRICES = {
 
     // Anthropic. cacheWrite is the 5-minute write price, the cheaper of the two,
     // since a run's totals don't say which was used.
+    "claude-fable-5-2": [{ from: "2026-01-01", input: 8, cachedInput: 0.2, cacheWrite: 10, output: 40 }],
+    "claude-mythos-5-2": [{ from: "2026-01-01", input: 8, cachedInput: 0.2, cacheWrite: 10, output: 40 }],
     "claude-fable-5-1": [{ from: "2026-01-01", input: 10, cachedInput: 0.25, cacheWrite: 12.5, output: 50 }],
     "claude-mythos-5-1": [{ from: "2026-01-01", input: 10, cachedInput: 0.25, cacheWrite: 12.5, output: 50 }],
     "claude-fable-5": [{ from: "2026-01-01", input: 10, cachedInput: 1, cacheWrite: 12.5, output: 50 }],

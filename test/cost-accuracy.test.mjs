@@ -61,14 +61,16 @@ test("pch usage counts fresh input the same way", () => {
   assert.deepEqual(tokensOf(legacy, "codex_local"), { input: 100_000, cached: 900_000, output: 1 });
 });
 
-test("the price table matches the published list prices checked 2026-10-24", () => {
+test("the price table matches the published list prices (Anthropic checked 2026-11-09, OpenAI 2026-10-24)", () => {
   const p = (m) => {
-    const { input, cachedInput, cacheWrite, output } = priceFor(BUILTIN_PRICES, m, "2026-10-24");
+    const { input, cachedInput, cacheWrite, output } = priceFor(BUILTIN_PRICES, m, "2026-11-09");
     return [input, cachedInput, cacheWrite, output];
   };
   // platform.claude.com/docs/en/about-claude/pricing: input, cache hit, 5m write, output.
   assert.deepEqual(p("claude-opus-5-5"), [4, 0.2, 5, 20]);
   assert.deepEqual(p("claude-sonnet-5-5"), [2, 0.1, 2.5, 10]);
+  assert.deepEqual(p("claude-fable-5-2"), [8, 0.2, 10, 40]);
+  assert.deepEqual(p("claude-mythos-5-2"), [8, 0.2, 10, 40]);
   assert.deepEqual(p("claude-fable-5-1"), [10, 0.25, 12.5, 50]);
   // developers.openai.com/api/docs/pricing: input, cached, 30m write, output.
   assert.deepEqual(p("gpt-6.1-sol"), [2, 0.1, 2.5, 10]);

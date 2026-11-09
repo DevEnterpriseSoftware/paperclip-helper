@@ -11,7 +11,7 @@ For each finished subscription run, cost sync posts one extra cost event with th
   - Raised and token-priced events are posted as `estimated`. A Paperclip that has no such status (it came with Paperclip's durable accounting; 2026.1012.0 and the stable releases before it take only `reported` and `unpriced`) refuses that with a `400`; cost sync then posts the event again as `reported`, and keeps doing so until it restarts. `unpriced` would say no cost is known.
 - **Codex** (`codex_local`) reports only tokens. The cost is estimated from the run's model and OpenAI's list prices: fresh input, cache reads at the cached rate, cache writes (when the ACP engine reports them) at the write rate, output, and fast mode doubled.
   - Paperclip 2026.10 and later store Codex's input net of cache reads and mark such runs (`rawInputIncludesCached: false`); older runs, without the mark, included them. Both are handled.
-- The price table ([`src/prices.mjs`](../src/prices.mjs)) was checked on 2026-10-24 against [OpenAI's](https://developers.openai.com/api/docs/pricing) and [Anthropic's](https://platform.claude.com/docs/en/about-claude/pricing) published prices.
+- The price table ([`src/prices.mjs`](../src/prices.mjs)) was checked against [OpenAI's](https://developers.openai.com/api/docs/pricing) published prices on 2026-10-24 and [Anthropic's](https://platform.claude.com/docs/en/about-claude/pricing) on 2026-11-09.
   - Add or override models with a `prices.json` in the data directory.
   - A run with no recorded model (or Claude's `mixed`) is priced with the agent's configured model. Codex runs on the default model with no model configured either: set `CODEX_DEFAULT_MODEL` to price them; otherwise they're skipped.
 
