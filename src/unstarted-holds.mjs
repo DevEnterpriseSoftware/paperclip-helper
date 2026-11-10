@@ -39,6 +39,15 @@
 // or end it), while another run on the issue is active, or while other issues block
 // it: the board is told once why, and what lifts it.
 //
+// An agent waiting on CI under watchdog 11's backstop is the common case: the backstop
+// arriving a moment after the agent's run ended makes the disposition repair Paperclip
+// scheduled unnecessary, and Paperclip holds the issue behind the suppressed repair. The
+// release puts the issue back in progress with the backstop before any wake starts
+// (release.mjs heldBackstop), from the watchdog's record of it if Paperclip cleared it,
+// so the next run ends with a live path instead of the next hold; and with nothing
+// saved, the watchdog adds no wake of its own: the CI report or the backstop wakes the
+// agent, and Paperclip's continuation run finds the wait in place.
+//
 // A hold from a run that did execute (it started, or recorded usage) is the board's:
 // it is reported once, an hour after the run ended, unless it is one 7 releases by
 // itself (no process record and no usage, WATCHDOG_RELEASE_HOLDS on, nothing in the way).
@@ -46,7 +55,7 @@
 import { asleep, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 import { noteToBoard } from "./board-note.mjs";
 import {
-  actsAsUser, claimedOnly, handOnRoute, handOnText, heldReviewRoute, neverStarted, ranWork, releaseHandedOn, releaseHeldReview, releaseHold, releaseProblems,
+  actsAsUser, claimedOnly, handOnRoute, handOnText, heldBackstop, heldReviewRoute, neverStarted, ranWork, releaseHandedOn, releaseHeldReview, releaseHold, releaseProblems,
   releaseRebuiltReview, reviewPending, unprovable, UPSTREAM_RELEASED_CODES,
 } from "./release.mjs";
 import { ACTIVE_RUN } from "./util.mjs";
@@ -241,12 +250,14 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
         ? `, giving the issue back to ${owner?.name ?? "the run's agent"} a moment (Paperclip releases it only while it is theirs) and asking them to reassign it to ${target.name}`
         : `, asking ${owner?.name ?? "the run's agent"} to give the issue back to ${target.name}: their review had ended, and the saved messages are ${target.name}'s work`
       : "";
+    // The CI backstop on the issue (or the watchdog's record of it): back with the issue.
+    const backstop = route || handOn ? null : heldBackstop(facts, { recorded: records.get(record.ciBackstop(issue)), now: now() });
     let result;
     try {
       result = route === "lossless" ? await releaseHeldReview(api, facts, options)
         : route === "rebuild" ? await releaseRebuiltReview(api, facts, options)
         : handOn ? await releaseHandedOn(api, facts, { ...options, route: handOn })
-        : await releaseHold(api, facts, options);
+        : await releaseHold(api, facts, { ...options, backstop });
     } catch (err) {
       if (err.reviewChanged) {
         // Released, but the review isn't as it was: the board's to look at.
@@ -272,7 +283,9 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
         : null;
     // Nothing saved: Paperclip starts its own continuation for the hold's owner
     // (issue_recovery_action_restored, from a sweep every 15 s, when that owner still has
-    // the issue). followUp() comments only if no run has started a while later.
+    // the issue). followUp() comments only if no run has started a while later; not when
+    // the CI backstop holds the wait again (the agent is waiting on CI, and the report or
+    // the backstop wakes it).
     if (handOn) {
       // handOnFollowUp() checks that it reached the target, and moves it on itself once
       // nothing of theirs runs there any more.
@@ -280,7 +293,7 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
         count: 0, at: now(), companyId, issueId: issue.id, holdAgentId: hold.agentId, targetId: target.id, kind: handOn.kind,
       });
       state.touch();
-    } else if (!delivered && !result.review) {
+    } else if (!delivered && !result.review && !result.backstop) {
       records.set(record.unstartedFollowUp(issue, hold.runId), { count: 0, at: now(), companyId, issueId: issue.id, assigneeId: assignee.id, errorCode: run.errorCode });
       state.touch();
     }
@@ -288,8 +301,10 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
       ctx,
       companyId,
       `${who}: ${why}${held}. The watchdog released it${stageText}${handOnStep}, recording that the run performed nothing` +
-        `${delivered ? `, and ${delivered}` : ""}${result.monitorRestored ? ". Its monitor, cleared by Paperclip on the way, is set again" : ""}. Status now ${result.status}.`,
-      { ...logExtra, level: "info", released: true, delivered: result.delivered, status: result.status, review: Boolean(result.review), handOn: handOn?.kind ?? null },
+        `${delivered ? `, and ${delivered}` : ""}${result.monitorRestored ? ". Its monitor, cleared by Paperclip on the way, is set again" : ""}` +
+        `${result.backstop === "restored" ? ". The issue is back in progress with the Helper's CI backstop monitor, which the release cleared, so the agent's next run ends with its wait in place" : ""}` +
+        `${result.backstop === "kept" ? ". The Helper's CI backstop monitor still holds the wait" : ""}. Status now ${result.status}.`,
+      { ...logExtra, level: "info", released: true, delivered: result.delivered, status: result.status, review: Boolean(result.review), handOn: handOn?.kind ?? null, ...(result.backstop ? { backstop: result.backstop } : {}) },
     );
   }
 

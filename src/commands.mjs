@@ -11,7 +11,7 @@ import { createCostSync } from "./cost-sync.mjs";
 import { blocked as blockedReport } from "./blocked.mjs";
 import {
   actsAsUser, claimedOnly, continuationText, continuePausedHold, CONVERSATION_ADAPTERS, defaultOutcome, handOnRoute, handOnText, heldReviewRoute, holdFacts,
-  neverStarted, pausedHold, releaseHandedOn, releaseHeldReview, releaseHold, releaseProblems, releaseRebuiltReview, RELEASE_OUTCOMES, unprovable,
+  heldBackstop, neverStarted, pausedHold, releaseHandedOn, releaseHeldReview, releaseHold, releaseProblems, releaseRebuiltReview, RELEASE_OUTCOMES, unprovable,
 } from "./release.mjs";
 import { unstartedHoldRemedy } from "./unstarted-holds.mjs";
 import {
@@ -409,6 +409,7 @@ export async function release(ctx, identifier, { apply = false, outcome = null }
     out("");
     out(`--apply records, as the board, that this run has stopped and that what it did is ${actionOutcome === "mixed" ? "unverified (mixed)" : actionOutcome.replace("_", " ")},`);
     out(`moves ${identifier} to todo, and ${saved ? "delivers the saved messages" : "lets the next message start a run"}.`);
+    if (heldBackstop(facts)) out(`The Helper's CI backstop monitor is on it: ${identifier} goes back in progress with it before anything is delivered.`);
     if (unstarted && actionOutcome === "not_performed") out("The run never started, so the agent has nothing of it to check.");
     else out("Only do it if no agent process from that run is still running. Have the agent check the branch before it continues.");
     out(`  pch release ${identifier} --apply${outcomeFlag}`);
@@ -422,6 +423,8 @@ export async function release(ctx, identifier, { apply = false, outcome = null }
     throw err;
   }
   out(`${identifier}: hold released (${result.status}).`);
+  if (result.backstop === "restored") out("The Helper's CI backstop monitor, which the release cleared, is set again, with the issue back in progress: the agent's next run ends with its wait in place.");
+  else if (result.backstop === "kept") out("The Helper's CI backstop monitor still holds the wait.");
   if (result.delivered) out(`Delivered ${result.delivered} saved message(s) to ${agent?.name ?? "the assignee"}.`);
   else if (result.byPaperclip) out(`Paperclip started the ${result.byPaperclip} saved message(s) itself once the hold was gone.`);
   else if (result.waiting) out(`${result.waiting} saved message(s) are waiting; they start with the next run.`);

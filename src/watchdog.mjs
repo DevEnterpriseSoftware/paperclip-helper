@@ -294,7 +294,7 @@ const record = {
   ciRun: (issue, run) => `ci:${issue.id}:${run.id}:${run.run_attempt ?? 1}`, // the comment that a run the agent waits on finished
   ciRerun: (repo, run) => `ci-rerun:${repo}#${run.id}`, // re-runs of a run's flaky failed jobs: { count, at }
   ciRerunFail: (repo, run) => `ci-rerun-fail:${repo}#${run.id}`, // GitHub refused a re-run, reported once
-  ciBackstop: (issue) => `ci-backstop:${issue.id}`, // the watchdog's backstop monitor on the issue: { count, at, run, agentId, replaced }
+  ciBackstop: (issue) => `ci-backstop:${issue.id}`, // the watchdog's backstop monitor on the issue: { count, at, run, agentId, replaced, monitor } (monitor: as scheduled, for a release to put back)
   answer: (card) => `answer:${card.id}`, // the return of an issue whose card you answered on your review
   escalated: (issue) => `escalated:${issue.id}`, // returns of reviews Paperclip escalated to you, per issue
   escalatedSeen: (issue, decisionId) => `escalated-seen:${issue.id}:${decisionId ?? "?"}`, // one return per escalation, or its report
@@ -575,6 +575,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       sourceRunStatus: run ? `${run.status}${run.errorCode ? ` (${run.errorCode})` : ""}` : null,
       delivered: result.delivered,
       ...(result.byPaperclip ? { deliveredByPaperclip: result.byPaperclip } : {}),
+      ...(result.backstop ? { ciBackstop: result.backstop } : {}),
     });
     if (!result.delivered && !result.waiting && !result.byPaperclip) {
       await nudge(

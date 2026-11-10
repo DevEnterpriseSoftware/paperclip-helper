@@ -19,6 +19,7 @@
 // settle by itself.
 
 import { ACTIVE_RUN, TERMINAL_RUN } from "./util.mjs";
+import { isBackstop } from "./ci-runs.mjs";
 
 export const RECONCILIATION_CAUSE = "legacy_execution_requires_reconciliation";
 export const RELEASE_OUTCOMES = ["mixed", "completed", "not_performed"];
@@ -210,6 +211,46 @@ async function restoreMonitor(api, id, monitor) {
   await api.request("PATCH", `/api/issues/${id}`, { executionPolicy: { ...(now.executionPolicy ?? {}), monitor: { ...monitor, nextCheckAt } } });
   return true;
 }
+
+// The CI backstop a plain release puts back (watchdog 11's monitor, ci-runs.mjs). An agent
+// waiting on CI with the backstop standing gets a disposition repair scheduled when its
+// run ends a moment before the monitor arrives; the monitor makes the repair unnecessary,
+// Paperclip suppresses it before it starts (issue_disposition_repair_superseded), and up
+// to 2026.1106.0 holds the issue behind it, set blocked by a direct update that leaves
+// the monitor. The release moves the issue to todo, which clears it, and wakes the agent
+// (Paperclip's continuation, the saved messages): that run, ending with no monitor, gets
+// the next repair, the backstop comes back a few seconds later, and suppresses it into
+// the next hold. So the release puts the issue back in progress with the backstop before
+// any wake starts, and the run ends with a live path.
+//
+// The backstop on the held issue: the policy's monitor, the Helper's, still scheduled,
+// and the issue still the held run's agent's. `recorded` (the watchdog's record of the
+// backstop it scheduled) stands in when Paperclip has cleared it from the policy.
+export function heldBackstop(facts, { recorded = null, now = Date.now() } = {}) {
+  const { issue, hold } = facts ?? {};
+  if (!issue || !hold?.agentId || issue.assigneeAgentId !== hold.agentId || issue.assigneeUserId) return null;
+  if (reviewPending(issue) || ["done", "cancelled", "in_review"].includes(issue.status)) return null;
+  const monitor = issue.executionPolicy?.monitor ?? null;
+  if (monitor) {
+    const state = issue.executionState?.monitor;
+    return isBackstop(monitor) && (!state || state.status === "scheduled") ? monitor : null;
+  }
+  const m = recorded?.agentId === hold.agentId ? recorded.monitor : null;
+  return m && isBackstop(m) && Date.parse(m.timeoutAt ?? m.nextCheckAt ?? "") > now ? m : null;
+}
+
+// After the release: the issue (in todo, the held run's agent's, no longer held) back in
+// progress and the backstop set again. "kept" when the release left it on the issue,
+// "restored" when it was set again, null when the issue isn't one to put it on.
+async function restoreBackstop(api, id, monitor, agentId) {
+  const now = await api.request("GET", `/api/issues/${id}`);
+  if (now.executionPolicy?.monitor) return isBackstop(now.executionPolicy.monitor) ? "kept" : null;
+  if (now.executionBlocker || now.assigneeAgentId !== agentId || now.assigneeUserId) return null;
+  if (now.status === "todo") await api.request("PATCH", `/api/issues/${id}`, { status: "in_progress" });
+  else if (now.status !== "in_progress") return null;
+  return (await restoreMonitor(api, id, monitor)) ? "restored" : null;
+}
+
 export function heldReviewRoute(facts) {
   const { issue, hold } = facts ?? {};
   if (!reviewPending(issue) || !hold?.agentId) return null;
@@ -502,11 +543,15 @@ async function resolveRun(api, id, facts, { actionOutcome, note, signature }) {
   return resolved;
 }
 
-export async function releaseHold(api, facts, { actionOutcome = defaultOutcome(facts), note, signature = "" } = {}) {
-  const { issue } = facts;
+// The plain release. With the CI backstop on the held issue (heldBackstop; `backstop`
+// to name another, null for none), the issue goes back in progress with it before the
+// saved messages are delivered: { backstop: "restored" | "kept" } in the answer.
+export async function releaseHold(api, facts, { actionOutcome = defaultOutcome(facts), note, signature = "", backstop = heldBackstop(facts) } = {}) {
+  const { issue, hold } = facts;
   const id = encodeURIComponent(issue.id ?? issue.identifier);
   await resolveRun(api, id, facts, { actionOutcome, note, signature });
-  return deliverAfterRelease(api, id);
+  const restored = backstop ? await restoreBackstop(api, id, backstop, hold.agentId).catch(() => null) : null;
+  return { ...(await deliverAfterRelease(api, id)), ...(restored ? { backstop: restored } : {}) };
 }
 
 // The rebuilt review (heldReviewRoute "rebuild"), for one still in review with nothing

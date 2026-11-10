@@ -282,6 +282,126 @@ test("a backstop an agent keeps wiping is put back a few times, then left to Pap
   assert.equal(env.logs.filter((l) => /keeps being replaced or refused/.test(l.msg)).length, 1);
 });
 
+// Paperclip holds the issue behind the disposition repair it had scheduled when Carla's
+// run ended, which the backstop made unnecessary: suppressed before it started
+// (issue_disposition_repair_superseded), then settled to blocked by a direct update that
+// leaves the monitor where it is. With `clear`, Paperclip cleared the monitor on the way.
+function holdBehindSuppressedRepair(env, { carla, issue }, { clear = false } = {}) {
+  const runId = uuid();
+  const finishedAt = minutesAgo(5);
+  env.db.heartbeatRuns.push({
+    id: runId, companyId: ids.company, agentId: carla.id, status: "cancelled", errorCode: "issue_disposition_repair_superseded", runtimeMode: "legacy",
+    createdAt: minutesAgo(6), finishedAt, startedAt: null, runtimeModeResolvedAt: null, processPid: null, processGroupId: null, processStartedAt: null,
+    nativeIssueId: null, nativeSessionId: null, sessionIdAfter: null, controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null,
+    usageJson: null, resultJson: {}, contextSnapshot: { issueId: issue.id },
+  });
+  env.db.runEvents[runId] = [];
+  env.db.issueRuns[issue.id].unshift({ runId, agentId: carla.id, status: "cancelled", errorCode: "issue_disposition_repair_superseded", createdAt: minutesAgo(6), finishedAt });
+  issue.status = "blocked";
+  issue.executionBlocker = {
+    recoveryActionId: uuid(), runId, agentId: carla.id, cause: "legacy_execution_requires_reconciliation", runStatus: "cancelled", savedMessageCount: 0,
+  };
+  if (clear) {
+    issue.executionPolicy = { stages: issue.executionPolicy.stages };
+    issue.executionState = { ...issue.executionState, monitor: { ...issue.executionState.monitor, status: "cleared", clearReason: "invalid_status", nextCheckAt: null } };
+  }
+  issue.updatedAt = new Date(Date.now() + 1000).toISOString();
+  return runId;
+}
+
+test("a hold keeps the backstop: never cleared from a held issue, while a blocked one that isn't held loses it as before", async (t) => {
+  const env = await watchdogEnv(t);
+  const w = waitingOnCi(env);
+  const { issue } = w;
+  await env.watchdog.tick();
+  const scheduled = issue.executionPolicy.monitor;
+  const record = env.state.nudges.get(`ci-backstop:${issue.id}`);
+  assert.ok(record.monitor.notes.startsWith(BACKSTOP_MARK), "the record keeps the monitor as scheduled, for a release to put back");
+  assert.equal(record.monitor.externalRef, RUN_URL);
+
+  holdBehindSuppressedRepair(env, w);
+  env.later(1);
+  await env.watchdog.tick();
+  env.later(1);
+  await env.watchdog.tick();
+  assert.equal(monitorPatches(env.db, issue).length, 1, "not cleared: the release puts the issue back in progress with it");
+  assert.deepEqual(issue.executionPolicy.monitor, scheduled);
+  assert.ok(env.state.nudges.has(`ci-backstop:${issue.id}`));
+  assert.ok(!env.logs.some((l) => l.msg === "watchdog: cleared its CI backstop monitor"));
+
+  // Blocked for another reason (nothing holds it): cleared, as before.
+  issue.executionBlocker = null;
+  issue.updatedAt = new Date(Date.now() + 2000).toISOString();
+  env.later(1);
+  await env.watchdog.tick();
+  const tidied = monitorPatches(env.db, issue);
+  assert.equal(tidied.length, 2);
+  assert.equal(tidied[1].body.executionPolicy.monitor, undefined);
+  assert.ok(!env.state.nudges.has(`ci-backstop:${issue.id}`));
+});
+
+test("a hold behind the repair the backstop suppressed is released back in progress with the backstop, and nobody woken by the watchdog", async (t) => {
+  const env = await watchdogEnv(t);
+  const w = waitingOnCi(env);
+  const { issue } = w;
+  await env.watchdog.tick();
+  const scheduled = issue.executionPolicy.monitor;
+  const runId = holdBehindSuppressedRepair(env, w);
+  env.later(4); // the hold scan, a stall window on
+  await env.watchdog.tick();
+
+  assert.equal(env.db.resolutions.length, 1);
+  assert.equal(env.db.resolutions[0].body.executionReconciliation.runId, runId);
+  assert.equal(env.db.resolutions[0].body.executionReconciliation.actionOutcome, "not_performed");
+  assert.equal(issue.executionBlocker, null);
+  assert.equal(issue.status, "in_progress", "back in progress, where the wait was");
+  assert.equal(issue.executionPolicy.monitor.notes, scheduled.notes, "the backstop again: the next run ends with a live path");
+  assert.equal(issue.executionPolicy.monitor.nextCheckAt, scheduled.nextCheckAt, "the same check");
+  assert.equal(issue.executionState.monitor.status, "scheduled");
+  // The release cleared it; the issue went back in progress, then the monitor was set, in that order.
+  const after = env.db.patches.filter((p) => p.issueId === issue.id).slice(1).map((p) => p.body);
+  assert.deepEqual(after[0], { status: "in_progress" });
+  assert.ok(after[1].executionPolicy.monitor.notes.startsWith(BACKSTOP_MARK));
+  assert.deepEqual(after[1].executionPolicy.stages, w.stages, "the policy kept with it");
+  const note = env.logs.find((l) => l.msg === "watchdog: a note for the board" && /released it/.test(l.text));
+  assert.match(note.text, /The issue is back in progress with the Helper's CI backstop monitor, which the release cleared, so the agent's next run ends with its wait in place\. Status now in_progress\./);
+
+  // Nothing saved, but no follow-up comment: the agent is waiting on CI, and the report or the backstop wakes it.
+  env.later(1);
+  await env.watchdog.tick();
+  env.later(5);
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, issue).length, 0);
+  assert.equal(monitorPatches(env.db, issue).length, 2, "no third: the backstop pass finds its monitor standing");
+  assert.equal([...env.state.nudges.entries()].filter(([k]) => k.startsWith("unstarted-follow-up:")).length, 0);
+
+  // The run finishing is reported as usual, the backstop cleared with it.
+  env.later(4);
+  finish(env, w.run);
+  await env.watchdog.tick();
+  const [report, ...more] = helperComments(env.db, issue);
+  assert.equal(more.length, 0);
+  assert.match(report.body, /The Helper's backstop monitor for this run was cleared\./);
+});
+
+test("a backstop Paperclip cleared as it held the issue is put back from the watchdog's record", async (t) => {
+  const env = await watchdogEnv(t);
+  const w = waitingOnCi(env);
+  const { issue } = w;
+  await env.watchdog.tick();
+  const scheduled = env.state.nudges.get(`ci-backstop:${issue.id}`).monitor;
+  holdBehindSuppressedRepair(env, w, { clear: true });
+  env.later(4);
+  await env.watchdog.tick();
+  assert.equal(issue.executionBlocker, null);
+  assert.equal(issue.status, "in_progress");
+  const restored = monitorPatches(env.db, issue).at(-1).body.executionPolicy.monitor;
+  assert.equal(restored.notes, scheduled.notes);
+  assert.equal(restored.externalRef, RUN_URL, "from the record: the run's own URL, not Paperclip's redacted copy");
+  assert.equal(restored.nextCheckAt, scheduled.nextCheckAt);
+  assert.equal(issue.executionState.monitor.status, "scheduled");
+});
+
 test("a dry run schedules nothing and says what it would do, once", async (t) => {
   const env = await watchdogEnv(t, { DRY_RUN: "true" });
   const { issue } = waitingOnCi(env);

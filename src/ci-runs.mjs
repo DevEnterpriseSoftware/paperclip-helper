@@ -22,6 +22,14 @@
 // Paperclip monitor of its own: one check, hours out (the run's worst case), whose
 // notes name the run. The watchdog still reports the run when it finishes and clears
 // the monitor in the same step; the monitor fires only if that report never comes.
+//
+// A hold keeps it. Paperclip can hold the issue for reconciliation while the backstop
+// stands (a disposition repair the monitor made unnecessary, suppressed before it
+// started: the very monitor causes the hold), and sets it blocked with the monitor in
+// place. Cleared then, the release's wake would end with no live path and the next
+// repair would be suppressed into the next hold. So the backstop stays on a held issue,
+// and the release (release.mjs releaseHold) puts the issue back in progress with it
+// before any wake starts.
 
 import { listIssues } from "./paperclip.mjs";
 import { ACTIVE_RUN, asleep, mapLimit, pausedRefusal, ts } from "./util.mjs";
@@ -681,8 +689,16 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     // and Paperclip takes a monitor only in progress or in review). Paperclip clears a
     // monitor itself when the issue moves to todo, blocked, done or cancelled; one left
     // on an issue now in review, or now another agent's, would wake the wrong run.
+    // Except a hold: Paperclip's settle sets a held issue blocked by a direct update,
+    // which leaves the monitor, and it stays there for the release to put back (above).
     if (issue.status !== "in_progress" || (mine && mine.agentId !== issue.assigneeAgentId)) {
-      if (mine && !(await tidyBackstop(issue, key, issue.status !== "in_progress" ? `the issue is ${issue.status}` : "the issue changed hands"))) return;
+      let full;
+      if (mine && issue.status === "blocked" && issue.assigneeAgentId === mine.agentId) {
+        full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+        if (!full) return;
+        if (full.executionBlocker && full.status === "blocked" && full.assigneeAgentId === mine.agentId && !full.assigneeUserId) return settle();
+      }
+      if (mine && !(await tidyBackstop(issue, key, issue.status !== "in_progress" ? `the issue is ${issue.status}` : "the issue changed hands", full))) return;
       if (issue.status !== "in_progress") return settle();
       mine = undefined; // gone with the previous owner's backstop; the new owner may wait on CI too
     }
@@ -719,7 +735,7 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
       if (watchesOnly(monitor, run)) {
         // Already standing (a restart forgot the record: take it up again).
         if (!mine || mine.run !== runKey) {
-          records.set(key, { count: 1, at: now(), run: runKey, agentId: assignee, replaced: Boolean(mine?.replaced) });
+          records.set(key, { count: 1, at: now(), run: runKey, agentId: assignee, replaced: Boolean(mine?.replaced), monitor: full.executionPolicy?.monitor ?? null });
           state.touch();
         }
         return settle();
@@ -754,7 +770,7 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     if (!fresh || fresh.status !== "in_progress" || fresh.assigneeAgentId !== assignee) return;
     if (!sameMonitor(fresh.executionState?.monitor, monitor)) return; // next tick
     const next = backstopMonitor({ run, now: now(), backstopMs, attemptCount: monitorAttempts(fresh), replaced });
-    records.set(key, { count: count + 1, at: now(), run: runKey, agentId: assignee, replaced: replaced || (mine?.run === runKey && Boolean(mine?.replaced)) });
+    records.set(key, { count: count + 1, at: now(), run: runKey, agentId: assignee, replaced: replaced || (mine?.run === runKey && Boolean(mine?.replaced)), monitor: next });
     state.touch();
     try {
       await api.request("PATCH", `/api/issues/${issue.id}`, { executionPolicy: { ...(fresh.executionPolicy ?? {}), monitor: next } });
@@ -772,9 +788,10 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
   }
 
   // Clears the watchdog's backstop from an issue it no longer fits, without a comment
-  // (a comment would wake the assignee). True once nothing of it is left.
-  async function tidyBackstop(issue, key, why) {
-    const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+  // (a comment would wake the assignee). True once nothing of it is left. `read`: the
+  // issue as just read, if it was.
+  async function tidyBackstop(issue, key, why, read) {
+    const full = read ?? (await api.request("GET", `/api/issues/${issue.id}`).catch(() => null));
     if (!full) return false;
     const monitor = full.executionState?.monitor;
     if (monitorPending(monitor, now()) && isBackstop(monitor) && full.executionPolicy?.monitor) {

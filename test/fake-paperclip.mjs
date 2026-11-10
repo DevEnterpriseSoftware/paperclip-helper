@@ -697,6 +697,14 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         // the two: the helper must never get here.
         if (issue.executionState?.status === "pending" && body.sourceIssueStatus !== issue.status) issue.executionState = null;
         issue.status = body.sourceIssueStatus;
+        // The move to todo clears a policy monitor, as any status Paperclip doesn't keep one
+        // in does (monitorClearReasonForIssue).
+        if (issue.executionPolicy?.monitor && !["in_progress", "in_review"].includes(issue.status)) {
+          const { monitor: _gone, ...rest } = issue.executionPolicy;
+          issue.executionPolicy = rest.stages?.length ? rest : null;
+          if (issue.executionState?.monitor) issue.executionState = { ...issue.executionState, monitor: { ...issue.executionState.monitor, status: "cleared", clearReason: "invalid_status", nextCheckAt: null } };
+        }
+        issue.updatedAt = new Date().toISOString();
         return send(200, { issue, replayed: false });
       }
       if (rest === "/recovery-actions" && req.method === "GET") {

@@ -6,7 +6,8 @@ import { captureOutput, minutesAgo, setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { createWatchdog } from "../src/watchdog.mjs";
 import * as cmd from "../src/commands.mjs";
-import { claimedOnly, DISPATCH_GATE_CODES, endedReviewOf, handOnRoute, handOnText, neverStarted, releaseProblems } from "../src/release.mjs";
+import { claimedOnly, DISPATCH_GATE_CODES, endedReviewOf, handOnRoute, handOnText, heldBackstop, neverStarted, releaseProblems } from "../src/release.mjs";
+import { BACKSTOP_MARK } from "../src/ci-runs.mjs";
 import { HAND_ON_CHECK_MS } from "../src/unstarted-holds.mjs";
 import { advise } from "../src/advice.mjs";
 
@@ -136,6 +137,39 @@ test("releaseProblems: a pending review stage, another agent's run, or open bloc
   assert.match(releaseProblems({ ...facts({}, { agentId: "agent-2" }), activeRun: true }, { handOn: true })[0], /another run on the issue is active/);
   assert.match(releaseProblems(facts({ status: "blocked", blockedBy: [{ identifier: "ACM-5", status: "in_progress" }, { identifier: "ACM-6", status: "done" }] }))[0], /blocked by ACM-5,/);
   assert.deepEqual(releaseProblems(facts({ status: "blocked", blockedBy: [{ identifier: "ACM-6", status: "done" }] })), []);
+});
+
+// The Helper's CI backstop as Paperclip stores it on the policy, and as the watchdog records it.
+const backstopOn = (over = {}) => ({
+  kind: "external_service", serviceName: "github", externalRef: "[redacted]", scheduledBy: "board", recoveryPolicy: "wake_owner",
+  nextCheckAt: new Date(Date.now() + 5 * 60 * 60_000).toISOString(), timeoutAt: new Date(Date.now() + 5.5 * 60 * 60_000).toISOString(),
+  notes: `${BACKSTOP_MARK} for CI run https://github.com/org/app/actions/runs/30498202022. It wakes the assignee once.`, ...over,
+});
+
+test("heldBackstop: the Helper's scheduled backstop on the held run's agent's issue, or the watchdog's record of it", () => {
+  const monitor = backstopOn();
+  const held = (issue = {}) => factsOf(unstartedRun({ errorCode: "issue_disposition_repair_superseded" }), {
+    status: "blocked", executionPolicy: { monitor }, executionState: { monitor: { status: "scheduled", ...monitor } }, ...issue,
+  });
+  assert.equal(heldBackstop(held()), monitor);
+  assert.equal(heldBackstop(held({ executionState: null })), monitor, "no state to say otherwise");
+  assert.equal(heldBackstop(held({ executionPolicy: { monitor: { ...monitor, notes: "Re-check CI run 30498202022" } } })), null, "the agent's own monitor");
+  assert.equal(heldBackstop(held({ executionPolicy: { monitor: { ...monitor, scheduledBy: "assignee" } } })), null, "an agent copying the notes");
+  assert.equal(heldBackstop(held({ executionState: { monitor: { status: "triggered" } } })), null, "fired already");
+  assert.equal(heldBackstop(held({ assigneeAgentId: "agent-2" })), null, "another agent's issue now");
+  assert.equal(heldBackstop(held({ assigneeUserId: "u-1" })), null, "a person's");
+  assert.equal(heldBackstop(held({ status: "in_review" })), null, "in review: not a plain release's");
+  assert.equal(heldBackstop(held({ executionState: { status: "pending", monitor: { status: "scheduled" } } })), null, "a pending review");
+
+  // Cleared from the policy: the watchdog's record stands in, for the same agent and while it would still check.
+  const cleared = held({ executionPolicy: null, executionState: { monitor: { status: "cleared" } } });
+  const recorded = { agentId: "agent-1", monitor: backstopOn({ externalRef: "https://github.com/org/app/actions/runs/30498202022" }) };
+  assert.equal(heldBackstop(cleared), null);
+  assert.equal(heldBackstop(cleared, { recorded }), recorded.monitor);
+  assert.equal(heldBackstop(cleared, { recorded: { ...recorded, agentId: "agent-2" } }), null, "another agent's wait");
+  assert.equal(heldBackstop(cleared, { recorded: { ...recorded, monitor: null } }), null, "a record from before 1.16.3");
+  assert.equal(heldBackstop(cleared, { recorded, now: Date.now() + 6 * 60 * 60_000 }), null, "past its timeout");
+  assert.equal(heldBackstop(held({ executionPolicy: { monitor: { ...monitor, notes: "Vendor sandbox" } } }), { recorded }), null, "never over another monitor");
 });
 
 // ---------------------------------------------------------------- the watchdog
@@ -674,6 +708,50 @@ test("pch release: names a run that never started, records not performed, and re
   );
   assert.equal(review.db.resolutions, undefined);
   assert.equal(r.issue.executionState.status, "pending");
+});
+
+test("the CI backstop on a held issue: pch release and the watchdog put the issue back in progress with it before delivering the saved messages", async (t) => {
+  const withBackstop = (e, opts) => {
+    const h = unstartedHold(e.db, { status: "blocked", ...opts });
+    const monitor = backstopOn();
+    h.issue.executionPolicy = { monitor };
+    h.issue.executionState = { monitor: { status: "scheduled", ...monitor, attemptCount: 0 } };
+    // What the issue looks like when the saved messages are delivered.
+    const seen = [];
+    e.db.interrupts.push = function (x) {
+      seen.push({ status: h.issue.status, monitor: h.issue.executionPolicy?.monitor?.notes ?? null });
+      return Array.prototype.push.call(this, x);
+    };
+    return { ...h, monitor, seen };
+  };
+
+  const e = await env(t);
+  const { issue, monitor, seen } = withBackstop(e);
+  const shown = (await captureOutput(() => cmd.release(e.ctx, "ACM-30"))).join("\n");
+  assert.match(shown, /The Helper's CI backstop monitor is on it: ACM-30 goes back in progress with it before anything is delivered\./);
+  const applied = (await captureOutput(() => cmd.release(e.ctx, "ACM-30", { apply: true }))).join("\n");
+  assert.match(applied, /ACM-30: hold released \(in_progress\)\./);
+  assert.match(applied, /The Helper's CI backstop monitor, which the release cleared, is set again, with the issue back in progress/);
+  assert.match(applied, /Delivered 2 saved message\(s\) to Richard\./);
+  assert.equal(issue.status, "in_progress");
+  assert.equal(issue.executionPolicy.monitor.nextCheckAt, monitor.nextCheckAt);
+  assert.deepEqual(seen, [{ status: "in_progress", monitor: monitor.notes }], "the run the messages start ends with the wait in place");
+
+  const w = await env(t);
+  const h = withBackstop(w);
+  await w.watchdog.tick();
+  assert.equal(h.issue.executionBlocker, null);
+  assert.equal(h.issue.status, "in_progress");
+  assert.deepEqual(h.seen, [{ status: "in_progress", monitor: h.monitor.notes }]);
+  assert.match(notes(w)[0].body, /and delivered 2 saved messages to Richard\. The issue is back in progress with the Helper's CI backstop monitor, which the release cleared, so the agent's next run ends with its wait in place\. Status now in_progress\./);
+
+  // A monitor that isn't the Helper's: the plain release, as before.
+  const o = await env(t);
+  const other = unstartedHold(o.db, { status: "blocked" });
+  other.issue.executionPolicy = { monitor: backstopOn({ notes: "Vendor sandbox back?" }) };
+  await o.watchdog.tick();
+  assert.equal(other.issue.status, "todo");
+  assert.equal(other.issue.executionPolicy, null, "cleared by the release, and left so");
 });
 
 test("pch release --outcome still overrides; a run that executed keeps 'mixed' by default", async (t) => {
