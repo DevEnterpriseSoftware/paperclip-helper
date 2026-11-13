@@ -11,6 +11,9 @@
 // 2. Blocked issues whose blockers are all done. Paperclip should wake the
 //    assignee with issue_blockers_resolved, but that wake can be dropped the
 //    same way. They get the same kind of comment once quiet for the stall window.
+//    Not an issue Paperclip holds for recovery, nor one whose agent waits on CI
+//    under the backstop (11): its done blockers aren't why it is blocked, and the
+//    comment would reopen it and wake the agent for nothing.
 //
 // 3. Done blockers whose workspace clean-up failed. A blocker is done, but the
 //    clean-up of its workspace (workspace_finalize) failed, typically because
@@ -57,7 +60,9 @@
 //    todo, which Paperclip refuses or does by ending the review), whose held run
 //    is another agent's than the assignee's, or that other issues block. A run that never started is 22's, and
 //    so is one that recorded usage (tokens or a cost): it did work, which only a
-//    person can judge, so 22 reports it.
+//    person can judge, so 22 reports it. Like 22, it keeps a hold whose agent waits
+//    on a CI run still going under 11's backstop, and releases it with the run's
+//    report once it has finished.
 //
 // 8. Issues linked to a closed workspace. An issue an agent creates from another
 //    issue's work is linked to that issue's execution workspace (reuse_existing).
@@ -225,7 +230,16 @@
 //    review with nothing in it to lose (release.mjs heldReviewRoute). Never while the
 //    run is another agent's than the assignee's, other issues block it, or any other
 //    review is pending: those are told to the board once, with what lifts them. A hold from a run that executed is
-//    reported once, an hour after it ended, unless 7 releases it.
+//    reported once, an hour after it ended, unless 7 releases it. While the agent waits
+//    on a CI run still going under 11's backstop, the hold is kept (a release would
+//    only wake it to say it is still waiting); once the run has finished, its report is
+//    posted behind the hold and the release delivers it: one wake, with the result.
+//
+// The loop breaker (wake-guard.mjs). Every nudge, release and re-send of saved messages asks first: once the
+// watchdog has woken the same issue twice within 30 minutes and nothing has moved on
+// it since (no new CI run named, no new assignee or status, no person's comment), it
+// wakes it no more, tells the board once, and leaves the issue alone until it changes.
+// A CI run's report is never held back, and starts the count again.
 //
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
@@ -237,7 +251,8 @@ import { holdFacts, neverStarted, pausedHold, ranWork, releaseHold, releaseProbl
 import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
 import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue, strandedCard } from "./questions.mjs";
 import { createGitHub } from "./github.mjs";
-import { createCiRunsCheck } from "./ci-runs.mjs";
+import { createCiRunsCheck, isBackstop, monitorPending } from "./ci-runs.mjs";
+import { createWakeGuard } from "./wake-guard.mjs";
 import { createSelfWakeCheck } from "./self-wakes.mjs";
 import { createBoardHeldCheck, quote } from "./board-held.mjs";
 import { createLimitCheck, localZone, RECOGNISERS } from "./limits.mjs";
@@ -341,6 +356,15 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   // 20. Relative worktree links: one note per project checkout.
   const worktreeLinks = createWorktreeLinksCheck({ ctx, records, state, stats, dryRunSeen, noteToBoard });
   const resumes = createResumeSweep({ ctx, records, state, stats, dryRunSeen, record, onSettled: (companyId) => pausedHolds.scanSoon(companyId) });
+  const wakeGuard = createWakeGuard({ ctx, records, state, noteToBoard: (companyId, text, extra) => noteToBoard(ctx, companyId, text, extra) });
+  // One log line per issue, rule and decision, for the watchdog's skips (this process).
+  const decided = new Set();
+  const decision = (issue, rule, what, msg, extra = {}) => {
+    const key = `${issue.id}:${what}`;
+    if (decided.has(key)) return;
+    decided.add(key);
+    log(msg, { issue: issue.identifier ?? issue.id, rule, decision: what, ...extra });
+  };
 
   async function agentFor(id, agents) {
     if (!agents.has(id)) agents.set(id, await api.request("GET", `/api/agents/${id}`));
@@ -433,9 +457,11 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       }
       return;
     }
+    if (!(await wakeGuard.allow(issue, "retry deferred"))) return;
     if (before && !(await before())) return; // not this tick
     records.set(key, { count: count + 1, at: now() });
     state.touch();
+    await wakeGuard.woke(issue, "retry deferred");
     try {
       await api.request("POST", `/api/issues/${issue.id}/queued-comments/interrupt`, {
         queueId: queue.queueId,
@@ -538,6 +564,10 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       }
       return true;
     }
+    // The agent waits on CI under the backstop: kept while the run goes, and released
+    // with its report once it has finished.
+    const ci = await ciHold(facts, "7", agents);
+    if (ci?.keep) return true;
     const saved = facts.queue?.entries?.length ?? 0;
     if (config.dryRun) {
       // Recorded only in memory: with dry run off, the release still happens.
@@ -547,6 +577,8 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       }
       return true;
     }
+    // A CI report posted behind the hold is the release's wake: not a loop.
+    if (!ci?.reported && !(await wakeGuard.allow(facts.issue, "release (7)"))) return true;
     records.set(key, { count: 1, at: now() });
     state.touch();
     let result;
@@ -556,6 +588,8 @@ export function createWatchdog(outerCtx, state, deps = {}) {
           "Released by Paperclip Helper's watchdog: the held run stopped without a record Paperclip could verify, " +
           "so Paperclip could never release this hold by itself.",
         signature: `\n\n${WATCHDOG_SIGNATURE}`,
+        // CI has finished: nothing to wait on, so no backstop to put back.
+        ...(ci?.finished ? { backstop: null } : {}),
       });
     } catch (err) {
       records.set(key, { count: 1, at: now(), failed: true });
@@ -576,8 +610,10 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       delivered: result.delivered,
       ...(result.byPaperclip ? { deliveredByPaperclip: result.byPaperclip } : {}),
       ...(result.backstop ? { ciBackstop: result.backstop } : {}),
+      ...(ci?.finished ? { ciRun: ci.wait.run.id, ciReport: ci.reported ? "delivered with the release" : "nothing to report" } : {}),
     });
-    if (!result.delivered && !result.waiting && !result.byPaperclip) {
+    if (!ci?.reported) await wakeGuard.woke(facts.issue, "release (7)");
+    if (!result.delivered && !result.waiting && !result.byPaperclip && !ci?.reported) {
       await nudge(
         issue,
         record.releaseNudge(issue, hold.runId),
@@ -589,6 +625,35 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       );
     }
     return true;
+  }
+
+  // 7 and 22: a hold on an issue whose agent waits on CI under 11's backstop
+  // (ci-runs.mjs heldWait). While the run goes the hold is kept: a release would only
+  // wake the agent to say it is still waiting, and its run ending is the next repair and
+  // the next hold. Once the run has finished its report is posted behind the hold
+  // (reportHeld), for the release to deliver as the agent's one wake.
+  //   null                                 no such wait: release as before
+  //   { keep: true, wait }                 the run is still going (or GitHub didn't say)
+  //   { finished: true, wait, reported }   release now; `reported`: the report waits behind it
+  async function ciHold(facts, rule, agents) {
+    if (!config.watchdogCiRuns || !github) return null;
+    const { issue, hold } = facts;
+    // Unreadable: released as before (the loop breaker still stands), never held for good.
+    const wait = await ciRunsCheck.heldWait(issue).catch((err) => {
+      log.warn("watchdog: couldn't tell whether a held issue waits on CI", { issue: issue.identifier ?? issue.id, error: err.message });
+      return null;
+    });
+    if (!wait) return null;
+    const ciRun = wait.run?.id ?? null;
+    if (wait.state !== "finished") {
+      decision(issue, rule, `kept:${hold.runId}`, "watchdog: a hold on an issue waiting on CI is kept until the run finishes", {
+        sourceRun: hold.runId, repo: wait.repo ?? null, ciRun, ciState: wait.state,
+      });
+      return { keep: true, wait };
+    }
+    if (config.dryRun) return { finished: true, wait, reported: false };
+    const reported = (await ciRunsCheck.reportHeld(issue, wait, issue.companyId, agents)) === "posted";
+    return { finished: true, wait, reported };
   }
 
   // An issue blocked by an active recovery action that waits on the board.
@@ -700,7 +765,8 @@ export function createWatchdog(outerCtx, state, deps = {}) {
 
   // Cancelled by Paperclip at admission, before any work: see stalledHandOff.
   const refused = (run) => run.status === "cancelled" && run.errorCode === "execution_reconciliation_required";
-  const neverStarted = (run) => run.status === "cancelled" && run.errorCode === "issue_assignee_changed" && !run.startedAt;
+  // (Not release.mjs's neverStarted(facts), which 7 asks about a held run: this one reads a run row.)
+  const cancelledAtHandOff = (run) => run.status === "cancelled" && run.errorCode === "issue_assignee_changed" && !run.startedAt;
 
   // A question card's wake to a teammate becomes a run Paperclip cancels before
   // it starts (questions.mjs). It was never the teammate's turn on the issue:
@@ -708,7 +774,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   // "new owner" while it waits on its card. Only runs of an agent a card on the
   // issue was addressed to are left out; any other never-started run still counts.
   async function cardWakesLeftOut(issue, runs) {
-    if (!Array.isArray(runs) || !runs.some(neverStarted)) return runs;
+    if (!Array.isArray(runs) || !runs.some(cancelledAtHandOff)) return runs;
     const cards = await api.request("GET", `/api/issues/${issue.id}/interactions`).catch(() => []);
     const asked = new Map(); // addressee → when it was first asked
     for (const c of Array.isArray(cards) ? cards : []) {
@@ -717,7 +783,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       }
     }
     if (!asked.size) return runs;
-    return runs.filter((r) => !(neverStarted(r) && asked.has(r.agentId) && ts(r.createdAt) >= asked.get(r.agentId)));
+    return runs.filter((r) => !(cancelledAtHandOff(r) && asked.has(r.agentId) && ts(r.createdAt) >= asked.get(r.agentId)));
   }
 
   // Issues the hand-off check found settled: never worked on, or the owner's own run
@@ -865,7 +931,9 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   // issue with those fields, so both happen in one step, and `patchNote` is added
   // to it; if Paperclip refuses the fields, the comment goes alone, without the note.
   // `before`, when given, is asked last, just before sending: false holds the nudge back.
-  async function nudge(issue, key, agent, message, logExtra, { patch = null, patchNote = "", before = null } = {}) {
+  // The loop breaker (wake-guard.mjs) is asked before that; `loopExempt` for a CI run's
+  // report, which is new information: never held back, and it starts the count again.
+  async function nudge(issue, key, agent, message, logExtra, { patch = null, patchNote = "", before = null, loopExempt = false } = {}) {
     const prior = records.get(key);
     const count = prior?.count ?? 0;
     if (count >= config.watchdogMaxNudges || (prior && now() - prior.at < stallMs)) return false;
@@ -877,6 +945,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       log("watchdog: would nudge (dry run)", { issue: who, agent: agent.name, ...logExtra });
       return false;
     }
+    if (!loopExempt && !(await wakeGuard.allow(issue, logExtra?.reason ?? "nudge"))) return false;
     if (before && !(await before())) return false; // not this tick
     records.set(key, { count: count + 1, at: now() });
     state.touch();
@@ -901,6 +970,8 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       return false;
     }
     stats.nudges += 1;
+    if (loopExempt) wakeGuard.reset(issue);
+    else await wakeGuard.woke(issue, logExtra?.reason ?? "nudge");
     log("watchdog: nudged", { issue: who, agent: agent.name, nudge: count + 1, ...logExtra, ...(patch ? { patched } : {}) });
     return true;
   }
@@ -993,6 +1064,23 @@ export function createWatchdog(outerCtx, state, deps = {}) {
         if (config.watchdogCancelledBlockers && (await cancelledBlockers(issue, diag, agents))) return;
         const idle = await unblockedButIdle(issue, diag, agents);
         if (!idle) return;
+        // Blocked by a recovery hold, or waiting on CI under the backstop: its done blockers
+        // aren't why. The comment would reopen it (blocked → todo, which also clears a
+        // monitor) and wake the agent for nothing. A hold is 7's or 22's to release.
+        const full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+        if (!full) return;
+        if (full.executionBlocker) {
+          decision(issue, "2", `held:${full.executionBlocker.runId ?? "?"}`, "watchdog: no blockers-resolved nudge: the issue is held for recovery, not by its blockers", {
+            cause: full.executionBlocker.cause ?? null, sourceRun: full.executionBlocker.runId ?? null, blockersDone: idle.done,
+          });
+          await releaseUnprovableHold(issue, agents);
+          return;
+        }
+        const monitor = full.executionState?.monitor;
+        if (isBackstop(monitor) && monitorPending(monitor, now())) {
+          decision(issue, "2", "ci-wait", "watchdog: no blockers-resolved nudge: the agent waits on CI under the Helper's backstop", { blockersDone: idle.done });
+          return;
+        }
         await nudge(
           issue,
           record.blocked(issue, idle.done),
@@ -1363,11 +1451,12 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   // ---------------------------------------------------------------- 11. CI runs agents wait on
 
   // The issue's runs, without those Paperclip cancelled before they started.
-  const startedRuns = (runs) => (Array.isArray(runs) ? runs : []).filter((r) => !refused(r) && !neverStarted(r));
+  const startedRuns = (runs) => (Array.isArray(runs) ? runs : []).filter((r) => !refused(r) && !cancelledAtHandOff(r));
 
   const ciRunsCheck = createCiRunsCheck({
     ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns,
     noteToBoard: (companyId, text, extra) => noteToBoard(ctx, companyId, text, extra),
+    heldScanSoon: (companyId) => pausedHolds.scanSoon(companyId),
   });
 
   // ---------------------------------------------------------------- 21. agents that wake themselves
@@ -1385,7 +1474,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
 
   // 22. Holds behind runs that never started, and reports of holds behind runs that did:
   // handed over by 18's scan, which reads every held issue once per stall window.
-  const unstartedHolds = createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, nudge });
+  const unstartedHolds = createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, nudge, ciHold, wakeGuard });
   const pausedHolds = createPausedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, resumes, otherHolds: unstartedHolds });
 
   // ---------------------------------------------------------------- 19. PRs ready to queue

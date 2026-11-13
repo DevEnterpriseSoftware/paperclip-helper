@@ -340,66 +340,156 @@ test("a hold keeps the backstop: never cleared from a held issue, while a blocke
   assert.ok(!env.state.nudges.has(`ci-backstop:${issue.id}`));
 });
 
-test("a hold behind the repair the backstop suppressed is released back in progress with the backstop, and nobody woken by the watchdog", async (t) => {
+// The agent's runs on the issue that Paperclip queued (a wake), with simulateWakes on.
+const wakesOf = (env, { carla, issue }) => (env.db.issueRuns[issue.id] ?? []).filter((r) => r.agentId === carla.id && r.status === "queued");
+const keptLines = (env) => env.logs.filter((l) => l.msg === "watchdog: a hold on an issue waiting on CI is kept until the run finishes");
+
+test("a hold behind the repair the backstop suppressed is kept while CI runs, and released with the run's report once it finishes: one wake", async (t) => {
   const env = await watchdogEnv(t);
+  env.db.simulateWakes = true;
   const w = waitingOnCi(env);
   const { issue } = w;
   await env.watchdog.tick();
   const scheduled = issue.executionPolicy.monitor;
   const runId = holdBehindSuppressedRepair(env, w);
-  env.later(4); // the hold scan, a stall window on
-  await env.watchdog.tick();
 
-  assert.equal(env.db.resolutions.length, 1);
-  assert.equal(env.db.resolutions[0].body.executionReconciliation.runId, runId);
-  assert.equal(env.db.resolutions[0].body.executionReconciliation.actionOutcome, "not_performed");
-  assert.equal(issue.executionBlocker, null);
-  assert.equal(issue.status, "in_progress", "back in progress, where the wait was");
-  assert.equal(issue.executionPolicy.monitor.notes, scheduled.notes, "the backstop again: the next run ends with a live path");
-  assert.equal(issue.executionPolicy.monitor.nextCheckAt, scheduled.nextCheckAt, "the same check");
-  assert.equal(issue.executionState.monitor.status, "scheduled");
-  // The release cleared it; the issue went back in progress, then the monitor was set, in that order.
-  const after = env.db.patches.filter((p) => p.issueId === issue.id).slice(1).map((p) => p.body);
-  assert.deepEqual(after[0], { status: "in_progress" });
-  assert.ok(after[1].executionPolicy.monitor.notes.startsWith(BACKSTOP_MARK));
-  assert.deepEqual(after[1].executionPolicy.stages, w.stages, "the policy kept with it");
-  const note = env.logs.find((l) => l.msg === "watchdog: a note for the board" && /released it/.test(l.text));
-  assert.match(note.text, /The issue is back in progress with the Helper's CI backstop monitor, which the release cleared, so the agent's next run ends with its wait in place\. Status now in_progress\./);
-
-  // Nothing saved, but no follow-up comment: the agent is waiting on CI, and the report or the backstop wakes it.
-  env.later(1);
-  await env.watchdog.tick();
-  env.later(5);
-  await env.watchdog.tick();
+  // CI still going: two hold scans, a stall window apart, release nothing and wake nobody.
+  for (let i = 0; i < 3; i += 1) {
+    env.later(4);
+    await env.watchdog.tick();
+  }
+  assert.equal((env.db.resolutions ?? []).length, 0, "the hold stays while the run goes");
+  assert.equal(issue.executionBlocker.runId, runId);
+  assert.equal(issue.status, "blocked");
+  assert.deepEqual(issue.executionPolicy.monitor, scheduled, "the backstop stays with it");
   assert.equal(helperComments(env.db, issue).length, 0);
-  assert.equal(monitorPatches(env.db, issue).length, 2, "no third: the backstop pass finds its monitor standing");
-  assert.equal([...env.state.nudges.entries()].filter(([k]) => k.startsWith("unstarted-follow-up:")).length, 0);
+  assert.equal(wakesOf(env, w).length, 0, "no wake before CI finishes");
+  const kept = keptLines(env);
+  assert.equal(kept.length, 1, "said once, not every scan");
+  assert.equal(kept[0].rule, "22");
+  assert.equal(String(kept[0].ciRun), String(w.run.id));
+  assert.equal(kept[0].ciState, "running");
 
-  // The run finishing is reported as usual, the backstop cleared with it.
+  // CI finishes: the report is posted behind the hold (saved there), the backstop cleared
+  // with it, and the release delivers it: the agent's one wake, with the result.
   env.later(4);
   finish(env, w.run);
   await env.watchdog.tick();
   const [report, ...more] = helperComments(env.db, issue);
   assert.equal(more.length, 0);
+  assert.match(report.body, /finished/);
   assert.match(report.body, /The Helper's backstop monitor for this run was cleared\./);
+  assert.equal(env.db.resolutions.length, 1);
+  assert.equal(env.db.resolutions[0].body.executionReconciliation.runId, runId);
+  assert.equal(env.db.resolutions[0].body.executionReconciliation.actionOutcome, "not_performed");
+  assert.equal(issue.executionBlocker, null);
+  assert.equal(issue.status, "todo", "nothing to wait on any more: no backstop put back");
+  assert.equal(issue.executionPolicy?.monitor ?? null, null);
+  assert.equal(env.db.interrupts.length, 1, "the saved report delivered");
+  assert.equal(wakesOf(env, w).length, 1, "exactly one wake, carrying the result");
+  assert.ok(!env.state.nudges.has(`ci-backstop:${issue.id}`));
+  assert.equal([...env.state.nudges.entries()].filter(([k]) => k.startsWith("unstarted-follow-up:")).length, 0, "no follow-up on top");
+  const note = env.logs.find((l) => l.msg === "watchdog: a note for the board" && /released it/.test(l.text));
+  assert.match(note.text, /It waited for the CI run the agent was waiting on \(30498202022\) to finish, and posted its report behind the hold, so the release wakes the agent once, with the result\./);
+  assert.equal(note.ciReport, true);
+
+  // Nothing more from the watchdog afterwards.
+  for (let i = 0; i < 2; i += 1) {
+    env.later(4);
+    await env.watchdog.tick();
+  }
+  assert.equal(helperComments(env.db, issue).length, 1);
+  assert.equal(env.db.resolutions.length, 1);
 });
 
-test("a backstop Paperclip cleared as it held the issue is put back from the watchdog's record", async (t) => {
+test("a held issue a comment reopened to todo still waits on CI: the record outlives the cleared monitor", async (t) => {
   const env = await watchdogEnv(t);
+  env.db.simulateWakes = true;
   const w = waitingOnCi(env);
   const { issue } = w;
   await env.watchdog.tick();
-  const scheduled = env.state.nudges.get(`ci-backstop:${issue.id}`).monitor;
   holdBehindSuppressedRepair(env, w, { clear: true });
+  issue.status = "todo"; // a board comment's reopen; Paperclip cleared the monitor
   env.later(4);
   await env.watchdog.tick();
-  assert.equal(issue.executionBlocker, null);
-  assert.equal(issue.status, "in_progress");
-  const restored = monitorPatches(env.db, issue).at(-1).body.executionPolicy.monitor;
-  assert.equal(restored.notes, scheduled.notes);
-  assert.equal(restored.externalRef, RUN_URL, "from the record: the run's own URL, not Paperclip's redacted copy");
-  assert.equal(restored.nextCheckAt, scheduled.nextCheckAt);
-  assert.equal(issue.executionState.monitor.status, "scheduled");
+  env.later(4);
+  await env.watchdog.tick();
+  assert.equal((env.db.resolutions ?? []).length, 0);
+  assert.ok(env.state.nudges.has(`ci-backstop:${issue.id}`), "kept for the release to know the wait");
+  assert.equal(monitorPatches(env.db, issue).length, 1, "nothing put back on a held issue");
+  assert.equal(wakesOf(env, w).length, 0);
+
+  env.later(4);
+  finish(env, w.run, "failure");
+  await env.watchdog.tick();
+  assert.equal(env.db.resolutions.length, 1);
+  assert.equal(helperComments(env.db, issue).length, 1);
+  assert.match(helperComments(env.db, issue)[0].body, /failure|failed/i);
+  assert.equal(wakesOf(env, w).length, 1);
+});
+
+test("a hold behind a repair suppressed at dispatch (7's: prepared, never invoked) is kept while CI runs and released with the report", async (t) => {
+  const env = await watchdogEnv(t);
+  env.db.simulateWakes = true;
+  const w = waitingOnCi(env);
+  const { carla, issue } = w;
+  await env.watchdog.tick();
+  // Paperclip claimed and prepared the repair, then its dispatch check found the backstop
+  // (durable_wait) and cancelled it: a start time, no process, no usage.
+  const runId = uuid();
+  const finishedAt = minutesAgo(5);
+  env.db.heartbeatRuns.push({
+    id: runId, companyId: ids.company, agentId: carla.id, status: "cancelled", errorCode: "legacy_disposition_repair_suppressed", runtimeMode: "legacy",
+    error: "Disposition repair suppressed: durable_wait", createdAt: minutesAgo(6), startedAt: minutesAgo(6), finishedAt, processPid: null, processGroupId: null,
+    executionStage: "dispatching", usageJson: null, resultJson: {}, contextSnapshot: { issueId: issue.id },
+  });
+  env.db.issueRuns[issue.id].unshift({ runId, agentId: carla.id, status: "cancelled", errorCode: "legacy_disposition_repair_suppressed", createdAt: minutesAgo(6), startedAt: minutesAgo(6), finishedAt });
+  issue.status = "blocked";
+  issue.executionBlocker = { recoveryActionId: uuid(), runId, agentId: carla.id, cause: "legacy_execution_requires_reconciliation", runStatus: "cancelled", savedMessageCount: 0 };
+  issue.updatedAt = minutesAgo(5);
+
+  for (let i = 0; i < 2; i += 1) {
+    env.later(4);
+    await env.watchdog.tick();
+  }
+  assert.equal((env.db.resolutions ?? []).length, 0);
+  assert.equal(wakesOf(env, w).length, 0);
+  assert.equal(keptLines(env).length, 1);
+  assert.equal(keptLines(env)[0].rule, "7");
+
+  env.later(4);
+  finish(env, w.run);
+  await env.watchdog.tick();
+  assert.equal(env.db.resolutions.length, 1);
+  assert.equal(env.db.resolutions[0].body.executionReconciliation.actionOutcome, "mixed");
+  assert.equal(helperComments(env.db, issue).length, 1, "the report, and no 'continue' nudge on top");
+  assert.equal(wakesOf(env, w).length, 1);
+  const released = env.logs.find((l) => l.msg === "watchdog: released a hold Paperclip couldn't release by itself");
+  assert.equal(released.ciReport, "delivered with the release");
+});
+
+test("the blockers-resolved nudge leaves an issue held for recovery, or waiting on CI, alone, and says why once", async (t) => {
+  const env = await watchdogEnv(t);
+  env.db.simulateWakes = true;
+  const w = waitingOnCi(env);
+  const { issue } = w;
+  await env.watchdog.tick();
+  holdBehindSuppressedRepair(env, w);
+  // Its old blocker links are done, but they aren't why it is blocked.
+  issue.blockedBy = [{ id: uuid(), identifier: "ACM-170", status: "done" }, { id: uuid(), identifier: "ACM-171", status: "done" }];
+  env.db.blockerDiagnostics[issue.id] = { readiness: { allBlockersDone: true }, blockers: issue.blockedBy };
+  issue.updatedAt = minutesAgo(10);
+  for (let i = 0; i < 3; i += 1) {
+    env.later(4);
+    await env.watchdog.tick();
+  }
+  assert.equal(helperComments(env.db, issue).length, 0, "no 'every blocker on this issue is done' comment");
+  assert.equal(issue.status, "blocked", "not reopened");
+  assert.deepEqual(issue.executionPolicy.monitor.notes.startsWith(BACKSTOP_MARK), true, "the backstop not cleared by a reopen");
+  const skipped = env.logs.filter((l) => l.msg === "watchdog: no blockers-resolved nudge: the issue is held for recovery, not by its blockers");
+  assert.equal(skipped.length, 1);
+  assert.deepEqual(skipped[0].blockersDone, ["ACM-170", "ACM-171"]);
+  assert.equal(skipped[0].rule, "2");
 });
 
 test("a dry run schedules nothing and says what it would do, once", async (t) => {
@@ -525,4 +615,16 @@ test("pch why: a self-wake loop comes first, even with a run going; a CI wait na
     ciRun: "org/app#30498202022", ciBackstop: { nextCheckAt: "2026-10-30T15:00:00.000Z" },
   });
   assert.match(waiting.what, /The Helper's backstop monitor holds the wait \(next check 2026-10-30T15:00:00.000Z\)/);
+});
+
+test("pch why: a hold on an issue waiting on CI says the watchdog keeps it until the run finishes", () => {
+  const held = advise({
+    identifier: "ACM-192", issue: { status: "blocked", assigneeAgentId: "a", executionBlocker: { cause: "legacy_execution_requires_reconciliation" } },
+    assignee: { name: "Carla", status: "idle" },
+    unstartedHold: { ownerName: "Carla", runId: "1a2b3c4d-0000", errorCode: "issue_disposition_repair_superseded", problems: [] },
+    ciRun: "org/app#30498202022", ciBackstop: { nextCheckAt: "2026-10-30T15:00:00.000Z" },
+  });
+  assert.equal(held.watchdog, "auto");
+  assert.match(held.what, /The agent is waiting on CI under the Helper's backstop, so the watchdog keeps the hold until that run finishes/);
+  assert.match(held.autoNote, /once the CI run has finished \(WATCHDOG_RELEASE_HOLDS\), with the run's report as the saved message/);
 });

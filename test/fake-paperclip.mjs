@@ -131,6 +131,31 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
     runs.unshift(run);
     db.heartbeatRuns.push(run);
   };
+  // A comment on an issue held for reconciliation (any hold the fake doesn't lift on a
+  // comment): Paperclip saves its wake behind the hold (queued-comments, deferred). A board
+  // user's comment on a held issue that is blocked with no unresolved blocker also reopens
+  // it to todo (the comment reopen, a direct update), which clears a policy monitor
+  // (monitorClearReasonForIssue). Seen on 2026.1106.0: a watchdog comment on a held issue
+  // moved it blocked → todo and the hold stayed.
+  const saveBehindHold = (issue, comment, body) => {
+    if (issue.status === "blocked" && !/^agent/.test(db.meSource ?? "board_key") && !(issue.blockedBy ?? []).some((b) => !["done", "cancelled"].includes(b.status))) {
+      issue.status = "todo";
+      if (issue.executionPolicy?.monitor) {
+        const { monitor: _gone, ...rest } = issue.executionPolicy;
+        issue.executionPolicy = rest.stages?.length ? rest : null;
+        if (issue.executionState?.monitor) issue.executionState = { ...issue.executionState, monitor: { ...issue.executionState.monitor, status: "cleared", clearReason: "invalid_status", nextCheckAt: null } };
+      }
+    }
+    (db.wakes[issue.id] ??= []).unshift({ kind: "wake_request", agentId: issue.assigneeAgentId, status: "deferred_issue_execution", reason: "issue_commented", requestedAt: new Date().toISOString() });
+    const q = (db.queuedComments[issue.id] ??= { issueId: issue.id, queueId: uuid(), state: "deferred", targetRunId: null, revision: "r1", protocol: "legacy", entries: [] });
+    q.entries = [...(q.entries ?? []), { comment: { id: comment.id, body }, position: q.entries?.length ?? 0 }];
+  };
+  const heldForReconciliation = (issue) => {
+    const hold = issue.executionBlocker;
+    if (hold?.cause !== "legacy_execution_requires_reconciliation") return false;
+    const source = db.heartbeatRuns.find((r) => r.id === hold.runId);
+    return source?.errorCode !== "agent_paused" && issue.executionState?.status !== "pending";
+  };
   const issueByRef = (ref) => db.issues.find((i) => i.id === ref || i.identifier?.toUpperCase() === String(ref).toUpperCase());
   const actor = (req) => {
     const auth = req.headers.authorization ?? "";
@@ -540,9 +565,11 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
             if (k in body) issue[k] = body[k];
           }
         }
-        if (body.comment) db.comments.push(boardComment(issue, body.comment, "patch", who));
+        const patchComment = body.comment ? boardComment(issue, body.comment, "patch", who) : null;
+        if (patchComment) db.comments.push(patchComment);
         issue.updatedAt = new Date().toISOString();
-        if (body.comment) wakeAssignee(issue, "issue_commented");
+        if (patchComment && !body.status && heldForReconciliation(issue)) saveBehindHold(issue, patchComment, body.comment);
+        else if (body.comment) wakeAssignee(issue, "issue_commented");
         else if (issue.status === "todo" && (before === "blocked" || before === "backlog")) wakeAssignee(issue, "issue_status_changed");
         return send(200, issue);
       }
@@ -586,6 +613,10 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
           (db.wakes[issue.id] ??= []).unshift({ kind: "wake_request", agentId: issue.assigneeAgentId, status: "deferred_issue_execution", reason: "issue_commented", requestedAt: new Date().toISOString() });
           const q = db.queuedComments[issue.id];
           if (q) q.entries = [...(q.entries ?? []), { comment: { id: comment.id, body: body.body }, position: q.entries?.length ?? 0 }];
+          return send(201, { id: comment.id, body: body.body });
+        }
+        if (heldForReconciliation(issue)) {
+          saveBehindHold(issue, comment, body.body);
           return send(201, { id: comment.id, body: body.body });
         }
         // Paperclip's comment reopen (routes/issues.ts, 2026.1023.0): a board user's comment on
@@ -667,6 +698,8 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         if (!queue || queue.queueId !== body.queueId) return send(409, { error: "The queued message is no longer pending" });
         if (queue.revision !== body.revision) return send(409, { error: "The queued messages changed in another session" });
         db.interrupts.push({ issueId: issue.id, body });
+        // Delivered: one run for the saved messages (with simulateWakes).
+        if (!issue.executionBlocker) wakeAssignee(issue, "issue_commented");
         return send(200, queue);
       }
       if (rest === "/recovery-actions/resolve" && req.method === "POST") {

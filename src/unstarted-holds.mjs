@@ -41,12 +41,18 @@
 //
 // An agent waiting on CI under watchdog 11's backstop is the common case: the backstop
 // arriving a moment after the agent's run ended makes the disposition repair Paperclip
-// scheduled unnecessary, and Paperclip holds the issue behind the suppressed repair. The
+// scheduled unnecessary, and Paperclip holds the issue behind the suppressed repair.
+// Releasing it then wakes the agent (Paperclip's continuation, the saved messages) with
+// nothing to do but say it is still waiting, and that run, ending a moment before the
+// backstop is back, is the next repair and the next hold. So while the CI run goes the
+// hold is kept (`ciHold`, from the watchdog: ci-runs.mjs heldWait), with one log line
+// saying so; once it has finished, its report is posted behind the hold and the release
+// delivers it: one wake, with the result. Without GitHub (no CI wait to read), the
 // release puts the issue back in progress with the backstop before any wake starts
-// (release.mjs heldBackstop), from the watchdog's record of it if Paperclip cleared it,
-// so the next run ends with a live path instead of the next hold; and with nothing
-// saved, the watchdog adds no wake of its own: the CI report or the backstop wakes the
-// agent, and Paperclip's continuation run finds the wait in place.
+// (release.mjs heldBackstop), as before.
+//
+// Every release asks the loop breaker first (wake-guard.mjs, `wakeGuard`): an issue the
+// watchdog has woken twice in half an hour with nothing moving on it is left alone.
 //
 // A hold from a run that did execute (it started, or recorded usage) is the board's:
 // it is reported once, an hour after the run ended, unless it is one 7 releases by
@@ -108,8 +114,10 @@ export function unstartedHoldRemedy({ problems, errorCode, identifier, ownerName
   return `Once that is out of the way the watchdog releases it on its next scan; \`pch release ${identifier}\` shows the hold.`;
 }
 
-// From the watchdog: its records, `record` keys, `agentFor` and `nudge`.
-export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, nudge }) {
+// From the watchdog: its records, `record` keys, `agentFor` and `nudge`; `ciHold(facts, rule,
+// agents)` (null, { keep }, or { finished, wait, reported }) and the loop breaker `wakeGuard`.
+const NO_GUARD = { allow: async () => true, woke: async () => {}, reset: () => {} };
+export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSeen, record, agentFor, nudge, ciHold = async () => null, wakeGuard = NO_GUARD }) {
   const { api, config, log } = ctx;
   const now = () => ctx.now();
   const stallMs = config.watchdogStallSec * 1000;
@@ -216,6 +224,10 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
     // hand-on route the run that matters is the held run's agent's.
     const runner = handOn ? owner : assignee;
     if (!runner || asleep(runner)) return;
+    // The agent waits on CI under the backstop: kept while the run goes; once it has
+    // finished, the report waits behind the hold and the release delivers it.
+    const ci = route || handOn ? null : await ciHold(facts, "22", agents);
+    if (ci?.keep) return;
     if (config.dryRun) {
       if (!dryRunSeen.has(key)) {
         dryRunSeen.add(key);
@@ -223,6 +235,7 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
       }
       return;
     }
+    if (!ci?.reported && !(await wakeGuard.allow(issue, "release (22)"))) return;
     records.set(key, { count: 1, at: now(), ...(retry ? { retried: true } : {}) });
     state.touch();
     const options = {
@@ -251,7 +264,8 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
         : `, asking ${owner?.name ?? "the run's agent"} to give the issue back to ${target.name}: their review had ended, and the saved messages are ${target.name}'s work`
       : "";
     // The CI backstop on the issue (or the watchdog's record of it): back with the issue.
-    const backstop = route || handOn ? null : heldBackstop(facts, { recorded: records.get(record.ciBackstop(issue)), now: now() });
+    // Not once the CI run has finished: there is no wait left to put back.
+    const backstop = route || handOn || ci?.finished ? null : heldBackstop(facts, { recorded: records.get(record.ciBackstop(issue)), now: now() });
     let result;
     try {
       result = route === "lossless" ? await releaseHeldReview(api, facts, options)
@@ -293,7 +307,7 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
         count: 0, at: now(), companyId, issueId: issue.id, holdAgentId: hold.agentId, targetId: target.id, kind: handOn.kind,
       });
       state.touch();
-    } else if (!delivered && !result.review && !result.backstop) {
+    } else if (!delivered && !result.review && !result.backstop && !ci?.reported) {
       records.set(record.unstartedFollowUp(issue, hold.runId), { count: 0, at: now(), companyId, issueId: issue.id, assigneeId: assignee.id, errorCode: run.errorCode });
       state.touch();
     }
@@ -303,9 +317,15 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
       `${who}: ${why}${held}. The watchdog released it${stageText}${handOnStep}, recording that the run performed nothing` +
         `${delivered ? `, and ${delivered}` : ""}${result.monitorRestored ? ". Its monitor, cleared by Paperclip on the way, is set again" : ""}` +
         `${result.backstop === "restored" ? ". The issue is back in progress with the Helper's CI backstop monitor, which the release cleared, so the agent's next run ends with its wait in place" : ""}` +
-        `${result.backstop === "kept" ? ". The Helper's CI backstop monitor still holds the wait" : ""}. Status now ${result.status}.`,
-      { ...logExtra, level: "info", released: true, delivered: result.delivered, status: result.status, review: Boolean(result.review), handOn: handOn?.kind ?? null, ...(result.backstop ? { backstop: result.backstop } : {}) },
+        `${result.backstop === "kept" ? ". The Helper's CI backstop monitor still holds the wait" : ""}` +
+        `${ci?.reported ? `. It waited for the CI run the agent was waiting on (${ci.wait.run.id}) to finish, and posted its report behind the hold, so the release wakes the agent once, with the result` : ""}` +
+        `${ci?.finished && !ci.reported ? `. It waited for the CI run the agent was waiting on (${ci.wait.run.id}) to finish` : ""}. Status now ${result.status}.`,
+      {
+        ...logExtra, level: "info", released: true, delivered: result.delivered, status: result.status, review: Boolean(result.review), handOn: handOn?.kind ?? null,
+        ...(result.backstop ? { backstop: result.backstop } : {}), ...(ci?.finished ? { ciRun: ci.wait.run.id, ciReport: ci.reported } : {}),
+      },
     );
+    if (!ci?.reported) await wakeGuard.woke(issue, "release (22)");
   }
 
   // After a hand-on release: the held run's agent was asked to reassign the issue to its

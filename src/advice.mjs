@@ -287,6 +287,11 @@ export function advise(facts) {
   }
   // A run Paperclip's dispatch cancelled before it started: nothing to reconcile, and
   // nothing in Paperclip releases it (watchdog 22).
+  // A held issue whose agent waits on CI under the Helper's backstop: the watchdog (7, 22)
+  // keeps the hold until the run finishes, then releases it with the run's report.
+  const ciHeld = hold && ciBackstop && config.watchdog !== false && config.watchdogReleaseHolds !== false
+    ? " The agent is waiting on CI under the Helper's backstop, so the watchdog keeps the hold until that run finishes: a release now would only wake it to say it is still waiting. Then it posts the run's report behind the hold and releases it, so the agent wakes once, with the result."
+    : "";
   if (hold && unstartedHold) {
     const { problems = [] } = unstartedHold;
     const releasing = config.watchdog !== false && config.watchdogReleaseHolds !== false;
@@ -330,7 +335,7 @@ export function advise(facts) {
       };
     }
     return {
-      what: unstartedHold.route === "lossless" ? `${what} The review is kept: Paperclip parked it with its stage pending.` : what,
+      what: unstartedHold.route === "lossless" ? `${what} The review is kept: Paperclip parked it with its stage pending.` : `${what}${ciHeld}`,
       steps: [
         `pch release ${identifier}   (shows the run and what releasing it does)`,
         unstartedHold.route === "lossless"
@@ -338,7 +343,9 @@ export function advise(facts) {
           : `pch release ${identifier} --apply   (records that the run performed nothing, moves the issue to todo and delivers the saved messages)`,
       ],
       watchdog: releasing ? "auto" : "manual",
-      autoNote: "The watchdog does this by itself once the run ended a stall window ago and the assignee is available (WATCHDOG_RELEASE_HOLDS), and tells the board.",
+      autoNote: ciHeld && unstartedHold.route !== "lossless"
+        ? "The watchdog does this by itself once the CI run has finished (WATCHDOG_RELEASE_HOLDS), with the run's report as the saved message, and tells the board."
+        : "The watchdog does this by itself once the run ended a stall window ago and the assignee is available (WATCHDOG_RELEASE_HOLDS), and tells the board.",
     };
   }
   // A run that recorded no process id or stop can never prove it stopped: a
@@ -349,7 +356,7 @@ export function advise(facts) {
     return {
       what:
         `Paperclip is holding execution on this issue (${hold.cause ?? "unknown cause"}) until the board confirms its last run stopped.` +
-        (unprovable ? " That run recorded no process or stop, so messages and Interrupt can't release it." : ""),
+        (unprovable ? " That run recorded no process or stop, so messages and Interrupt can't release it." : "") + ciHeld,
       steps: [
         ...(hold.nextAction ? [`Paperclip's own next action: ${hold.nextAction}`] : []),
         `pch release ${identifier}   (shows the held run and what releasing it does)`,

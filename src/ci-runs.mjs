@@ -23,13 +23,18 @@
 // notes name the run. The watchdog still reports the run when it finishes and clears
 // the monitor in the same step; the monitor fires only if that report never comes.
 //
-// A hold keeps it. Paperclip can hold the issue for reconciliation while the backstop
-// stands (a disposition repair the monitor made unnecessary, suppressed before it
-// started: the very monitor causes the hold), and sets it blocked with the monitor in
-// place. Cleared then, the release's wake would end with no live path and the next
-// repair would be suppressed into the next hold. So the backstop stays on a held issue,
-// and the release (release.mjs releaseHold) puts the issue back in progress with it
-// before any wake starts.
+// A hold keeps it, and is kept while the run goes. Paperclip can hold the issue for
+// reconciliation while the backstop stands (a disposition repair the monitor made
+// unnecessary, suppressed before it started: the very monitor causes the hold), and
+// sets it blocked with the monitor in place. Any release wakes the agent (the move to
+// todo, the saved messages, Paperclip's continuation), and the agent has nothing to do
+// but say it is still waiting; a run that ends a moment before the backstop is back is
+// the next repair, the next suppression and the next hold. So while the run goes the
+// hold stays (heldWait, asked by watchdogs 7 and 22 before they release one), and once
+// it has finished the report is posted behind the hold and the release delivers it
+// (reportHeld): one wake, with the result. The record of the backstop outlives a move
+// of the held issue to todo (a comment reopens it, and Paperclip clears the monitor),
+// so the wait is still known then.
 
 import { listIssues } from "./paperclip.mjs";
 import { ACTIVE_RUN, asleep, mapLimit, pausedRefusal, ts } from "./util.mjs";
@@ -260,6 +265,8 @@ export function runnerProblemMessage({ run, runner }) {
 // Issues the CI-run check reads: an agent that waits on CI leaves its issue in
 // any of these. Only those touched in the last few days: an older wait is stale.
 const CI_STATUSES = "todo,in_progress,in_review,blocked";
+// How long a run a held issue waits on, seen still going, isn't asked about again.
+const HELD_RUN_TTL_MS = 60_000;
 const CI_LOOKBACK_MS = 3 * 24 * 60 * 60_000;
 const DEFAULT_BRANCH_TTL_MS = 60 * 60_000; // a renamed default branch is picked up within the hour
 const CONCURRENCY = 4;
@@ -277,7 +284,9 @@ const BACKSTOPS_PER_RUN = 3;
 // `agentFor` (an agent by id, cached for the tick), `nudge` (its once-per-key
 // comment that wakes the agent), `hasPendingWake` (a wake already on its way),
 // `candidate` (an issue the watchdog may act on) and `startedRuns`.
-export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns, noteToBoard }) {
+// `heldScanSoon(companyId)`: a report was posted behind a hold; the hold scan (22) is
+// asked to look at once, so its release delivers it now rather than a stall window on.
+export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns, noteToBoard, heldScanSoon = () => {} }) {
   const { api, config, log } = ctx;
   const now = () => ctx.now();
   const stallMs = config.watchdogStallSec * 1000;
@@ -293,6 +302,7 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
   const runnerScans = new Map(); // "repo|runner" → { failures, at }: other PRs' setup failures, for one scan
   const backstopMs = Math.max(0, Number(config.watchdogCiBackstopMin) || 0) * 60_000; // 0: no backstop
   const backstopSeen = new Map(); // issueId → { companyId, updatedAt, assignee }: settled by the backstop pass at that point
+  const heldRuns = new Map(); // "repo#id" → { found, at }: a run a held issue waits on, seen still going (heldWait)
   const rerunPattern = (() => {
     if (!config.watchdogCiRerunJobs) return null;
     try {
@@ -594,8 +604,11 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     if (runnerIssue) {
       const posted = await nudge(full, key, agent, runnerProblemMessage({ run, runner: runnerIssue.runner }), {
         reason: "CI run failed on its runner", repo: found.repo, run: run.id, runner: runnerIssue.runner,
-      });
-      if (posted) stats.ciReports += 1;
+      }, { loopExempt: true });
+      if (posted) {
+        stats.ciReports += 1;
+        if (full.executionBlocker) heldScanSoon(companyId);
+      }
       return;
     }
     if (!dispatchedOnDefault && (await rerunFlaky(found, issue))) return;
@@ -625,7 +638,7 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
       agent,
       ciMessage({ run, jobs: found.jobs, reruns }),
       { reason: "CI run finished", repo: found.repo, run: run.id, conclusion: run.conclusion, ...(cleared && isBackstop(cleared) ? { backstopCleared: true } : {}) },
-      clearMonitor !== undefined ? { patch: { executionPolicy: clearMonitor }, patchNote: clearedNote(cleared, replaced) } : {},
+      { loopExempt: true, ...(clearMonitor !== undefined ? { patch: { executionPolicy: clearMonitor }, patchNote: clearedNote(cleared, replaced) } : {}) },
     );
     if (posted) {
       stats.ciReports += 1;
@@ -633,7 +646,94 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
         records.delete(backstopKey);
         state.touch();
       }
+      // Posted behind a hold (saved there): the hold's release delivers it.
+      if (full.executionBlocker) heldScanSoon(companyId);
     }
+  }
+
+  // ---------------------------------------------------------------- a held issue waiting on CI
+
+  // The CI run a held issue's agent waits on under the watchdog's backstop, for 7 and 22
+  // before they release the hold (see the top of this file). The backstop on the policy
+  // (Paperclip's settle leaves it there), else the watchdog's record of it (a comment
+  // that reopened the held issue to todo cleared the monitor, not the wait). Bounded by
+  // the backstop's own timeout: past it, the wait is over whatever CI says.
+  //   null                                  no such wait: release as usual
+  //   { state: "running" | "unknown", ... } keep the hold (unknown: GitHub didn't answer)
+  //   { state: "finished", repo, run, jobs } the run is done: reportHeld, then release
+  // A failed run whose failed jobs are all known flaky is re-run here first, as the
+  // report would, and counts as running again.
+  async function heldWait(issue) {
+    if (!github || !config.watchdogCiRuns) return null;
+    const mine = records.get(record.ciBackstop(issue));
+    const recorded = mine?.run && mine.agentId === issue.assigneeAgentId ? mine : null;
+    const onPolicy = isBackstop(issue.executionPolicy?.monitor) ? issue.executionPolicy.monitor : null;
+    if (!recorded && !onPolicy) return null;
+    const monitor = onPolicy ?? recorded.monitor;
+    const until = ts(monitor?.timeoutAt) || ts(monitor?.nextCheckAt);
+    if (until && until <= now()) return null;
+    let ref = null;
+    if (recorded) {
+      const at = recorded.run.lastIndexOf("#");
+      ref = { repo: recorded.run.slice(0, at), id: recorded.run.slice(at + 1) };
+    } else ref = runRefs(onPolicy.notes)[0] ?? null;
+    if (!ref?.id) return null;
+    // A run still going is read again at most once a minute (7 asks every tick).
+    const seenKey = `${ref.repo ?? "*"}#${ref.id}`;
+    const seen = heldRuns.get(seenKey);
+    let found = seen && now() - seen.at < HELD_RUN_TTL_MS ? seen.found : null;
+    if (!found) {
+      found = await lookupRun(ref, { fresh: true });
+      if (found.state === "running") heldRuns.set(seenKey, { found, at: now() });
+      else heldRuns.delete(seenKey);
+    }
+    if (found.state === "missing") return null;
+    if (found.state === "unknown") return { state: "unknown", repo: ref.repo, run: { id: ref.id } };
+    if (found.state === "finished" && !(await dispatchedOnDefaultBranch(found.repo, found.run)) && (await rerunFlaky(found, issue))) {
+      return { ...found, state: "running" };
+    }
+    return found;
+  }
+
+  // Posts the report of a finished run (heldWait) on the held issue, where Paperclip saves
+  // it behind the hold for the release to deliver, and clears the backstop with it. Only
+  // a report the usual pass would post: a run cancelled by a newer push, skipped, or
+  // whose branch has moved on says nothing about the change, and the release alone
+  // wakes the agent. "posted" (or already was), else null.
+  async function reportHeld(issue, found, companyId, agents) {
+    const { run, repo } = found;
+    const key = record.ciRun(issue, run);
+    if ((records.get(key)?.count ?? 0) > 0) return "posted";
+    const agent = await agentFor(issue.assigneeAgentId, agents).catch(() => null);
+    if (!agent) return null;
+    const onDefault = await dispatchedOnDefaultBranch(repo, run);
+    if (!onDefault && UNINFORMATIVE.has(run.conclusion)) return null;
+    const runnerIssue = await runnerProblem(found, companyId);
+    if (!runnerIssue && !onDefault && (await headMoved(repo, run)) === true) return null;
+    const backstopKey = record.ciBackstop(issue);
+    const backstop = isBackstop(issue.executionPolicy?.monitor) ? issue.executionPolicy.monitor : null;
+    const message = runnerIssue
+      ? runnerProblemMessage({ run, runner: runnerIssue.runner })
+      : ciMessage({ run, jobs: found.jobs, reruns: records.get(record.ciRerun(repo, run))?.count ?? 0 });
+    const posted = await nudge(
+      issue,
+      key,
+      agent,
+      message,
+      { reason: runnerIssue ? "CI run failed on its runner" : "CI run finished", repo, run: run.id, conclusion: run.conclusion, held: true },
+      { loopExempt: true, ...(backstop ? { patch: { executionPolicy: withoutMonitor(issue.executionPolicy) ?? null }, patchNote: clearedNote(backstop, false) } : {}) },
+    );
+    if (!posted) return null;
+    stats.ciReports += 1;
+    if (records.delete(backstopKey)) state.touch();
+    return "posted";
+  }
+
+  // A run dispatched on the repository's default branch (read from GitHub): a verdict
+  // the agent asked for, reported on any conclusion and never re-run. Unknown counts as not.
+  async function dispatchedOnDefaultBranch(repo, run) {
+    if (run.event !== "workflow_dispatch" || !run.head_branch) return false;
+    return run.head_branch === (await defaultBranch(repo));
   }
 
   // What the report adds when it clears a monitor.
@@ -690,13 +790,15 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     // monitor itself when the issue moves to todo, blocked, done or cancelled; one left
     // on an issue now in review, or now another agent's, would wake the wrong run.
     // Except a hold: Paperclip's settle sets a held issue blocked by a direct update,
-    // which leaves the monitor, and it stays there for the release to put back (above).
+    // which leaves the monitor, and it stays there while the run goes (above). A held
+    // issue a comment moved to todo has lost the monitor, but keeps the record: the
+    // release still has to know the agent waits on CI.
     if (issue.status !== "in_progress" || (mine && mine.agentId !== issue.assigneeAgentId)) {
       let full;
-      if (mine && issue.status === "blocked" && issue.assigneeAgentId === mine.agentId) {
+      if (mine && ["blocked", "todo"].includes(issue.status) && issue.assigneeAgentId === mine.agentId) {
         full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
         if (!full) return;
-        if (full.executionBlocker && full.status === "blocked" && full.assigneeAgentId === mine.agentId && !full.assigneeUserId) return settle();
+        if (full.executionBlocker && ["blocked", "todo"].includes(full.status) && full.assigneeAgentId === mine.agentId && !full.assigneeUserId) return settle();
       }
       if (mine && !(await tidyBackstop(issue, key, issue.status !== "in_progress" ? `the issue is ${issue.status}` : "the issue changed hands", full))) return;
       if (issue.status !== "in_progress") return settle();
@@ -819,5 +921,5 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
   const sameMonitor = (a, b) =>
     (a?.status ?? null) === (b?.status ?? null) && (a?.nextCheckAt ?? null) === (b?.nextCheckAt ?? null) && (a?.notes ?? null) === (b?.notes ?? null);
 
-  return { check: checkCiRuns };
+  return { check: checkCiRuns, heldWait, reportHeld };
 }

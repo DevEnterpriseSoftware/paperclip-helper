@@ -980,3 +980,26 @@ test("a rebuilt review gets back the monitor Paperclip cleared on the way (the C
   assert.ok(issue.executionPolicy.stages?.length, "the stages kept with it");
   assert.match(notes(e)[0].body, /Its monitor, cleared by Paperclip on the way, is set again\. Status now in_review\./);
 });
+
+test("7 leaves a hold behind a run that never started to 22, even between 22's scans", async (t) => {
+  // 7 runs every tick (on a blocked issue, and on a deferred wake); 22 once per stall
+  // window. 7 used to ask a hand-off helper of the same name whether the run never
+  // started, always got no, and released 22's holds itself as "stopped without a record
+  // Paperclip could verify", with an unverified outcome.
+  let clock = Date.now();
+  const e = await env(t, {}, () => clock);
+  const { issue, runId } = unstartedHold(e.db, { status: "blocked", finishedMin: 2 });
+  await e.watchdog.tick(); // 22 scans now: the run ended less than a stall window ago
+  assert.equal((e.db.resolutions ?? []).length, 0);
+  clock += 2 * 60_000; // the run ended 4 min ago; 22's next scan is a minute off
+  await e.watchdog.tick();
+  assert.equal((e.db.resolutions ?? []).length, 0, "not 7's");
+  assert.ok(!e.logs.some((l) => l.msg === "watchdog: released a hold Paperclip couldn't release by itself"));
+  clock += 2 * 60_000;
+  await e.watchdog.tick();
+  assert.equal(e.db.resolutions.length, 1, "22's, on its scan");
+  assert.equal(e.db.resolutions[0].body.executionReconciliation.runId, runId);
+  assert.equal(e.db.resolutions[0].body.executionReconciliation.actionOutcome, "not_performed");
+  assert.match(e.db.resolutions[0].body.resolutionNote, /was cancelled before it started \(issue_disposition_repair_superseded\)/);
+  assert.equal(issue.executionBlocker, null);
+});
