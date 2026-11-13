@@ -6,7 +6,7 @@ import { minutesAgo, setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { startFakeGitHub } from "./fake-github.mjs";
 import { createWatchdog } from "../src/watchdog.mjs";
-import { agentCiMonitor, BACKSTOP_MARK, backstopMonitor, isBackstop, polls } from "../src/ci-runs.mjs";
+import { agentCiMonitor, BACKSTOP_MARK, backstopMonitor, isBackstop, polls, runRefs } from "../src/ci-runs.mjs";
 import { selfWakeLoop, selfWakes } from "../src/self-wakes.mjs";
 import { advise } from "../src/advice.mjs";
 import { loadConfig } from "../src/config.mjs";
@@ -63,7 +63,9 @@ test("backstopMonitor: one check hours out, the run in its notes, one more attem
   assert.ok(Date.parse(m.timeoutAt) > Date.parse(m.nextCheckAt));
   assert.equal(m.maxAttempts, 8, "Paperclip counts attempts across every monitor on the issue");
   assert.equal(m.recoveryPolicy, "wake_owner");
-  assert.ok(m.notes.startsWith(BACKSTOP_MARK) && m.notes.includes(RUN_URL) && m.notes.length <= 500);
+  assert.ok(m.notes.startsWith(BACKSTOP_MARK) && m.notes.length <= 500);
+  // The notes name the run the way the watchdog reads it back (Paperclip redacts externalRef).
+  assert.deepEqual(runRefs(m.notes), [{ repo: "org/app", id: "30498202022" }]);
   assert.equal(backstopMonitor({ run, now, backstopMs: 3_600_000, attemptCount: 100 }).maxAttempts, undefined, "past Paperclip's cap of 100: none");
   assert.ok(isBackstop({ notes: m.notes, scheduledBy: "board" }));
   assert.ok(!isBackstop({ notes: m.notes, scheduledBy: "assignee" }), "an agent copying the notes doesn't make it the Helper's");

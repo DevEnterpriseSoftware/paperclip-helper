@@ -23,6 +23,7 @@ An agent waiting on CI is no longer woken over and over while it waits. On Paper
   - `pch why` on a held issue waiting on CI.
 
   Not yet in the compatibility suite.
+- **A code-scanning warning in a test cleared.** CodeQL flagged a backstop test's check that the monitor's notes contain the run's URL as an incomplete URL sanitization (`js/incomplete-url-substring-sanitization`). It was no security check, but the test now reads the run back from the notes with `runRefs`, the way the watchdog does, which also checks more.
 
 ## 1.16.3
 
