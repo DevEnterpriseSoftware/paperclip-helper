@@ -6,7 +6,7 @@ import { minutesAgo, setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { startFakeGitHub } from "./fake-github.mjs";
 import { createWatchdog } from "../src/watchdog.mjs";
-import { agentCiMonitor, BACKSTOP_MARK, backstopMonitor, isBackstop, polls, runRefs } from "../src/ci-runs.mjs";
+import { agentCiMonitor, BACKSTOP_MARK, backstopMonitor, isBackstop, polls, runRefs, sawRun, stillWaitsOn } from "../src/ci-runs.mjs";
 import { selfWakeLoop, selfWakes } from "../src/self-wakes.mjs";
 import { advise } from "../src/advice.mjs";
 import { loadConfig } from "../src/config.mjs";
@@ -492,6 +492,204 @@ test("the blockers-resolved nudge leaves an issue held for recovery, or waiting 
   assert.equal(skipped.length, 1);
   assert.deepEqual(skipped[0].blockersDone, ["ACM-170", "ACM-171"]);
   assert.equal(skipped[0].rule, "2");
+});
+
+// ---------------------------------------------------------------- a finished run the agent never read
+
+test("stillWaitsOn: a comment that still waits on the run, by id, by URL or as CI, and not one past it", () => {
+  const run = { id: 30498202022 };
+  assert.ok(stillWaitsOn("The issue stays assigned to me and I am waiting on run 30498202022.", run));
+  assert.ok(stillWaitsOn(`Still waiting for ${RUN_URL} to finish.`, run));
+  assert.ok(stillWaitsOn("No change: still waiting on CI.", run), "no run named, but CI");
+  assert.ok(stillWaitsOn("Blocked on run 30498202022.", run));
+  assert.ok(stillWaitsOn("Awaiting the checks before resubmitting.", run));
+  assert.ok(!stillWaitsOn("CI run 30498202022 passed, submitting.", run), "a result: it read the run");
+  assert.ok(!stillWaitsOn("Run 30498202022 failed on lint; fixing.", run));
+  assert.ok(!stillWaitsOn("Fixed the failure in run 30498202022; waiting on run 30498300001.", run), "it waits on a newer run");
+  assert.ok(!stillWaitsOn("No longer waiting on run 30498202022: it failed.", run));
+  assert.ok(!stillWaitsOn("Waiting on the vendor's sandbox.", run), "another wait");
+  assert.ok(!stillWaitsOn("", run));
+});
+
+test("sawRun: a later run or comment means the agent saw the result, unless all it said since still waits", () => {
+  const run = { id: 30498202022 };
+  const done = 1_000;
+  const waiting = { at: 1_500, body: "Still waiting on run 30498202022." };
+  const read = { at: 1_600, body: "Run 30498202022 failed; fixing the test." };
+  assert.equal(sawRun([], run, done, null), null, "nothing since: not seen");
+  assert.equal(sawRun([{ at: 500, body: "Waiting on run 30498202022." }], run, done, null), null, "said before it finished");
+  assert.equal(sawRun([waiting], run, done, null), null, "only still waiting since");
+  assert.equal(sawRun([read, waiting], run, done, null), "commented");
+  assert.equal(sawRun([], run, done, 1_200), "ran", "a run since, nothing said: it could read CI");
+  assert.equal(sawRun([waiting], run, done, 1_200), null, "a run since that only said it still waits");
+  assert.equal(sawRun([waiting], run, done, 1_550), "ran", "what it said before its latest run doesn't count");
+});
+
+// The agent's run that started before the run finished (a disposition repair, say)
+// posts after it finished that it is still waiting on that very run.
+function repairStillWaiting(env, w, { startedMin = 3, commentMin = 1 } = {}) {
+  const at = (min) => new Date(env.clock.now - min * 60_000).toISOString();
+  env.db.issueRuns[w.issue.id].unshift({ runId: uuid(), agentId: w.carla.id, status: "succeeded", createdAt: at(startedMin), startedAt: at(startedMin), finishedAt: at(commentMin) });
+  env.db.comments.push({
+    issueId: w.issue.id, authorAgentId: w.carla.id, createdAt: at(commentMin),
+    body: `Recording the disposition: the Helper's backstop is in place, the issue stays assigned to me, and I am waiting on run ${w.run.id}.`,
+  });
+  w.issue.updatedAt = at(commentMin);
+}
+
+test("a comment after the run finished that still waits on it doesn't count as seen: reported within a stall window", async (t) => {
+  const env = await watchdogEnv(t);
+  const w = waitingOnCi(env);
+  await env.watchdog.tick();
+  assert.equal(w.issue.executionState.monitor.status, "scheduled");
+
+  env.later(2);
+  finish(env, w.run, "failure");
+  w.run.jobs = [{ name: "e2e (windows)", conclusion: "failure" }];
+  env.later(5);
+  repairStillWaiting(env, w, { startedMin: 6, commentMin: 1 });
+  env.later(3); // the issue quiet for a stall window
+  await env.watchdog.tick();
+  const [report, ...more] = helperComments(env.db, w.issue);
+  assert.equal(more.length, 0);
+  assert.ok(report, "reported, not left to the backstop hours later");
+  assert.match(report.body, /\*\*failure\*\*/);
+  assert.equal(w.issue.executionState.monitor.status, "cleared", "the backstop cleared with it");
+});
+
+test("a run started after the finish that only says it still waits doesn't count as seen either", async (t) => {
+  const env = await watchdogEnv(t);
+  const w = waitingOnCi(env);
+  await env.watchdog.tick();
+  env.later(2);
+  finish(env, w.run, "failure");
+  env.later(5);
+  repairStillWaiting(env, w, { startedMin: 3, commentMin: 1 });
+  env.later(3);
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, w.issue).length, 1);
+});
+
+test("an agent that saw the run (ran since and said so, or wrote its result) isn't told, and its backstop isn't touched", async (t) => {
+  for (const [startedMin, body] of [[3, "Run 30498202022 failed on lint; pushing a fix."], [null, "CI run 30498202022 failed; looking into it."]]) {
+    const env = await watchdogEnv(t);
+    const w = waitingOnCi(env);
+    await env.watchdog.tick();
+    const scheduled = w.issue.executionPolicy.monitor;
+    env.later(2);
+    finish(env, w.run, "failure");
+    env.later(5);
+    const at = (min) => new Date(env.clock.now - min * 60_000).toISOString();
+    if (startedMin) env.db.issueRuns[w.issue.id].unshift({ runId: uuid(), agentId: w.carla.id, status: "succeeded", createdAt: at(startedMin), startedAt: at(startedMin), finishedAt: at(1) });
+    env.db.comments.push({ issueId: w.issue.id, authorAgentId: w.carla.id, createdAt: at(1), body });
+    w.issue.updatedAt = at(1);
+    env.later(3);
+    await env.watchdog.tick();
+    assert.equal(helperComments(env.db, w.issue).length, 0);
+    assert.deepEqual(w.issue.executionPolicy.monitor, scheduled, "seen: the backstop stays where it was");
+    assert.ok(!env.logs.some((l) => /brought the CI backstop forward/.test(l.msg)));
+    assert.ok(env.logs.some((l) => l.reason === (startedMin ? "the agent has run on the issue since it finished" : "the agent commented after it finished")));
+  }
+});
+
+test("an issue whose recorded execution run never started is still checked: reported, and said at debug level", async (t) => {
+  const env = await watchdogEnv(t);
+  const w = waitingOnCi(env);
+  await env.watchdog.tick();
+  env.later(2);
+  finish(env, w.run, "failure");
+  // Another agent's automation run, queued on the issue and cancelled at dispatch, left recorded.
+  const gilfoyle = { id: uuid(), companyId: ids.company, name: "Gilfoyle", status: "idle" };
+  env.db.agents.push(gilfoyle);
+  const cancelled = { runId: uuid(), agentId: gilfoyle.id, status: "cancelled", errorCode: "issue_assignee_changed", createdAt: minutesAgo(1), startedAt: null, finishedAt: minutesAgo(1) };
+  env.db.issueRuns[w.issue.id].unshift(cancelled);
+  w.issue.executionRunId = cancelled.runId;
+  env.later(10);
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, w.issue).length, 1);
+  const said = env.logs.filter((l) => l.msg === "watchdog: the issue's recorded run isn't going; its CI run is checked anyway");
+  assert.equal(said.length, 1);
+  assert.equal(said[0].field, "executionRunId");
+  assert.equal(said[0].status, "cancelled");
+});
+
+test("a finished run left unreported brings the backstop forward to a stall window, once", async (t) => {
+  const env = await watchdogEnv(t);
+  const w = waitingOnCi(env);
+  await env.watchdog.tick();
+  const hoursOut = Date.parse(w.issue.executionState.monitor.nextCheckAt);
+  env.later(2);
+  finish(env, w.run, "failure");
+  // A wake for Carla deferred ever since, which holds the report back.
+  env.db.wakes[w.issue.id] = [{ kind: "wake_request", agentId: w.carla.id, status: "deferred_issue_execution", reason: "issue_commented", requestedAt: new Date(env.clock.now).toISOString() }];
+  env.later(5);
+  await env.watchdog.tick();
+  assert.equal(helperComments(env.db, w.issue).length, 0);
+  const [, pulled, ...more] = monitorPatches(env.db, w.issue);
+  assert.equal(more.length, 0);
+  const m = pulled.body.executionPolicy.monitor;
+  assert.equal(Date.parse(m.nextCheckAt), env.clock.now + 180_000, "one stall window from now");
+  assert.ok(Date.parse(m.nextCheckAt) < hoursOut);
+  assert.ok(Date.parse(m.timeoutAt) > Date.parse(m.nextCheckAt));
+  assert.ok(m.notes.startsWith(BACKSTOP_MARK) && m.notes.includes(RUN_URL), "still the Helper's backstop for the run");
+  assert.notEqual(m.externalRef, "[redacted]");
+  assert.deepEqual(pulled.body.executionPolicy.stages, w.stages);
+  assert.equal(pulled.body.comment, undefined, "no comment: that would wake the agent");
+  const line = env.logs.find((l) => l.msg === "watchdog: brought the CI backstop forward: the run it watches finished and isn't reported");
+  assert.equal(line.reason, "a wake for the agent is waiting to start");
+  assert.equal(env.state.nudges.get(`ci-backstop:${w.issue.id}`).pulled, true);
+  assert.equal(env.watchdog.stats.ciBackstopsPulled, 1);
+
+  // The next scan, still held back: due within the stall window already, so left be.
+  env.later(3);
+  await env.watchdog.tick();
+  assert.equal(monitorPatches(env.db, w.issue).length, 2, "already due soon: not moved again");
+  assert.equal(env.watchdog.stats.ciBackstopsPulled, 1);
+});
+
+test("the backstop is brought forward past another agent's queued run, not past the assignee's own", async (t) => {
+  for (const own of [false, true]) {
+    const env = await watchdogEnv(t);
+    const w = waitingOnCi(env);
+    await env.watchdog.tick();
+    env.later(2);
+    finish(env, w.run);
+    const other = { id: uuid(), companyId: ids.company, name: "Gilfoyle", status: "idle" };
+    env.db.agents.push(other);
+    env.db.issueRuns[w.issue.id].unshift({ runId: uuid(), agentId: own ? w.carla.id : other.id, status: "queued", createdAt: minutesAgo(1) });
+    env.later(5);
+    await env.watchdog.tick();
+    assert.equal(helperComments(env.db, w.issue).length, 0);
+    assert.equal(monitorPatches(env.db, w.issue).length, own ? 1 : 2, own ? "its own run will see the result" : "another agent's run won't");
+  }
+});
+
+test("a backstop isn't brought forward for a run still going, and a dry run only says it would", async (t) => {
+  // Still going: never, however long.
+  const going = await watchdogEnv(t);
+  const a = waitingOnCi(going);
+  await going.watchdog.tick();
+  going.db.wakes[a.issue.id] = [{ kind: "wake_request", agentId: a.carla.id, status: "deferred_issue_execution", requestedAt: new Date(going.clock.now).toISOString() }];
+  for (let i = 0; i < 3; i += 1) {
+    going.later(10);
+    await going.watchdog.tick();
+  }
+  assert.equal(monitorPatches(going.db, a.issue).length, 1);
+
+  // A dry run says what it would do, once.
+  const dry = await watchdogEnv(t, { DRY_RUN: "true" });
+  const b = waitingOnCi(dry);
+  const m = backstopMonitor({ run: b.run, now: dry.clock.now, backstopMs: 360 * 60_000 });
+  b.issue.executionPolicy = { ...b.issue.executionPolicy, monitor: { ...m, externalRef: "[redacted]", scheduledBy: "board" } };
+  b.issue.executionState = { monitor: { status: "scheduled", ...m, scheduledBy: "board", attemptCount: 0 } };
+  finish(dry, b.run);
+  dry.db.wakes[b.issue.id] = [{ kind: "wake_request", agentId: b.carla.id, status: "deferred_issue_execution", requestedAt: new Date(dry.clock.now).toISOString() }];
+  for (let i = 0; i < 2; i += 1) {
+    dry.later(10);
+    await dry.watchdog.tick();
+  }
+  assert.equal(dry.db.patches.length, 0);
+  assert.equal(dry.logs.filter((l) => l.msg === "watchdog: would bring the CI backstop forward (dry run)").length, 1);
 });
 
 test("a dry run schedules nothing and says what it would do, once", async (t) => {

@@ -88,6 +88,38 @@ export function waitingOn(comments, agentId, monitor) {
   return { text: [named?.body ?? "", monitor?.notes ?? ""].join("\n"), saidAt: mine[0]?.createdAt ?? null };
 }
 
+// Does this comment say the agent is still waiting on the run? A comment written
+// after the run finished usually means the agent saw the result, but not one that
+// still waits on it: Paperclip's recovery and disposition runs have agents post
+// "still waiting on run X" lines without ever reading CI. It waits on the run when it
+// says it waits ("waiting on", "waiting for", "awaiting", "blocked on") and the newest
+// run it names is this one, or it names no run and speaks of CI ("still waiting on
+// CI"). "No longer waiting" doesn't count.
+const WAITING = /\b(?:wait(?:s|ing)?\s+(?:on|for|until)|awaiting|blocked\s+on)\b/i;
+const NOT_WAITING = /\b(?:no\s+longer|not|stopped|done|finished)\s+(?:wait(?:s|ing)?|blocked)\b/i;
+const CI_WORD = /\b(?:CI|checks?|builds?|pipelines?|workflows?|actions)\b/i;
+export function stillWaitsOn(text, run) {
+  const s = String(text ?? "");
+  if (!WAITING.test(s) || NOT_WAITING.test(s)) return false;
+  const refs = runRefs(s);
+  if (refs.length) return String(refs[0].id) === String(run.id);
+  return CI_WORD.test(s);
+}
+
+// Has the agent seen the finished run? It has when it started a run on the issue after
+// the run finished, or commented after the run finished (it watched the run within its
+// own run), unless everything it said since (since that run started, if it did) still
+// waits on the run: then it never read the result. `comments` are the assignee's, as
+// { at, body }; `lastStart` is when its latest run since the finish started, or null.
+// "ran" or "commented" when it has, else null.
+export function sawRun(comments, run, finishedAt, lastStart) {
+  const after = (Array.isArray(comments) ? comments : []).filter((c) => c.at >= (lastStart ?? finishedAt));
+  const waits = after.length > 0 && after.every((c) => stillWaitsOn(c.body, run));
+  if (waits) return null;
+  if (lastStart != null) return "ran";
+  return after.length ? "commented" : null;
+}
+
 // Conclusions that say nothing about the change: a run cancelled (often by a newer
 // push), skipped, or waiting on someone's approval. Not reported.
 export const UNINFORMATIVE = new Set(["cancelled", "skipped", "neutral", "action_required", "stale"]);
@@ -282,11 +314,11 @@ const BACKSTOPS_PER_RUN = 3;
 
 // Check 11. From the watchdog: its records (keys from `record`), the GitHub client,
 // `agentFor` (an agent by id, cached for the tick), `nudge` (its once-per-key
-// comment that wakes the agent), `hasPendingWake` (a wake already on its way),
-// `candidate` (an issue the watchdog may act on) and `startedRuns`.
+// comment that wakes the agent), `hasPendingWake` (a wake already on its way) and
+// `startedRuns`.
 // `heldScanSoon(companyId)`: a report was posted behind a hold; the hold scan (22) is
 // asked to look at once, so its release delivers it now rather than a stall window on.
-export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns, noteToBoard, heldScanSoon = () => {} }) {
+export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, startedRuns, noteToBoard, heldScanSoon = () => {} }) {
   const { api, config, log } = ctx;
   const now = () => ctx.now();
   const stallMs = config.watchdogStallSec * 1000;
@@ -499,8 +531,12 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     ciScanAt.set(companyId, now());
     ciRuns.clear();
     runnerScans.clear();
+    // Every agent's issue quiet for the stall window. Not only those with no execution
+    // or checkout run recorded: Paperclip can leave either set to a run that never
+    // started (a queued run cancelled at dispatch), and an issue skipped for that would
+    // never be looked at, without a word. Runs actually going are checked below.
     const issues = (await listIssues(api, companyId, CI_STATUSES)).filter(
-      (i) => candidate(i) && now() - ts(i.updatedAt) < CI_LOOKBACK_MS,
+      (i) => i.assigneeAgentId && now() - ts(i.updatedAt) >= stallMs && now() - ts(i.updatedAt) < CI_LOOKBACK_MS,
     );
     const live = new Set(issues.map((i) => i.id));
     // Forget this company's issues that are no longer looked at (keys are per issue).
@@ -525,12 +561,11 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
       if (!Array.isArray(comments)) return;
       full = await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
       const said = waitingOn(comments, assignee, full?.executionState?.monitor);
-      cached = { companyId, updatedAt: issue.updatedAt, assignee, refs: runRefs(said.text), saidAt: said.saidAt };
+      const mine = comments.filter((c) => c?.authorAgentId === assignee).map((c) => ({ at: ts(c.createdAt), body: c.body ?? "" }));
+      cached = { companyId, updatedAt: issue.updatedAt, assignee, refs: runRefs(said.text), mine };
       ciTexts.set(issue.id, cached);
     }
     if (!cached.refs.length) return;
-    const agent = await agentFor(assignee, agents).catch(() => null);
-    if (!agent || asleep(agent)) return;
     // Newest run first: the one the agent waits on. While it runs, the older ones don't matter.
     let found = null;
     for (const ref of cached.refs) {
@@ -545,16 +580,24 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     const key = record.ciRun(issue, run);
     if ((records.get(key)?.count ?? 0) > 0 || dryRunSeen.has(key)) return; // reported (a paused task leaves a count of 0)
     // Why a finished run isn't reported (yet), at debug level, once per run attempt
-    // and reason: LOG_LEVEL=debug shows why an agent wasn't told.
-    const silent = (reason, extra = {}) => {
+    // and reason: LOG_LEVEL=debug shows why an agent wasn't told. Unless the agent has
+    // seen the run (or can't be woken), the watchdog's backstop on the issue is also
+    // brought forward to a stall window from now (pullBackstop): if the report never
+    // comes, the backstop wakes the agent in minutes rather than hours.
+    const silent = async (reason, extra = {}, { pull = true } = {}) => {
       const seen = ciSilenced.get(key) ?? { companyId, reasons: new Set() };
       ciSilenced.set(key, seen);
-      if (seen.reasons.has(reason)) return;
-      seen.reasons.add(reason);
-      log.debug("watchdog: a finished CI run an agent waits on isn't reported", {
-        issue: issue.identifier ?? issue.id, repo: found.repo, run: run.id, attempt: run.run_attempt ?? 1, reason, ...extra,
-      });
+      if (!seen.reasons.has(reason)) {
+        seen.reasons.add(reason);
+        log.debug("watchdog: a finished CI run an agent waits on isn't reported", {
+          issue: issue.identifier ?? issue.id, repo: found.repo, run: run.id, attempt: run.run_attempt ?? 1, reason, ...extra,
+        });
+      }
+      if (pull) await pullBackstop(issue, found, reason).catch((err) => log.warn("watchdog: couldn't bring the CI backstop forward", { issue: issue.identifier ?? issue.id, error: err.message }));
     };
+    const agent = await agentFor(assignee, agents).catch(() => null);
+    if (!agent) return silent("the assignee couldn't be read", {}, { pull: false });
+    if (asleep(agent)) return silent(`the agent is ${agent.status}`, {}, { pull: false });
     // A run dispatched on the default branch is a verdict the agent asked for: it
     // is reported on any conclusion, never re-run, and still counts once the
     // branch has moved on. Only dispatched runs ask GitHub for the default branch;
@@ -569,7 +612,8 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     if (!dispatchedOnDefault && UNINFORMATIVE.has(run.conclusion)) return silent(`its conclusion, ${run.conclusion}, says nothing about the change`);
     const finishedAt = ts(run.updated_at);
     full ??= await api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
-    if (!full || full.assigneeAgentId !== assignee) return;
+    if (!full) return;
+    if (full.assigneeAgentId !== assignee) return silent("the issue changed hands", {}, { pull: false });
     const monitor = full.executionState?.monitor;
     const monitorDue = monitorPending(monitor, now());
     // The watchdog's own backstop, or a monitor that watches this very run and nothing
@@ -577,16 +621,32 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     // notice the run finished. Report it now.
     const heldByMonitor = monitorDue && (isBackstop(monitor) || watchesOnly(monitor, run));
     // Otherwise give the agent's own monitor, or the agent, the stall window to notice.
-    if (!finishedAt || (!heldByMonitor && now() - finishedAt < stallMs)) return silent("finished less than the stall window ago");
-    // The agent wrote about the run after it finished: it watched it within its own run.
-    if (cached.saidAt && ts(cached.saidAt) >= finishedAt) return silent("the agent commented after it finished");
+    if (!finishedAt || (!heldByMonitor && now() - finishedAt < stallMs)) return silent("finished less than the stall window ago", {}, { pull: false });
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => null);
     if (!Array.isArray(runs)) return;
-    if (runs.some((r) => ACTIVE_RUN.has(r.status))) return silent("a run on the issue is in progress");
-    // The agent has run on the issue since the run finished: it has seen the result.
-    if (startedRuns(runs).some((r) => r.agentId === assignee && ts(r.startedAt ?? r.createdAt) >= finishedAt)) {
-      return silent("the agent has run on the issue since it finished");
+    const active = runs.filter((r) => ACTIVE_RUN.has(r.status));
+    // The agent's own run going will see the result; another agent's queued run (often
+    // cancelled at dispatch moments later) doesn't, so the backstop is brought forward.
+    if (active.length) return silent("a run on the issue is in progress", {}, { pull: !active.some((r) => r.agentId === assignee) });
+    // Paperclip can leave the issue's execution or checkout run set to a run that never
+    // started. Checked anyway: said once, at debug level.
+    for (const field of ["executionRunId", "checkoutRunId"]) {
+      if (!full[field]) continue;
+      const k = `${key}:${field}`;
+      if (ciSilenced.get(k)?.reasons.has(full[field])) continue;
+      ciSilenced.set(k, { companyId, reasons: new Set([full[field]]) });
+      log.debug("watchdog: the issue's recorded run isn't going; its CI run is checked anyway", {
+        issue: issue.identifier ?? issue.id, field, runId: full[field], status: runs.find((r) => (r.runId ?? r.id) === full[field])?.status ?? null, run: run.id,
+      });
     }
+    // Has the agent seen the result? It has when it ran on the issue after the run
+    // finished, or wrote after it finished (it watched the run within its own run),
+    // unless all it said since still waits on this run (stillWaitsOn): a recovery run
+    // that says "still waiting on run X" never read CI.
+    const since = startedRuns(runs).filter((r) => r.agentId === assignee && ts(r.startedAt ?? r.createdAt) >= finishedAt).map((r) => ts(r.startedAt ?? r.createdAt));
+    const saw = sawRun(cached.mine, run, finishedAt, since.length ? Math.max(...since) : null);
+    if (saw === "ran") return silent("the agent has run on the issue since it finished", {}, { pull: false });
+    if (saw === "commented") return silent("the agent commented after it finished", {}, { pull: false });
     // A monitor still due that watches this very run would only wake the agent again
     // to find it finished: report now, and clear the monitor in the same step. One
     // that watches something else is left to fire. (Paperclip redacts a monitor's
@@ -649,6 +709,60 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
       // Posted behind a hold (saved there): the hold's release delivers it.
       if (full.executionBlocker) heldScanSoon(companyId);
     }
+  }
+
+  // The watchdog's backstop is a safety net: it fires only if the report never comes.
+  // Scheduled hours out (a run can wait that long for its runner), it costs hours when
+  // the report is missed. So once the run it watches has finished and the report is
+  // held back for any reason but the agent having seen it, the backstop is brought
+  // forward to a stall window from now. If the report still doesn't come, the backstop
+  // wakes the agent then; if it does, it clears the backstop as usual. An agent waiting
+  // on a slow queue is left alone: the run has to have finished. Only the Helper's own
+  // backstop for this very run, on an issue in progress and not held (7 and 22 release
+  // a held one with the report), and only when that brings it closer.
+  async function pullBackstop(issue, found, reason) {
+    if (!backstopMs) return;
+    const { run } = found;
+    const read = async () => api.request("GET", `/api/issues/${issue.id}`).catch(() => null);
+    const fits = (f) => {
+      const m = f?.executionState?.monitor;
+      return Boolean(
+        f && f.status === "in_progress" && f.assigneeAgentId === issue.assigneeAgentId && !f.assigneeUserId && !f.executionBlocker &&
+          f.executionPolicy?.monitor && monitorPending(m, now()) && isBackstop(m) && watchesOnly(m, run),
+      );
+    };
+    const full = await read();
+    if (!fits(full)) return;
+    const monitor = full.executionState.monitor;
+    const target = now() + stallMs;
+    if (ts(monitor.nextCheckAt) <= target + 60_000) return; // due within the stall window already
+    const key = record.ciBackstop(issue);
+    const mine = records.get(key);
+    const extra = { issue: issue.identifier ?? issue.id, repo: found.repo, run: run.id, reason, was: monitor.nextCheckAt };
+    if (config.dryRun) {
+      const seenKey = `${key}:pull:${run.id}`;
+      if (!dryRunSeen.has(seenKey)) {
+        dryRunSeen.add(seenKey);
+        log("watchdog: would bring the CI backstop forward (dry run)", extra);
+      }
+      return;
+    }
+    // The policy is replaced whole: read it again now, so nothing changed meanwhile is overwritten.
+    const fresh = await read();
+    if (!fits(fresh) || !sameMonitor(fresh.executionState.monitor, monitor)) return; // next scan
+    const replaced = Boolean(mine?.replaced);
+    const next = { ...backstopMonitor({ run, now: now(), backstopMs: stallMs, attemptCount: monitorAttempts(fresh), replaced }), notes: monitor.notes };
+    try {
+      await api.request("PATCH", `/api/issues/${issue.id}`, { executionPolicy: { ...fresh.executionPolicy, monitor: next } });
+    } catch (err) {
+      if (pausedRefusal(err)) return log.debug("watchdog: the issue is paused; CI backstop left as it was", extra);
+      log.warn("watchdog: Paperclip refused to bring the CI backstop forward", { ...extra, error: err.message });
+      return;
+    }
+    records.set(key, { ...(mine ?? { count: 1, run: `${found.repo}#${run.id}`, agentId: issue.assigneeAgentId, replaced }), at: now(), monitor: next, pulled: true });
+    state.touch();
+    stats.ciBackstopsPulled = (stats.ciBackstopsPulled ?? 0) + 1;
+    log("watchdog: brought the CI backstop forward: the run it watches finished and isn't reported", { ...extra, nextCheckAt: next.nextCheckAt });
   }
 
   // ---------------------------------------------------------------- a held issue waiting on CI

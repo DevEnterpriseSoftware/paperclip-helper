@@ -1083,7 +1083,9 @@ export async function status(ctx) {
         counted(w.questions, "undelivered question card routed", "undelivered question cards routed"),
         counted(w.ciReports, "finished CI run reported", "finished CI runs reported"),
         counted(w.ciReruns, "flaky CI run re-run", "flaky CI runs re-run"),
-        counted(w.ciBackstops, "CI backstop monitor scheduled", "CI backstop monitors scheduled"),
+        w.ciBackstops || w.ciBackstopsPulled
+          ? `${counted(w.ciBackstops, "CI backstop monitor scheduled", "CI backstop monitors scheduled") ?? "no CI backstop monitors scheduled"}${w.ciBackstopsPulled ? ` (${w.ciBackstopsPulled} brought forward for a finished run left unreported)` : ""}`
+          : null,
         counted(w.returned, "issue returned to its agent", "issues returned to their agent"),
         counted(w.resumed, "issue restored after a resume", "issues restored after a resume"),
         w.limitPauses ? `${plural(w.limitPauses, "agent")} paused at a usage limit (${w.limitResumes} resumed)` : null,

@@ -336,7 +336,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   const records = state.nudges;
   const stats = {
     ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, questions: 0,
-    ciReports: 0, ciReruns: 0, ciBackstops: 0, selfWakes: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, pausedHolds: 0,
+    ciReports: 0, ciReruns: 0, ciBackstops: 0, ciBackstopsPulled: 0, selfWakes: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, pausedHolds: 0,
     runnerProblems: 0, readyNotes: 0, worktreeLinkNotes: 0, unstartedHolds: 0, lastError: null,
     // The last tick's requests, how many were answered from what the tick had already
     // read, its slowest checks and its slowest kinds of request (for `pch status`).
@@ -1454,7 +1454,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   const startedRuns = (runs) => (Array.isArray(runs) ? runs : []).filter((r) => !refused(r) && !cancelledAtHandOff(r));
 
   const ciRunsCheck = createCiRunsCheck({
-    ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, candidate, startedRuns,
+    ctx, records, state, stats, dryRunSeen, record, github, agentFor, nudge, hasPendingWake, startedRuns,
     noteToBoard: (companyId, text, extra) => noteToBoard(ctx, companyId, text, extra),
     heldScanSoon: (companyId) => pausedHolds.scanSoon(companyId),
   });
