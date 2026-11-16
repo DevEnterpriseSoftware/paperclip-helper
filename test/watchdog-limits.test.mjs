@@ -731,7 +731,7 @@ test("an agent whose pause never finished stays paused after its resume: the boa
   env.db.issues.push({ id: uuid(), identifier: "ACM-2", companyId: ids.company, status: "todo", title: "Work", assigneeAgentId: engineer.id, updatedAt: iso(T0) });
   env.state.save({ force: true });
   const why = (await captureOutput(() => cmd.why(env.ctx, "ACM-2"))).join("\n");
-  assert.match(why, /Paused by the watchdog at a usage limit; resumed at Mon 12 Oct, 16:06 \(Europe\/London\), which Paperclip hasn't finished/);
+  assert.match(why, /Paused by the watchdog at a usage limit \(the Claude usage limit, which resets Mon 12 Oct, 16:00 \(Europe\/London\)\); resumed at Mon 12 Oct, 16:06 \(Europe\/London\), which Paperclip hasn't finished/);
   assert.match(why, /Paperclip hasn't finished pausing Engineer/);
 
   // Paperclip finally finishes the pause; with no hold left it goes straight on to resume.

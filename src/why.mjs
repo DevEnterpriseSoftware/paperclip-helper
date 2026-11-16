@@ -242,6 +242,7 @@ async function whyReport(ctx, identifier, out) {
         kind: verdict.kind,
         label: labelOf(assigneeAgent.adapterType),
         what: verdict.what ?? null,
+        scope: verdict.scope ?? null,
         resetAt: verdict.reset ? resetLabel(verdict.reset.at, verdict.reset.timeZone) : null,
       };
       if (verdict.kind === "limit") out(`Usage limit: ${lastFailure.label} ${verdict.what}${lastFailure.resetAt ? `, resets ${lastFailure.resetAt}` : ""}`);
@@ -301,14 +302,17 @@ async function whyReport(ctx, identifier, out) {
     limitPause = {
       label: labelOf(r.adapter ?? "claude_local"),
       what: r.what ?? "usage limit",
+      // One model's own limit pauses only that model's agents (watchdog 16).
+      model: r.scope === "model" ? r.model ?? null : null,
       resetAt: r.unknownReset ? null : resetLabel(r.resetAt, r.timeZone),
       resumeAt: resetLabel(r.resetAt + graceMs, r.timeZone),
       // Asked already, but Paperclip hasn't finished the resume (watchdog 16).
       resumeSentAt: sent ? resetLabel(sent, r.timeZone) : null,
     };
+    const which = `the ${limitPause.label} ${limitPause.what}${limitPause.resetAt ? `, which resets ${limitPause.resetAt}` : ""}`;
     out(sent
-      ? `Paused by the watchdog at a usage limit; resumed at ${limitPause.resumeSentAt}, which Paperclip hasn't finished`
-      : `Paused by the watchdog at a usage limit; resumed at ${limitPause.resumeAt}`);
+      ? `Paused by the watchdog at a usage limit (${which}); resumed at ${limitPause.resumeSentAt}, which Paperclip hasn't finished`
+      : `Paused by the watchdog at a usage limit (${which}); resumed at ${limitPause.resumeAt}`);
   }
   // The agent a pending review stage waits on, when it isn't the assignee's own status that matters.
   const p = full?.executionState?.status === "pending" ? full.executionState.currentParticipant : null;

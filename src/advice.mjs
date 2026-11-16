@@ -54,8 +54,8 @@ export function advise(facts) {
     deadLinkRun = null, // { runId, workspaceId }: the assignee's last run failed restoring a linked workspace
     cards = [], // the issue's pending question cards (questions.mjs)
     routed = {}, // card id → the issue the watchdog routed it to
-    limitPause = null, // the watchdog paused the assignee at a usage limit: { label, what, resetAt, resumeAt, resumeSentAt } (labels; resumeSentAt once it asked Paperclip to resume it)
-    lastFailure = null, // the assignee's latest run failed on its provider: { kind: "limit" | "transient", label, what, resetAt }
+    limitPause = null, // the watchdog paused the assignee at a usage limit: { label, what, model, resetAt, resumeAt, resumeSentAt } (labels; model for one model's own limit; resumeSentAt once it asked Paperclip to resume it)
+    lastFailure = null, // the assignee's latest run failed on its provider: { kind: "limit" | "transient", label, what, scope, resetAt }
     participant = null, // the agent a pending review stage waits on: { name, status }
     stagesWipedBy = null, // in review with no stage: who removed its stages (watchdog 17), when the activity log shows it
     ciRun = null, // the CI run the assignee's latest comments say it waits on: "repo#id" or the bare id
@@ -118,6 +118,9 @@ export function advise(facts) {
       steps: [
         "Nothing to do but wait: every run before the reset would fail the same way.",
         `To resume ${who} sooner (the limit was raised, say), resume it in Paperclip; its issues blocked during the pause are restored after that too.`,
+        ...(limitPause.model
+          ? [`This limit is ${limitPause.model}'s own: agents on other models keep running. Switch ${who} to another model and the watchdog resumes it at its next look.`]
+          : []),
       ],
       watchdog: "auto",
       autoNote: "The watchdog resumes exactly the agents it paused, a few minutes after the reset, and then restores the issues Paperclip blocked meanwhile.",
@@ -389,7 +392,7 @@ export function advise(facts) {
       ],
       watchdog: pauseOn ? "auto" : "manual",
       autoNote:
-        "The watchdog pauses the agents on that account as each goes idle, so Paperclip stops retrying them, resumes them a few minutes after the reset, " +
+        `The watchdog pauses the agents on that account${lastFailure.scope === "model" ? " and model (agents on other models keep running)" : ""} as each goes idle, so Paperclip stops retrying them, resumes them a few minutes after the reset, ` +
         "and then restores the issues Paperclip blocked meanwhile.",
     };
   }

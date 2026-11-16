@@ -34,6 +34,7 @@ import * as commands from "../../src/commands.mjs";
 import { approvalWaitingOn, ts } from "../../src/util.mjs";
 import { backstopMonitor, isBackstop, monitorAttempts } from "../../src/ci-runs.mjs";
 import { claimedOnly, handOnRoute, holdFacts, neverStarted } from "../../src/release.mjs";
+import { claudeModelOf, modelFamily } from "../../src/limits.mjs";
 
 const BASE = (process.env.PAPERCLIP_COMPAT_API ?? "").replace(/\/+$/, "");
 const COMPANY_PREFIX = "pch-compat";
@@ -916,6 +917,19 @@ if (!BASE) {
       assert.equal(after.adapterConfig.effort, "high");
       assert.equal(after.adapterConfig.command, NODE);
       assert.deepEqual(after.adapterConfig.args, ["-e", 'console.log("modelled")']);
+    });
+
+    // Watchdog 16, one model's own limit (the Fable weekly limit, say): it pauses the
+    // agents on that model, read from adapterConfig.model in the company's agent
+    // list each tick, and resumes one whose model was changed meanwhile. Runs can't
+    // reach a real limit here (no model is involved), so this checks what it reads.
+    test("watchdog 16: an agent's model is in the company list, and a change to it shows there at once", async () => {
+      const listed = (await companyAgents(s.ctx.api, s.company.id)).find((a) => a.id === s.modelled.id);
+      assert.ok(listed, "the agent is listed");
+      assert.equal(claudeModelOf(listed), `${s.oldModel}-new`, "adapterConfig.model isn't withheld from the list");
+      await ok("PATCH", `/api/agents/${s.modelled.id}`, { adapterConfig: { model: "claude-opus-compat" } });
+      const switched = (await companyAgents(s.ctx.api, s.company.id)).find((a) => a.id === s.modelled.id);
+      assert.equal(modelFamily(claudeModelOf(switched)), "opus", "the list shows the new model");
     });
 
     test("a terminated agent leaves the company list but can still be read", async () => {

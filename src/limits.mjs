@@ -18,6 +18,13 @@
 // transient failures ("Claude exited with code 143"), so only the limit wording
 // counts.
 //
+// A model's own limit (Max and Ultra plans have a separate weekly limit for
+// Fable, besides the one across all models): the limit text names the model
+// ("Fable weekly limit", "weekly limit for claude-fable-5-2"). Only agents on that
+// model under the same subscription stop; the others still have the all-models
+// allowance, so the pause covers that subscription's agents on that model only
+// (scope "model"). Limit text that names no model is the subscription's own limit.
+//
 // Codex: the run's error is the Codex CLI's own message (codex-rs
 // protocol/src/error.rs, UsageLimitReachedError and CodexErr). Paperclip's error
 // code can't be relied on: its CLI path files "Selected model is at capacity" as
@@ -43,7 +50,56 @@ const RESET_TEXT =
   /\bresets?\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2,8})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]\.?\s*m\.?)?(?:\s*\(([^)]+)\))?/i;
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 
-// A Claude agent's run that failed on a usage limit.
+// A model a Claude limit message can name: a model id ("claude-fable-5-2") or a
+// family name ("Fable", "Opus"). "Claude" alone names no model.
+const CLAUDE_MODEL = String.raw`claude-[a-z0-9][a-z0-9.\[\]-]*|fable|mythos|opus|sonnet|haiku`;
+// Up to 40 characters of the same sentence: no full stop (one inside a version
+// number, "Opus 5.5", is kept), "·" or "|", or line break.
+const SAME_SENTENCE = String.raw`(?:[^.·|\n]|\.(?=\d)){0,40}?`;
+// A model's own limit, the model named before the limit ("Fable limit", "Fable
+// weekly limit", "your Fable usage has reached its weekly limit") or after it
+// ("weekly limit for claude-fable-5-2"). A rate limit is transient, not this.
+// The exact wording Claude Code uses in a `-p` run isn't confirmed yet (see
+// test/fixtures/limit-messages.mjs): this accepts the model anywhere in the phrase.
+const MODEL_LIMIT = new RegExp(
+  String.raw`\b(${CLAUDE_MODEL})\b(?:\s+(?:weekly|usage|session|5[-\s]?hour|plan))?\s+limit\b` +
+    String.raw`|\b(${CLAUDE_MODEL})\b${SAME_SENTENCE}\b(?:weekly|usage|5[-\s]?hour|session)\s+limit\b` +
+    String.raw`|(?<!\brate\s)\blimit\s+(?:for|on)\s+(?:the\s+)?(?:claude\s+)?(${CLAUDE_MODEL})\b`,
+  "i",
+);
+
+// The family a Claude model belongs to: "claude-fable-5-2" → "fable",
+// "claude-3-5-sonnet-20241022" → "sonnet", "opus" or "Opus" → "opus",
+// "sonnet[1m]" → "sonnet". null when no model is given.
+export function modelFamily(model) {
+  const name = String(model ?? "").trim().toLowerCase();
+  if (!name) return null;
+  const id = name.match(/^(?:anthropic[./:])?claude-(?:[\d.-]+-)?([a-z]+)/);
+  if (id) return id[1];
+  const word = name.match(/^[a-z]+/);
+  return word ? word[0] : name;
+}
+
+// The model a Claude agent runs on (its adapter config), or null when it uses the default.
+export const claudeModelOf = (agent) => {
+  const model = agent?.adapterConfig?.model;
+  return typeof model === "string" && model.trim() ? model.trim() : null;
+};
+
+// The model's own limit a Claude limit message names: { family, named, weekly } or null.
+function claudeModelLimit(text) {
+  const m = text.match(MODEL_LIMIT);
+  if (!m) return null;
+  const named = (m[1] ?? m[2] ?? m[3]).trim();
+  const family = modelFamily(named);
+  if (!family) return null;
+  // The sentence it is in says which limit: Fable's own is weekly.
+  const start = Math.max(0, text.lastIndexOf("·", m.index) + 1, text.lastIndexOf("\n", m.index) + 1);
+  const sentence = text.slice(start, m.index + m[0].length + 80);
+  return { family, named, weekly: family === "fable" || /\bweekly\b/i.test(sentence) };
+}
+
+// A Claude agent's run that failed on a usage limit (the subscription's, or one model's own).
 export function isClaudeLimitFailure(run, agent) {
   if (agent?.adapterType !== "claude_local") return false;
   return CLAUDE.classify(run)?.kind === "limit";
@@ -254,22 +310,35 @@ export function codexAccountOf(agent) {
 
 // ---------------------------------------------------------------- recognisers
 
-// classify(run, { now, timeZone }) → null (not a limit or capacity failure),
+// classify(run, { now, timeZone }, agent) → null (not a limit or capacity failure),
 // { kind: "transient" } (left to Paperclip's retries), or { kind: "limit", reset,
 // scope, what }: reset { at, timeZone } or null when the message has none; scope
-// "account" (every agent on the account) or "agent" (only an agent that hits it:
-// one model's own limit); what names it for the board; zone, the time zone to tell
-// the board a guessed reset in (the message's own when it names one).
+// "account" (every agent on the account), "model" (the account's agents on one
+// model: that model's own limit; with `model`, the model as the failing agent
+// runs it or as the message names it, and `family`, what agents are matched by),
+// or "agent" (only an agent that hits it: Codex's limit for one model); what names
+// it for the board; zone, the time zone to tell the board a guessed reset in (the
+// message's own when it names one).
 const CLAUDE = {
   adapterType: "claude_local",
   label: "Claude",
   accountOf: (agent) => subscriptionOf(agent),
-  classify(run) {
+  classify(run, _options, agent) {
     if (run?.status !== "failed" || !LIMIT_CODES.has(run.errorCode)) return null;
     const text = String(run.error ?? "");
-    if (!LIMIT_TEXT.test(text)) return { kind: "transient" };
+    const own = claudeModelLimit(text);
+    if (!own && !LIMIT_TEXT.test(text)) return { kind: "transient" };
     const at = ts(run.finishedAt ?? run.updatedAt ?? run.createdAt);
-    return { kind: "limit", reset: parseReset(text, at), scope: "account", what: "usage limit" };
+    const reset = parseReset(text, at);
+    if (!own) return { kind: "limit", reset, scope: "account", what: "usage limit" };
+    // One model's own limit: the agent's own model when it is that one, else the one named.
+    const agentModel = claudeModelOf(agent);
+    const model = agentModel && modelFamily(agentModel) === own.family ? agentModel : own.named;
+    const period = own.weekly ? "weekly limit" : "usage limit";
+    return {
+      kind: "limit", reset, scope: "model", model, family: own.family,
+      what: own.family === "fable" ? `Fable ${period}` : `${period} for ${model}`,
+    };
   },
 };
 
@@ -311,7 +380,7 @@ export function accountOf(agent) {
 // What the agent's adapter makes of a failed run (see the recognisers above); null
 // for an adapter without a recogniser, which keeps today's behaviour (nothing paused).
 export function classifyFailure(run, agent, options = {}) {
-  return RECOGNISERS.get(agent?.adapterType)?.classify(run, options) ?? null;
+  return RECOGNISERS.get(agent?.adapterType)?.classify(run, options, agent) ?? null;
 }
 
 // A short, readable reset time for the board: in the zone the limit message named.
@@ -322,27 +391,61 @@ export function resetLabel(at, timeZone = "UTC") {
   return `${text} (${timeZone})`;
 }
 
-// The newest limit failure per account among a company's runs, after `since` (per
-// account). A limit scoped to one agent (one model's own limit) is that agent's
-// own: `agent:<id>`. [{ key, run, agent, at, verdict }]
-function latestLimitFailures(runs, agents, sinceByKey = new Map(), timeZone) {
+// The key a limit verdict pauses agents by: the account (`scope: "account"`), the
+// account's agents on one model (`model:<account>:<family>`), or one agent
+// (`agent:<id>`, Codex's limit for one model). null when the account isn't known.
+export function limitKeyOf(verdict, agent) {
+  if (verdict?.scope === "agent") return `agent:${agent.id}`;
+  const account = accountOf(agent);
+  if (!account) return null;
+  return verdict?.scope === "model" ? `model:${account}:${verdict.family}` : account;
+}
+
+// The newest limit failure per key (limitKeyOf) among a company's runs, after
+// `since` (per key), with every agent that failed on it since. [{ key, run, agent,
+// at, verdict, failed: [agentId] }]
+function latestLimitFailures(runs, agents, sinceByKey = new Map(), timeZone, log) {
   const found = new Map();
   for (const run of Array.isArray(runs) ? runs : []) {
     const agent = agents.get(run.agentId);
     const verdict = classifyFailure(run, agent, { timeZone });
     if (verdict?.kind !== "limit") continue;
-    const key = verdict.scope === "agent" ? `agent:${agent.id}` : accountOf(agent);
+    const key = limitKeyOf(verdict, agent);
     if (!key) continue;
     const at = ts(run.finishedAt ?? run.updatedAt ?? run.createdAt);
     if (at <= (sinceByKey.get(key) ?? 0)) continue;
+    // The full text, so the wording of each limit can be checked against a real message.
+    if (agent.adapterType === "claude_local") {
+      log?.debug?.("watchdog: a Claude run failed on a usage limit", {
+        agent: agent.name, model: claudeModelOf(agent), run: run.id, errorCode: run.errorCode ?? null, scope: verdict.scope, what: verdict.what, error: String(run.error ?? ""),
+      });
+    }
     const prior = found.get(key);
-    if (!prior || at > prior.at) found.set(key, { key, run, agent, at, verdict });
+    const failed = [...new Set([...(prior?.failed ?? []), agent.id])];
+    if (!prior || at > prior.at) found.set(key, { key, run, agent, at, verdict, failed });
+    else prior.failed = failed;
   }
   return [...found.values()];
 }
 
-// The agents an event pauses: those on its account (an `agent:<id>` event, only that agent).
-const onAccount = (agent, account) => accountOf(agent) === account || account === `agent:${agent.id}`;
+// The agents an event pauses: those on its account (an `agent:<id>` event, only
+// that agent); for one model's own limit, those of the account on that model. An
+// agent on the default model (none set) counts when it failed on that limit itself.
+function onScope(agent, event) {
+  if (event.scope === "model") {
+    if (accountOf(agent) !== event.modelAccount && event.modelAccount !== `agent:${agent.id}`) return false;
+    const model = claudeModelOf(agent);
+    return model ? modelFamily(model) === event.family : (event.failed ?? []).includes(agent.id);
+  }
+  return accountOf(agent) === event.account || event.account === `agent:${agent.id}`;
+}
+
+// A paused agent no longer on the model whose limit paused it: its model was changed meanwhile.
+function switchedModel(agent, event) {
+  if (event.scope !== "model" || !agent) return false;
+  const model = claudeModelOf(agent);
+  return Boolean(model) && modelFamily(model) !== event.family;
+}
 
 // Runs that are going or about to: pausing the agent would cancel them, and a run
 // cancelled mid-way gets its issue blocked by Paperclip's recovery. A scheduled
@@ -408,14 +511,16 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
 
     // New limit failures, or later ones while the account is still paused.
     const since = new Map([...events].map(([account, r]) => [account, Math.max(r.resumedAt ?? 0, r.lastFailureAt ?? 0)]));
-    for (const { key: account, run, agent, at, verdict } of latestLimitFailures(runs, agents, since, timeZone)) {
+    for (const { key: account, run, agent, at, verdict, failed } of latestLimitFailures(runs, agents, since, timeZone, log)) {
       const prior = events.get(account);
-      const event = startOrExtend(prior, { companyId, account, run, at, agent, verdict });
+      const event = startOrExtend(prior, { companyId, account, run, at, agent, verdict, failed });
       if (!event) continue;
       if (!prior || prior.resumedAt) {
+        const whom = verdict.scope === "agent" ? "it" : verdict.scope === "model" ? `its agents on ${verdict.model}` : "its agents";
         once(`limit-detected:${account}:${run.id}`, () =>
-          log.warn(`watchdog: ${verdict.scope === "agent" ? "an agent" : `a ${label(event)} account`} hit its ${event.what}; pausing ${verdict.scope === "agent" ? "it" : "its agents"} until it resets`, {
+          log.warn(`watchdog: ${verdict.scope === "agent" ? "an agent" : `a ${label(event)} account`} hit its ${event.what}; pausing ${whom} until it resets`, {
             agent: agent.name, adapter: agent.adapterType, run: run.id, resetAt: new Date(event.resetAt).toISOString(), knownReset: !event.unknownReset,
+            ...(verdict.scope === "model" ? { model: verdict.model } : {}),
           }),
         );
       }
@@ -426,7 +531,10 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
     for (const event of events.values()) {
       if (event.resumedAt) continue;
       if (now() >= event.resetAt + graceMs) await resume(event, agents);
-      else await pauseIdle(event, agents, runs);
+      else {
+        await resumeSwitched(event, agents);
+        await pauseIdle(event, agents, runs);
+      }
     }
     logUnrecognised(runs, agents);
   }
@@ -462,7 +570,7 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
 
   // The event a limit failure starts, or the running one it extends; null when
   // its reset has passed already.
-  function startOrExtend(prior, { companyId, account, run, at, agent, verdict }) {
+  function startOrExtend(prior, { companyId, account, run, at, agent, verdict, failed = [] }) {
     const reset = verdict.reset;
     const active = prior && !prior.resumedAt;
     // The same limit again soon after a resume: it hadn't really reset.
@@ -476,8 +584,15 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
     }
     const resetAt = reset?.at ?? at + waitMs;
     if (resetAt + graceMs <= now()) return null;
+    // One model's own limit: which agents it covers (onScope).
+    const model = verdict.scope === "model"
+      ? {
+        scope: "model", model: verdict.model, family: verdict.family, modelAccount: accountOf(agent),
+        failed: [...new Set([...(active ? prior.failed ?? [] : []), ...failed])],
+      }
+      : {};
     return {
-      companyId, account, adapter: agent.adapterType, what: verdict.what, runId: run.id, lastFailureAt: at,
+      companyId, account, adapter: agent.adapterType, what: verdict.what, runId: run.id, lastFailureAt: at, ...model,
       resetAt: active ? Math.max(prior.resetAt, resetAt) : resetAt,
       timeZone: reset?.timeZone ?? (active ? prior.timeZone : null) ?? verdict.zone ?? "UTC",
       unknownReset: active ? prior.unknownReset && !reset : !reset,
@@ -514,7 +629,7 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
 
   // Pauses the account's agents that have no live run; returns those still busy.
   async function pauseIdle(event, agents, runs) {
-    const members = [...agents.values()].filter((a) => onAccount(a, event.account));
+    const members = [...agents.values()].filter((a) => onScope(a, event));
     const waiting = [];
     for (const agent of members) {
       if (event.paused[agent.id] || asleep(agent)) continue; // ours, or a person's or not runnable
@@ -525,7 +640,13 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
         continue;
       }
       if (config.dryRun) {
-        once(`limit-pause:${event.runId}:${agent.id}`, () => log("watchdog: would pause an agent until its usage limit resets (dry run)", { agent: agent.name }));
+        once(`limit-pause:${event.runId}:${agent.id}`, () =>
+          log(
+            event.scope === "model"
+              ? `watchdog: would pause an agent for the ${label(event)} ${event.what} until it resets (dry run)`
+              : "watchdog: would pause an agent until its usage limit resets (dry run)",
+            { agent: agent.name, ...(event.scope === "model" ? { model: claudeModelOf(agent) ?? event.model } : {}) },
+          ));
         continue;
       }
       // Busy, or Paperclip didn't say: not paused this tick, and counted as waiting.
@@ -565,11 +686,12 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
     const resumeAt = resetLabel(event.resetAt + graceMs, event.timeZone);
     const what = event.what ?? "usage limit";
     const text =
-      `${name} ${what} reached: ${plural(paused.length, "agent")} paused (${names(paused)})` +
+      `${name} ${what} reached: ${plural(paused.length, "agent")}${event.scope === "model" ? ` on ${event.model}` : ""} paused (${names(paused)})` +
       `${waiting.length ? `, and ${plural(waiting.length, "more")} once ${waiting.length === 1 ? "its" : "their"} current run ends (${names(waiting.map((a) => a.name))})` : ""}. ` +
       (event.unknownReset
         ? `${name} didn't say when the limit resets, so the watchdog resumes them at ${resumeAt} to try again.`
         : `The limit resets ${resetLabel(event.resetAt, event.timeZone)}; the watchdog resumes them at ${resumeAt}.`) +
+      (event.scope === "model" ? ` ${name} agents on other models keep running.` : "") +
       `${otherLabels.length ? ` ${otherLabels.join(" and ")} agents are unaffected and keep working.` : others.length ? " Agents on other adapters keep working." : ""}` +
       " An agent you pause yourself stays paused.";
     event.notified = true;
@@ -583,10 +705,11 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
   // shows it so: a resume it accepted but hasn't finished (it answers while the agent
   // is still `resuming`, or still `pausing`) is read again each tick, and the board is
   // told if it takes long. The event ends once none is left to resume or watch.
-  async function resume(event, agents) {
+  async function resume(event, agents, { only = null } = {}) {
     if (config.dryRun) return;
     const stuck = [];
     for (const [id, entry] of Object.entries(event.paused)) {
+      if (only && !only.has(id)) continue;
       const { name, pausedAt } = entry;
       let agent = agents.get(id);
       if (!agent) agent = await api.request("GET", `/api/agents/${id}`).catch(() => null);
@@ -634,8 +757,21 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
       else log("watchdog: asked Paperclip to resume an agent after its usage limit reset; waiting for it to finish", lifecycleOf(fresh ?? agent, name));
     }
     if (stuck.length) await noteStuck(event, stuck);
-    if (!Object.keys(event.paused).length) event.resumedAt = now();
+    if (!only && !Object.keys(event.paused).length) event.resumedAt = now();
     save(event);
+  }
+
+  // One model's own limit: an agent paused for it whose model was changed since
+  // isn't held by that limit any more, so it is resumed now rather than at the reset.
+  async function resumeSwitched(event, agents) {
+    if (event.scope !== "model" || config.dryRun) return;
+    const switched = new Set(Object.keys(event.paused).filter((id) => !event.paused[id].resumeSentAt && switchedModel(agents.get(id), event)));
+    if (!switched.size) return;
+    for (const id of switched) {
+      event.failed = (event.failed ?? []).filter((x) => x !== id);
+      log(`watchdog: an agent paused for the ${label(event)} ${event.what} is on another model now; resuming it`, { agent: event.paused[id].name, model: claudeModelOf(agents.get(id)) });
+    }
+    await resume(event, agents, { only: switched });
   }
 
   // An agent Paperclip now shows resumed: counted, and the board told if it heard it was stuck.

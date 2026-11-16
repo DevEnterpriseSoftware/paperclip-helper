@@ -246,6 +246,6 @@ test("pch why says when the watchdog paused the assignee at a usage limit, from 
   });
   env.state.save({ force: true });
   const lines = (await captureOutput(() => cmd.why(env.ctx, "ACM-110"))).join("\n");
-  assert.match(lines, /Paused by the watchdog at a usage limit; resumed at Mon 7 Jan, 15:50 \(UTC\)/);
+  assert.match(lines, /Paused by the watchdog at a usage limit \(the Codex usage limit, which resets Mon 7 Jan, 15:45 \(UTC\)\); resumed at Mon 7 Jan, 15:50 \(UTC\)/);
   assert.match(lines, /Recommendation: The watchdog paused Gilfoyle because its Codex usage limit was reached; it resets Mon 7 Jan, 15:45 \(UTC\)/);
 });

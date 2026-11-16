@@ -171,7 +171,10 @@
 //    OPENAI_API_KEY secret, or the login in CODEX_HOME), each once it has no run
 //    queued or going: pausing mid-run cancels the run. Transient capacity ("model is
 //    at capacity") is left to Paperclip's retries, and an adapter without a
-//    recogniser is left alone. The board is told once (the log, and
+//    recogniser is left alone. One model's own limit (Claude's separate weekly
+//    limit for Fable; Codex's limit for one model) pauses only the agents on that
+//    model (Claude: those of the subscription; Codex: the one that hit it); an
+//    agent switched to another model meanwhile is resumed. The board is told once (the log, and
 //    WATCHDOG_NOTIFY_ISSUE). At the reset the message gives (an hour later when it
 //    gives none), plus WATCHDOG_LIMIT_RESUME_GRACE_MIN, it resumes exactly the
 //    agents it paused, never one a person paused, and 15 restores their issues.

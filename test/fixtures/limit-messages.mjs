@@ -53,4 +53,20 @@ export const CLAUDE_MESSAGES = [
   ["Weekly limit", "Claude run failed: subtype=success: You've hit your org's monthly spend limit · ask your admin to raise it, or switch to extra usage · your weekly limit resets Oct 12, 4pm (Europe/London)", { kind: "limit", scope: "account" }],
   ["5-hour limit", "Claude AI usage limit reached|1760281200", { kind: "limit", scope: "account" }],
   ["Transient", "Claude exited with code 143", { kind: "transient" }],
+  // A rate limit names a model too, but is transient.
+  ["Rate limit naming a model", "API Error: rate limit for claude-fable-5-2 exceeded, please retry", { kind: "transient" }],
+];
+
+// One model's own limit (Max and Ultra plans have a separate weekly limit for
+// Fable). ASSUMED wording: no real `claude -p` run that hit it has been seen yet,
+// so these accept the model anywhere in the limit phrase. Replace them with the
+// real text once one is logged (the watchdog logs every Claude limit failure's
+// full text at debug level).
+//   { kind: "limit", scope: "model", family, what }
+export const CLAUDE_MODEL_MESSAGES = [
+  ["assumed: Fable limit", "You've hit your Fable limit · resets Oct 14, 4pm (Europe/London)", { kind: "limit", scope: "model", family: "fable", what: "Fable weekly limit" }],
+  ["assumed: Fable weekly limit", "Claude run failed: subtype=success: You've hit your Fable weekly limit · resets Oct 14, 4pm (Europe/London)", { kind: "limit", scope: "model", family: "fable", what: "Fable weekly limit" }],
+  ["assumed: weekly limit for a model id", "You've reached your weekly limit for claude-fable-5-2 · resets Oct 14, 4pm (Europe/London)", { kind: "limit", scope: "model", family: "fable", what: "Fable weekly limit" }],
+  ["assumed: limit for Claude Fable", "You've hit your weekly limit for Claude Fable. Turn on usage credits to keep going · resets Oct 14, 4pm (Europe/London)", { kind: "limit", scope: "model", family: "fable", what: "Fable weekly limit" }],
+  ["assumed: Fable usage needs credits", "Fable usage has reached its weekly limit and usage credits are off. Stop, switch to usage credits, or upgrade.", { kind: "limit", scope: "model", family: "fable", what: "Fable weekly limit" }],
 ];
