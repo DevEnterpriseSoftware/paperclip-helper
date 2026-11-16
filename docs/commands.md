@@ -172,7 +172,7 @@ The recommendation names what is going on, gives the steps as commands you can p
 - a review blocked because its participant couldn't be woken, and any other issue Paperclip's recovery parked;
 - saved messages waiting behind an earlier run;
 - a question card the asker waits on: one Paperclip never delivered to the teammate it's addressed to (with the issue the watchdog routed it to), or one for you;
-- a blocked issue: waiting on open blockers, on a workspace clean-up, on a cancelled blocker (which Paperclip never counts as resolved), with every blocker done, blocked by an agent over another issue's workspace or with a note of its own, or an agent re-running every few minutes while it waits on you;
+- a blocked issue: waiting on open blockers, on a workspace clean-up, on a cancelled blocker (which Paperclip never counts as resolved), with every blocker done (and whether the agent took up the blockers-resolved wake and now waits on something else, or the wake was dropped), blocked by an agent over another issue's workspace or with a note of its own, or an agent re-running every few minutes while it waits on you;
 - an issue in review with no review stage pending (and who removed its stages, when an agent's update did);
 - a dropped hand-off, runs Paperclip refused before they started, a run that failed (or only met a busy model, which Paperclip retries), a run that finished waiting on a CI run, and a run that finished without moving the issue on.
 

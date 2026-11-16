@@ -79,6 +79,32 @@ function boardComment(issue, body, via, who) {
 // Paperclip's cost statuses: since paperclipai/paperclip#14997, and before it.
 export const COST_STATUSES = ["reported", "estimated", "unpriced"];
 export const OLD_COST_STATUSES = ["reported", "unpriced"];
+
+// Paperclip's record of a blockers-resolved wake (routes/issues.ts, and the recovery's
+// liveness backstop, 2026.1106.0): an `issue.blockers_resolved_wake_emitted` activity on
+// the dependent, with the woken agent and the run the wake made (details.wakeupRunId,
+// null when the wake was deferred or skipped).
+export function blockersResolvedWake(db, dependent, { agentId = dependent.assigneeAgentId, runId = null, source = "workspace.finalize", blockerIds = [], at = new Date().toISOString() } = {}) {
+  const entry = {
+    id: uuid(), companyId: dependent.companyId, actorType: "system", actorId: "issue_update", agentId,
+    action: "issue.blockers_resolved_wake_emitted", entityType: "issue", entityId: dependent.id,
+    details: { source, wakeupRunId: runId, idempotencyKey: null, resolvedBlockerIssueId: blockerIds[0] ?? null, blockerIssueIds: blockerIds },
+    createdAt: at,
+  };
+  db.activity.push(entry);
+  return entry;
+}
+
+// A pending card an agent saved on its issue for a person to answer (no addressee agent),
+// as GET /api/issues/:id/interactions lists it.
+export function boardCard(db, issue, { kind = "ask_user_questions", createdByAgentId = issue.assigneeAgentId, addresseeUserId = null, at = new Date().toISOString(), prompt = "Which option should I take?" } = {}) {
+  const card = {
+    id: uuid(), issueId: issue.id, kind, status: "pending", addresseeAgentId: null, addresseeUserId, createdByAgentId,
+    payload: { questions: [{ id: "q1", prompt }] }, createdAt: at,
+  };
+  (db.interactions[issue.id] ??= []).push(card);
+  return card;
+}
 const BILLING_TYPES = ["metered_api", "subscription_included", "subscription_overage", "credits", "fixed", "unknown"];
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Zod's string().datetime(): UTC only, so a "Z" and no offset.

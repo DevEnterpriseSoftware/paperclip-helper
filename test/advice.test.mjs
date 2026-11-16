@@ -64,6 +64,18 @@ test("advice: blocked issues — open blocker, done blockers, an agent's own not
   assert.match(done.what, /Every blocker is done/);
   assert.equal(done.watchdog, "auto");
 
+  // The wake got through and the agent went on to wait for something else, the done blocker left listed.
+  const taken = advise(base({
+    issue: blocked,
+    blockers: { blockers: [{ identifier: "ACM-2", status: "done" }] },
+    blockersWake: { runId: "4f1c2a9e-0000-4000-8000-000000000001", status: "succeeded" },
+    lastComment: { body: "Waiting only for the board's answer on the card." },
+  }));
+  assert.match(taken.what, /took up the wake \(run 4f1c2a9e, succeeded\)/);
+  assert.match(taken.what, /ACM-2 still sits in "Blocked by", but isn't what it waits on now/);
+  assert.match(taken.what, /board's answer on the card/);
+  assert.equal(taken.watchdog, null, "nothing for the watchdog to do");
+
   const note = advise(base({ issue: blocked, runs: [run(A, "succeeded", 600)], lastComment: { body: "Blocked: approval a1b2c3d4 still pending." } }));
   assert.match(note.what, /blocked this issue with a note of its own/);
   assert.match(note.what, /approval a1b2c3d4/);

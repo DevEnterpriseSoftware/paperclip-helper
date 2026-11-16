@@ -13,7 +13,7 @@ import { selfWakeLoop } from "./self-wakes.mjs";
 import { claimedOnly, handOnRoute, heldReviewRoute, holdFacts, neverStarted, PAUSE_CANCEL, RECONCILIATION_CAUSE, releaseProblems } from "./release.mjs";
 import { describeWakes } from "./paused-holds.mjs";
 import { codeLabel, EXTENSION_ERROR, hostPaths, meaningOf, readWorkspace, RECOVERY_KIND, VALIDATION_FAILED, validationOf } from "./worktree-links.mjs";
-import { ts } from "./util.mjs";
+import { blockersWakeOf, ranRun, ts } from "./util.mjs";
 
 // A blocker counts as "finalizing" until the latest operation on its execution
 // workspace is a successful workspace_finalize. Show the last few operations.
@@ -334,6 +334,22 @@ async function whyReport(ctx, identifier, out) {
   const loop = selfWakeLoop(activity, runList, { now: ctx.now() });
   const selfWake = loop ? { name: (await nameOf(loop.agentId)) ?? "an agent", count: loop.count } : null;
   if (selfWake) out(`Self-wakes: ${selfWake.name}, ${selfWake.count} in the last hour (each run's final message, posted as its comment, started its next run)`);
+  // Every blocker done: did the blockers-resolved wake reach the assignee (watchdog 2)?
+  // The run Paperclip's latest wake activity names, if the assignee's and under way.
+  let blockersWake = null;
+  if (blockers?.readiness?.allBlockersDone && (blockers.blockers ?? []).length && full?.assigneeAgentId) {
+    // From this round of blockers: the wake names one of them (an older one may be an earlier round's).
+    const current = new Set((blockers.blockers ?? []).map((b) => b.id).filter(Boolean));
+    const latest = blockersWakeOf(activity);
+    const named = [latest?.details?.resolvedBlockerIssueId, ...(latest?.details?.blockerIssueIds ?? [])].filter(Boolean);
+    const wake = latest && (!named.length || !current.size || named.some((id) => current.has(id))) ? latest : null;
+    const id = wake?.agentId === full.assigneeAgentId || !wake?.agentId ? wake?.details?.wakeupRunId : null;
+    const run = id ? runList.find((r) => (r.runId ?? r.id) === id) : null;
+    if (run && (!run.agentId || run.agentId === full.assigneeAgentId) && ranRun(run)) {
+      blockersWake = { runId: id, status: run.status, at: wake.createdAt };
+      out(`Blockers-resolved wake: taken up by run ${String(id).slice(0, 8)} (${run.status})`);
+    }
+  }
   // The CI run the assignee's latest comments say it waits on (watchdog 11).
   const said = waitingOn(Array.isArray(comments) ? comments : [], full?.assigneeAgentId, full?.executionState?.monitor);
   const ref = runRefs(said.text)[0];
@@ -361,6 +377,7 @@ async function whyReport(ctx, identifier, out) {
     stagesWipedBy,
     ciRun,
     ciBackstop,
+    blockersWake,
     selfWake,
     pauseHold,
     unstartedHold,

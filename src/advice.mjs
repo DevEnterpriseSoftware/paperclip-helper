@@ -60,6 +60,7 @@ export function advise(facts) {
     stagesWipedBy = null, // in review with no stage: who removed its stages (watchdog 17), when the activity log shows it
     ciRun = null, // the CI run the assignee's latest comments say it waits on: "repo#id" or the bare id
     ciBackstop = null, // the watchdog's backstop monitor for that wait stands: { nextCheckAt }
+    blockersWake = null, // every blocker done, and the blockers-resolved wake's run (the assignee's) got under way: { runId, status }
     selfWake = null, // an agent keeps waking itself with its runs' posted final messages (self-wakes.mjs): { name, count }
     pauseHold = null, // the hold is from a run a pause cancelled (watchdog 18): { ownerName, runId, waiting, held }
     unstartedHold = null, // the hold is from a run Paperclip cancelled before it started (watchdog 22): { ownerName, runId, errorCode, problems, route }
@@ -520,6 +521,19 @@ export function advise(facts) {
         ],
         watchdog: config.watchdog === false || config.watchdogCancelledBlockers === false ? "manual" : "auto",
         autoNote: `The watchdog tells ${who} once, quoting why the blocker was cancelled, so it can remove or replace the blocker itself.`,
+      };
+    }
+    if (linked.length && blockersWake) {
+      const names = linked.map((b) => b.identifier ?? b.id).join(", ");
+      return {
+        what:
+          `Every blocker is done, and ${who} took up the wake (run ${String(blockersWake.runId).slice(0, 8)}, ${blockersWake.status}), then left the issue blocked: ` +
+          `${names} still ${linked.length === 1 ? "sits" : "sit"} in "Blocked by", but ${linked.length === 1 ? "isn't" : "aren't"} what it waits on now.${note}`,
+        steps: [
+          "Its last note (and any card above) says what it waits on. Answer or decide that; it wakes the agent.",
+          `If nothing is left to wait for, comment to tell ${who} so.`,
+        ],
+        watchdog: null,
       };
     }
     if (linked.length) {

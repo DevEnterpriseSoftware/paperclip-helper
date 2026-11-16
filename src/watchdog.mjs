@@ -13,7 +13,12 @@
 //    same way. They get the same kind of comment once quiet for the stall window.
 //    Not an issue Paperclip holds for recovery, nor one whose agent waits on CI
 //    under the backstop (11): its done blockers aren't why it is blocked, and the
-//    comment would reopen it and wake the agent for nothing.
+//    comment would reopen it and wake the agent for nothing. Nor one whose wake
+//    got through: the run Paperclip's issue.blockers_resolved_wake_emitted activity
+//    names started, or the assignee has run or commented since the last blocker was
+//    done. Agents often leave a done blocker in "Blocked by" when they go on to wait
+//    for something else. Nor one waiting on a card a person must answer: the answer
+//    wakes the assignee. That card check also holds back 1, 9 and 14.
 //
 // 3. Done blockers whose workspace clean-up failed. A blocker is done, but the
 //    clean-up of its workspace (workspace_finalize) failed, typically because
@@ -249,7 +254,7 @@
 
 import { companyAgents, listIssues } from "./paperclip.mjs";
 import { createTickReads } from "./tick-reads.mjs";
-import { ACTIVE_RUN, agentMention, asleep, every, mapLimit, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
+import { ACTIVE_RUN, agentMention, asleep, blockersWakeOf, every, mapLimit, pausedRefusal, ranRun, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 import { holdFacts, neverStarted, pausedHold, ranWork, releaseHold, releaseProblems, RECONCILIATION_CAUSE, unprovable } from "./release.mjs";
 import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
 import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue, strandedCard } from "./questions.mjs";
@@ -367,6 +372,17 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     if (decided.has(key)) return;
     decided.add(key);
     log(msg, { issue: issue.identifier ?? issue.id, rule, decision: what, ...extra });
+  };
+
+  // A nudge held back because nothing was lost: one debug line per issue and reason
+  // (in a dry run, an info line saying it would skip).
+  const skipped = (issue, rule, what, nudgeName, why, extra = {}) => {
+    const key = `${issue.id}:${what}`;
+    if (decided.has(key)) return;
+    decided.add(key);
+    const fields = { issue: issue.identifier ?? issue.id, rule, decision: what, ...extra };
+    if (config.dryRun) log(`watchdog: would skip the ${nudgeName} (dry run): ${why}`, fields);
+    else log.debug(`watchdog: no ${nudgeName}: ${why}`, fields);
   };
 
   async function agentFor(id, agents) {
@@ -859,7 +875,74 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     if ((Array.isArray(runs) ? runs : []).some((r) => r.agentId === assignee && ACTIVE_RUN.has(r.status))) return null;
     if (await hasPendingWake(issue, runs, agents)) return null;
     const done = blockers.map((b) => b.identifier ?? b.id).sort();
-    return { agent, done };
+    return { agent, done, blockers, runs: Array.isArray(runs) ? runs : [] };
+  }
+
+  // When the last of the blockers was done: the latest completedAt (or, without one,
+  // updatedAt, which is no earlier). null when any blocker's time can't be read.
+  async function blockersDoneAt(blockers) {
+    let latest = 0;
+    for (const b of blockers) {
+      let at = ts(b.completedAt) || ts(b.updatedAt);
+      if (!at) {
+        const full = await api.request("GET", `/api/issues/${encodeURIComponent(b.id ?? b.identifier)}`).catch(() => null);
+        at = ts(full?.completedAt) || ts(full?.updatedAt);
+      }
+      if (!at) return null;
+      latest = Math.max(latest, at);
+    }
+    return latest || null;
+  }
+
+  // Evidence that the blockers-resolved wake reached the assignee, or null:
+  //  - the run Paperclip's latest issue.blockers_resolved_wake_emitted activity names
+  //    (details.wakeupRunId, logged from the last blocker's done on) is the assignee's
+  //    and started (an issue with a run still going is never nudged anyway);
+  //  - a run of the assignee started on the issue since the last blocker was done;
+  //  - the assignee commented since then.
+  // Whether the wake was dropped is read from these alone; the issue still being
+  // blocked with done blockers listed proves nothing (agents leave them there).
+  async function wakeTakenUp(issue, idle) {
+    const assignee = issue.assigneeAgentId;
+    const doneAt = await blockersDoneAt(idle.blockers);
+    const runs = idle.runs;
+    const SLACK_MS = 60_000; // the activity and completedAt are written in the same request
+    const activity = await api.request("GET", `/api/issues/${issue.id}/activity`).catch(() => null);
+    const wake = blockersWakeOf(activity, doneAt ? doneAt - SLACK_MS : 0);
+    // Paperclip logs it on the dependent with the woken agent and, when the wake made
+    // a run, details.wakeupRunId (null when it was deferred or skipped: not taken up).
+    const wakeRunId = wake && (!wake.agentId || wake.agentId === assignee) ? (wake.details?.wakeupRunId ?? null) : null;
+    if (wakeRunId) {
+      const run =
+        runs.find((r) => (r.runId ?? r.id) === wakeRunId) ??
+        (await api.request("GET", `/api/heartbeat-runs/${encodeURIComponent(wakeRunId)}`).catch(() => null));
+      if (run && (!run.agentId || run.agentId === assignee) && ranRun(run)) return { by: "wake run", run: wakeRunId, status: run.status };
+    }
+    if (!doneAt) return null;
+    const since = runs.find((r) => r.agentId === assignee && ranRun(r) && ts(r.startedAt ?? r.createdAt) >= doneAt);
+    if (since) return { by: "run since", run: since.runId ?? since.id, status: since.status };
+    const comments = await api.request("GET", `/api/issues/${issue.id}/comments?order=desc&limit=20`).catch(() => null);
+    const said = (Array.isArray(comments) ? comments : []).find((c) => c?.authorAgentId === assignee && ts(c.createdAt) >= doneAt);
+    if (said) return { by: "comment since", comment: said.id ?? null };
+    return null;
+  }
+
+  // A pending card on the issue that a person must answer (addressed to a user, or to
+  // no agent): its answer wakes the assignee, so a nudge would only wake it to say it
+  // is still waiting. Logged once per card; true also when the cards can't be read (an
+  // unread issue must not look like one with nothing pending), so the nudge waits.
+  async function waitsOnBoard(issue, rule, what) {
+    let cards;
+    try {
+      cards = await pendingCards(api, issue.id);
+    } catch (err) {
+      log.debug(`watchdog: no ${what} this time: the issue's cards couldn't be read`, { issue: issue.identifier ?? issue.id, rule, error: err.message });
+      return true;
+    }
+    const card = cards.find((c) => c.addresseeUserId || !c.addresseeAgentId);
+    if (!card) return false;
+    skipped(issue, rule, `board-card:${card.id}`, what, "waits on a board interaction", { card: card.id, kind: card.kind ?? null });
+    return true;
   }
 
   // ---------------------------------------------------------------- 3. failed finalize
@@ -1001,6 +1084,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
         if (pausedHolds.actedOn(issue.id)) return;
         const stall = await stalledHandOff(issue, agents);
         if (!stall) return;
+        if (await waitsOnBoard(issue, "1", "hand-off nudge")) return;
         // Every wake held behind a run a pause cancelled (18): a comment waits behind it
         // too. 18 resolves it and then wakes the owner, saying why; without that, the
         // nudge says why instead of guessing at an environment lease.
@@ -1084,6 +1168,15 @@ export function createWatchdog(outerCtx, state, deps = {}) {
           decision(issue, "2", "ci-wait", "watchdog: no blockers-resolved nudge: the agent waits on CI under the Helper's backstop", { blockersDone: idle.done });
           return;
         }
+        // The wake got through, and the agent went on to wait for something else (the
+        // done blockers left in "Blocked by"), or the issue waits on a person's answer.
+        const taken = await wakeTakenUp(issue, idle);
+        if (taken) {
+          const what = taken.run ? `wake taken up by run ${taken.run}` : "wake taken up (the assignee commented since)";
+          skipped(issue, "2", `taken:${taken.run ?? taken.comment ?? "comment"}`, "blockers-resolved nudge", what, { ...taken, blockersDone: idle.done });
+          return;
+        }
+        if (await waitsOnBoard(issue, "2", "blockers-resolved nudge")) return;
         await nudge(
           issue,
           record.blocked(issue, idle.done),
@@ -1267,6 +1360,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
         const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
         if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return;
         if (await hasPendingWake(full, runs, agents)) return;
+        if (await waitsOnBoard(full, "9", "scheduled-workspace nudge")) return;
         await nudge(
           full,
           record.scheduledWorkspace(full),
@@ -1428,6 +1522,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
     if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return true;
     if (await hasPendingWake(issue, runs, agents)) return true;
+    if (await waitsOnBoard(issue, "14", "cancelled-blocker nudge")) return true;
     const why = [];
     for (const b of cancelled.slice(0, 3)) {
       const comments = await api.request("GET", `/api/issues/${b.id}/comments?order=desc&limit=1`).catch(() => []);

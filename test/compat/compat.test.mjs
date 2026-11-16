@@ -561,6 +561,59 @@ if (!BASE) {
       s.skew = 0;
     });
 
+    test("watchdog: a blockers-resolved wake that was taken up is logged with its run, and isn't nudged", async (t) => {
+      // A blocker done wakes the dependent's assignee (issue_blockers_resolved), and
+      // Paperclip logs issue.blockers_resolved_wake_emitted on the dependent with the
+      // woken agent and the run the wake made (details.wakeupRunId). Watchdog 2 reads that
+      // to tell a wake that got through from one that was dropped: the dependent can stay
+      // blocked with its done blocker listed (agents leave it there) and still not be stuck.
+      const blocker = await issue({ title: "Wake blocker", status: "todo" });
+      const dependent = await issue({ title: "Wake dependent", status: "blocked", assigneeAgentId: s.alice.id, blockedByIssueIds: [blocker.id] });
+      await sleep(1500);
+      const before = new Set((await runsOf(dependent.id)).map((r) => r.runId ?? r.id));
+      await ok("PATCH", `/api/issues/${blocker.id}`, { status: "done" });
+      const done = await ok("GET", `/api/issues/${blocker.id}`);
+      assert.ok(isIso(done.completedAt), "a done issue has completedAt, which the watchdog reads as when its blocker was done");
+
+      const wake = await until("the blockers-resolved wake's activity on the dependent", async () => {
+        const log = await s.ctx.api.request("GET", `/api/issues/${dependent.id}/activity`);
+        assert.ok(Array.isArray(log), "the issue's activity is listed");
+        return log.find((a) => a?.action === "issue.blockers_resolved_wake_emitted") ?? null;
+      }).catch(() => null);
+      if (!wake) {
+        await ok("PATCH", `/api/issues/${dependent.id}`, { status: "cancelled" }); // not left for the next test to find
+        return t.skip("this Paperclip logs no issue.blockers_resolved_wake_emitted activity");
+      }
+      hasKeys(wake, ["agentId", "details", "createdAt", "entityId"], "a blockers-resolved wake activity");
+      assert.equal(wake.entityId, dependent.id, "logged on the dependent");
+      assert.equal(wake.agentId, s.alice.id, "with the woken agent");
+      assert.ok("wakeupRunId" in wake.details, "with details.wakeupRunId");
+      const runId = wake.details.wakeupRunId;
+      assert.ok(runId, "the wake made a run");
+      assert.ok(!before.has(runId), "a new run");
+      const run = await until("the wake's run, listed on the dependent", async () => (await runsOf(dependent.id)).find((r) => (r.runId ?? r.id) === runId) ?? null);
+      assert.equal(run.agentId, s.alice.id);
+      await settled(dependent.id);
+
+      // The agent went on to wait for something else: blocked again, the done blocker still listed.
+      const now = await ok("GET", `/api/issues/${dependent.id}`);
+      if (now.status !== "blocked") await ok("PATCH", `/api/issues/${dependent.id}`, { status: "blocked" });
+      await settled(dependent.id);
+      const nudges = async () => (await commentsOf(dependent.id)).filter((c) => c.body.includes("every blocker on this issue is done"));
+      s.skew = 10 * 60_000;
+      const watchdog = createWatchdog(s.ctx, createStateStore(path.join(s.dataDir, "wake-taken-state.json")));
+      await watchdog.tick();
+      s.skew = 0;
+      assert.equal(watchdog.stats.lastError, null);
+      assert.equal((await nudges()).length, 0, "no blockers-resolved nudge on a wake that was taken up");
+      assert.ok(
+        s.logs.some((l) => (l.msg ?? "").startsWith("watchdog: no blockers-resolved nudge: wake taken up by run") && l.issue === dependent.identifier),
+        "the skip is logged with its reason",
+      );
+      const cards = await s.ctx.api.request("GET", `/api/issues/${dependent.id}/interactions`);
+      assert.ok(Array.isArray(cards), "the issue's cards are listed (what the board-card check reads)");
+    });
+
     test("watchdog: issues that are progressing normally are never touched", async () => {
       // Everything seeded so far, looked at an hour later: runs by the current
       // owner, a blocked issue with an open blocker, a paused task, a running run.

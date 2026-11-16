@@ -42,7 +42,7 @@ The watchdog looks for an issue where all of these hold:
 - The owner isn't paused, terminated or waiting for approval.
 - Paperclip has no wake queued for the owner.
 
-It then comments on the issue, which wakes the assignee. While a task is paused, Paperclip refuses comments, so the watchdog waits until it's resumed.
+It then comments on the issue, which wakes the assignee, unless a card on the issue waits on a person: answering that wakes the assignee too, so the comment waits. While a task is paused, Paperclip refuses comments, so the watchdog waits until it's resumed.
 
 When the issue is held behind a run an agent's pause cancelled, the comment would be saved behind that hold too: [18](#18-wakes-held-by-a-run-an-agents-pause-cancelled) lifts the hold the way Paperclip allows. When the watchdog won't (`WATCHDOG_RELEASE_HOLDS` off, the helper's key not a board user's, or Paperclip refused), the nudge says that hold is why and gives the two steps that lift it, rather than guessing at the lease.
 
@@ -57,6 +57,18 @@ Three things look like "the owner is on it" and aren't, so the watchdog ignores 
 Paperclip should wake the assignee with `issue_blockers_resolved`, but that wake can be dropped the same way. Once the issue has been quiet for the stall window, it gets the same kind of comment. A comment on a blocked issue whose blockers are done also moves it back to `todo`; this was verified against Paperclip 2026.916.1.
 
 **Only when the blockers are why it is blocked.** An issue Paperclip holds for recovery (`executionBlocker`) is blocked by the hold, whatever its old blocker links say, and one whose agent waits on CI under [11](#11-ci-runs-an-agent-waits-on)'s backstop is waiting, not dropped. The comment would reopen either to `todo` (which also clears the backstop) and wake the agent for nothing; before 1.17.0 that was half of a loop of wakes on an agent waiting on CI. So neither gets this nudge: one log line says why ("no blockers-resolved nudge: the issue is held for recovery, not by its blockers", or "… waits on CI under the Helper's backstop"), and a hold is left to [7](#7-holds-paperclip-can-never-release-by-itself) or [22](#22-holds-behind-runs-that-never-started).
+
+**Only when the wake was really dropped.** Agents often leave a done blocker in **Blocked by** when they go on to wait for something else, so "every blocker is done, the issue is blocked and its agent idle" doesn't prove the wake was lost. Before 1.17.2 the watchdog took it as proof, and woke an agent that had already taken the wake up and was waiting on a card for the board: each nudge reopened the issue and cost a full run that only said "still waiting". Now the watchdog leaves the issue alone when any of these shows the wake got through:
+
+- the run Paperclip's `issue.blockers_resolved_wake_emitted` activity on the issue names (`details.wakeupRunId`, logged when the last blocker was done) is the assignee's and started;
+- a run of the assignee started on the issue after the last blocker was done (its `completedAt`);
+- the assignee commented on the issue after that.
+
+It also leaves alone an issue with a pending card a person must answer (`ask_user_questions`, a confirmation, an approval: any card addressed to a user or to no agent). Answering it wakes the assignee, so nothing is lost. A card addressed to a teammate doesn't count ([10](#10-question-cards-addressed-to-a-teammate) handles those). The same card check holds back the nudges of [1](#1-dropped-hand-offs), [9](#9-issues-waiting-for-a-workspace-their-agent-scheduled) and [14](#14-issues-blocked-by-a-cancelled-issue).
+
+Either skip is logged once per issue at debug level: "no blockers-resolved nudge: wake taken up by run …" (with `by`: `wake run`, `run since` or `comment since`), or "… waits on a board interaction" (with the card and its `kind`). A dry run logs "would skip the blockers-resolved nudge (dry run): …" at info. The done blockers left in **Blocked by** stay there: whether to remove them is the agent's call.
+
+A wake that really was dropped is still nudged as before: no wake activity since the last blocker was done, or one whose run was never made (`wakeupRunId` null, a deferred wake) or can't be found, and no run or comment from the assignee since, and no card waiting on a person.
 
 ## 3. Done blockers whose workspace clean-up failed
 
@@ -135,7 +147,7 @@ With `WATCHDOG_CLEAR_DEAD_LINKS` on, the watchdog looks at every open issue (bac
 
 An agent can't change its own workspace during a run, but it can schedule one for its next run (`PUT /api/issues/:id/workspace`). The agent instructions in this setup have an engineer do that when its branch carries another issue's pull request, instead of asking you. It then leaves the issue in `todo`, and nothing starts the next run.
 
-With `WATCHDOG_CLEAR_DEAD_LINKS` on, the watchdog looks at `todo` issues touched in the last day that have been quiet for the stall window. If one has a workspace selection waiting for its next run, no run in progress and no wake pending, it comments, which wakes the assignee on its new workspace. It nudges at most `WATCHDOG_MAX_NUDGES` times per scheduled selection.
+With `WATCHDOG_CLEAR_DEAD_LINKS` on, the watchdog looks at `todo` issues touched in the last day that have been quiet for the stall window. If one has a workspace selection waiting for its next run, no run in progress, no wake pending and no card waiting on a person (answering that wakes the assignee anyway), it comments, which wakes the assignee on its new workspace. It nudges at most `WATCHDOG_MAX_NUDGES` times per scheduled selection.
 
 ## 10. Question cards addressed to a teammate
 
@@ -238,7 +250,7 @@ If you'd rather the work went back to the implementer, there are two ways:
 
 Paperclip counts a blocker as resolved only when it is **done**. A cancelled blocker stays unresolved until someone removes or replaces it in **Blocked by**, so the dependent stays blocked and nothing wakes its agent. Often the work landed elsewhere (another issue's PR carried the fix) and nobody updated the link.
 
-With `WATCHDOG_CANCELLED_BLOCKERS` on, once such an issue has been quiet for the stall window, the watchdog comments on it once, which wakes its agent: which blockers were cancelled, each one's last comment (usually why it was cancelled), and what to do. If the work landed elsewhere or isn't needed, remove the blocker (and link what replaced it); if it is still needed, say so and ask for a replacement. It waits while the agent is paused, terminated or awaiting approval, or a run is active or a wake pending on the issue.
+With `WATCHDOG_CANCELLED_BLOCKERS` on, once such an issue has been quiet for the stall window, the watchdog comments on it once, which wakes its agent: which blockers were cancelled, each one's last comment (usually why it was cancelled), and what to do. If the work landed elsewhere or isn't needed, remove the blocker (and link what replaced it); if it is still needed, say so and ask for a replacement. It waits while the agent is paused, terminated or awaiting approval, a run is active or a wake pending on the issue, or a card on the issue waits on a person: the answer wakes the agent.
 
 ## 15. Issues blocked while their agent was paused
 

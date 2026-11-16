@@ -39,6 +39,18 @@ export const pausedRefusal = (err) => err?.status === 409 && /paused/i.test(err?
 export const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
 // Run statuses that are over, one way or another.
 export const TERMINAL_RUN = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
+// Paperclip's record that a blocker done woke a dependent's assignee
+// (issue.blockers_resolved_wake_emitted, on the dependent, with the woken agentId and
+// details.wakeupRunId: the run the wake made, null when it was deferred or skipped).
+// The latest in an issue's activity (newest first) logged at or after `since` (ms), or null.
+export const BLOCKERS_WAKE_ACTION = "issue.blockers_resolved_wake_emitted";
+export function blockersWakeOf(activity, since = 0) {
+  return (Array.isArray(activity) ? activity : []).find((a) => a?.action === BLOCKERS_WAKE_ACTION && ts(a.createdAt) >= since) ?? null;
+}
+// A run that got under way: not one Paperclip cancelled before it started (refused at a
+// hold, or on a hand-off), nor one still waiting to start.
+export const ranRun = (r) =>
+  Boolean(r) && !["queued", "scheduled_retry"].includes(r.status) && !(r.status === "cancelled" && (!r.startedAt || r.errorCode === "execution_reconciliation_required"));
 // Issue statuses that are finished: nothing more happens on them.
 export const CLOSED_STATUSES = new Set(["done", "cancelled"]);
 // How a pull request is named in notes and comments.
