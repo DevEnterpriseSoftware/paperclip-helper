@@ -449,9 +449,13 @@ test("when Paperclip doesn't answer about the run's issue, the run waits for the
   const env = await syncEnv(t);
   const eng = addProject(env);
   env.issue.projectId = eng.id;
-  env.fake.fail("GET", `/api/issues/${env.issue.id}`, 500, { times: 2 }); // a GET is retried once
+  // Unreadable for the whole first pass: every run on the issue asks for it (a failed read
+  // isn't cached), and which asks first depends on the order Paperclip lists them in.
+  env.fake.fail("GET", `/api/issues/${env.issue.id}`, 500, { times: 100 });
   await env.sync.tick();
   assert.equal(byRun(env.db).has(env.runs.claude.id), false);
+  assert.equal(env.db.costEvents.filter((e) => e.issueId === env.issue.id).length, 0, "no run on the issue posted without its project");
+  env.fake.clearFailures();
   await env.sync.tick();
   assert.equal(byRun(env.db).get(env.runs.claude.id).projectId, eng.id);
 });
