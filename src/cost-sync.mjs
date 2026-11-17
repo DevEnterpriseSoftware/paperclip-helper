@@ -40,8 +40,11 @@ const unknown = (v) => !v || v === "unknown";
 // How far a Claude run's token price must exceed its reported cost before the
 // reported cost is taken as wrong: wide, so price-table slack never raises a run.
 const RAISE_MARGIN = 0.1;
-// Codex models whose fast mode Paperclip applies (codex-local, CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS).
-const CODEX_FAST_MODELS = new Set(["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]);
+// Codex models whose fast mode Paperclip applies (codex-local, CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS,
+// plus models newer than the Paperclip release, which it passes fast mode through for).
+const CODEX_FAST_MODELS = new Set(["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4"]);
+// How many of the issues in no project `pch costs` names.
+const NAMED_LOOSE_ISSUES = 5;
 // A run whose post keeps ending with an unknown outcome is given up after this many retries.
 const MAX_INFLIGHT_RETRIES = 5;
 // A refusal of the board key itself: every later request would fail the same way.
@@ -772,23 +775,40 @@ export function createCostSync(ctx) {
   }
 
   // Where the posts will land on the Costs page's "By project": each project's
-  // runs and cost, and "no project" for runs with none (a timer run, say).
+  // runs and cost, and "no project" for runs with none (a timer run, say). When the
+  // company has projects, the issues behind "no project" are named, costliest first:
+  // an issue created without a project (and every child issue of it) leaves all its
+  // runs' costs unattributed, Paperclip's own cost events included.
   async function printByProject(companyId, postable, print) {
     if (!postable.length) return;
     const rows = new Map();
-    for (const i of postable) {
-      const key = i.post.projectId ?? "";
-      const row = rows.get(key) ?? { runs: 0, usd: 0 };
+    const loose = new Map(); // issue id → { runs, usd } for runs with an issue but no project
+    const add = (map, key, usd) => {
+      const row = map.get(key) ?? { runs: 0, usd: 0 };
       row.runs += 1;
-      row.usd += i.usd;
-      rows.set(key, row);
+      row.usd += usd;
+      map.set(key, row);
+    };
+    for (const i of postable) {
+      add(rows, i.post.projectId ?? "", i.usd);
+      if (!i.post.projectId && i.post.issueId) add(loose, i.post.issueId, i.usd);
     }
     const projects = await api.request("GET", `/api/companies/${companyId}/projects`).catch(() => null);
     const names = new Map((Array.isArray(projects) ? projects : []).map((p) => [p.id, p.name]));
+    const runs = (n) => `${n} run${n === 1 ? "" : "s"}`;
     const parts = [...rows]
       .sort((a, b) => b[1].usd - a[1].usd)
-      .map(([id, row]) => `${id ? names.get(id) ?? id : "no project"} $${row.usd.toFixed(2)} (${row.runs} run${row.runs === 1 ? "" : "s"})`);
+      .map(([id, row]) => `${id ? names.get(id) ?? id : "no project"} $${row.usd.toFixed(2)} (${runs(row.runs)})`);
     print(`  by project: ${parts.join(", ")}`);
+    if (!loose.size || !names.size) return;
+    const top = [...loose].sort((a, b) => b[1].usd - a[1].usd);
+    const named = [];
+    for (const [id, row] of top.slice(0, NAMED_LOOSE_ISSUES)) {
+      const issue = await recordOf(`/api/issues/${id}`);
+      named.push(`${issue?.identifier ?? id} $${row.usd.toFixed(2)} (${runs(row.runs)})`);
+    }
+    const more = top.length > named.length ? `, and ${top.length - named.length} more` : "";
+    print(`  issues in no project: ${named.join(", ")}${more}. Give them a project so their later runs land under it; a child issue takes its parent's.`);
   }
 
   // `costs --retry-skipped`: queues the skipped runs that can be posted again for

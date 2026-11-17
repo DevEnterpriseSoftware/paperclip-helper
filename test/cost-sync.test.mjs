@@ -505,3 +505,27 @@ test("the preview shows where the runs land by project, and counts them toward p
   assert.match(text, /budget "Engineering" \(project, lifetime\): \$0\.00 → \$9\.28 of \$5\.00\. WARNING: this reaches the hard stop, so Paperclip would pause the project\./);
   assert.equal(env.db.costEvents.length, 0);
 });
+
+test("the preview names the issues in no project behind \"no project\"", async (t) => {
+  const env = await syncEnv(t);
+  const eng = addProject(env, "Engineering");
+  const loose = env.issue; // created without a project
+  loose.identifier ??= "ACM-1";
+  delete loose.projectId;
+  const text = (await captureOutput(() => env.sync.preview())).join("\n");
+  assert.match(text, /by project: no project \$11\.80 \(5 runs\)/);
+  assert.match(text, new RegExp(`issues in no project: ${loose.identifier} \\$11\\.80 \\(5 runs\\)\\. Give them a project`));
+
+  // Once the issue has a project, nothing is named.
+  loose.projectId = eng.id;
+  const after = (await captureOutput(() => env.sync.preview())).join("\n");
+  assert.doesNotMatch(after, /issues in no project/);
+});
+
+test("the preview names no issues when the company has no projects", async (t) => {
+  const env = await syncEnv(t);
+  delete env.issue.projectId;
+  const text = (await captureOutput(() => env.sync.preview())).join("\n");
+  assert.match(text, /by project: no project/);
+  assert.doesNotMatch(text, /issues in no project/);
+});

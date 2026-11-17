@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.17.3
+
+GPT-6.2 Astra and GPT-6.2 Sol are priced, so Codex agents moved to them keep their costs synced. Deploy this before you move any agent. Now:
+
+- **Prices for `gpt-6.2-astra` and `gpt-6.2-sol`**, from OpenAI's pricing page on 2026-11-17: Astra $8 input, $0.40 cached, $10 cache write (30 minutes), $40 output per million tokens; Sol $2, $0.10, $2.50 and $10, the same as GPT-6.1 Sol. Both are in the fast-mode list too, so a fast run on either is doubled. `gpt-5.4`, which Paperclip also runs in fast mode, is added to that list. GPT-5.6 Sol's promotional price now runs until 2026-11-30. Long-context prices (over 272K input tokens) still aren't applied: a run's totals don't say which requests were long. [docs/cost-sync.md](docs/cost-sync.md)
+- **`pch set-model` warns before it moves a Codex agent to a model cost sync can't price.** Codex reports only tokens, so such an agent's runs would wait unsynced (`no price for …`) until a price is added. The warning says so once, names the prices file, and the move goes ahead. Claude agents report their own cost, so they aren't checked. [docs/commands.md](docs/commands.md#set-model-every-model-and-effort-level)
+- **`pch costs` names the issues behind "no project".** Every run on an issue in no project is unattributed on the Costs page, Paperclip's own cost events included, and so is every child issue of it, since a child takes its parent's project. An agent that creates an issue without a `projectId` is enough. The preview now lists such issues under the by-project line, costliest first (the top five, then a count), with what to do: `issues in no project: ACM-12 $41.20 (9 runs), …`. Nothing is named when the company has no projects. [docs/cost-sync.md](docs/cost-sync.md#which-project-a-cost-lands-under), and a fuller row in [docs/troubleshooting.md](docs/troubleshooting.md).
+- **Tests:** 630 in all. New: the GPT-6.2 prices; Sol and Astra runs priced by their recorded model and by the agent's configured one; fast mode doubled on both; `set-model`'s warning for Codex agents moved to an unpriced model (once, with the move still made), none for a priced model, one in `prices.json`, Claude agents, or with cost sync off; the preview naming an issue in no project, and naming nothing once it has one or when the company has no projects.
+
 ## 1.17.2
 
 One model's own usage limit no longer pauses every Claude agent on the subscription. Max and Ultra plans have two weekly limits: one across all models, and a separate one for Fable. When an agent on Fable used up the Fable limit, watchdog 16 took it for the subscription's limit and paused every Claude agent on that subscription until it reset, up to a week, although agents on other models still had their all-models allowance. Now:

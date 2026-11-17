@@ -11,7 +11,7 @@ For each finished subscription run, cost sync posts one extra cost event with th
   - Raised and token-priced events are posted as `estimated`. A Paperclip that has no such status (it came with Paperclip's durable accounting; 2026.1012.0 and the stable releases before it take only `reported` and `unpriced`) refuses that with a `400`; cost sync then posts the event again as `reported`, and keeps doing so until it restarts. `unpriced` would say no cost is known.
 - **Codex** (`codex_local`) reports only tokens. The cost is estimated from the run's model and OpenAI's list prices: fresh input, cache reads at the cached rate, cache writes (when the ACP engine reports them) at the write rate, output, and fast mode doubled.
   - Paperclip 2026.10 and later store Codex's input net of cache reads and mark such runs (`rawInputIncludesCached: false`); older runs, without the mark, included them. Both are handled.
-- The price table ([`src/prices.mjs`](../src/prices.mjs)) was checked against [OpenAI's](https://developers.openai.com/api/docs/pricing) published prices on 2026-10-24 and [Anthropic's](https://platform.claude.com/docs/en/about-claude/pricing) on 2026-11-09.
+- The price table ([`src/prices.mjs`](../src/prices.mjs)) was checked against [OpenAI's](https://developers.openai.com/api/docs/pricing) published prices on 2026-11-17 and [Anthropic's](https://platform.claude.com/docs/en/about-claude/pricing) on 2026-11-09.
   - Add or override models with a `prices.json` in the data directory.
   - A run with no recorded model (or Claude's `mixed`) is priced with the agent's configured model. Codex runs on the default model with no model configured either: set `CODEX_DEFAULT_MODEL` to price them; otherwise they're skipped.
 
@@ -27,7 +27,7 @@ Paperclip's Costs page puts a cost event under a project only by the event's own
 2. the run's context (`contextSnapshot.projectId`);
 3. on a Paperclip without ledger scopes, the project of the run's issue now, read once per issue per pass. If Paperclip doesn't answer, the run waits for the next pass rather than be posted without its project.
 
-A run with no issue and no project (a timer run, say) is posted without one and shows as *Unattributed*. If Paperclip no longer has the run's project or issue, the event is posted without that one and keeps the other. The run's billing code, when it has one, goes on the event too.
+A run with no issue and no project (a timer run, say) is posted without one and shows as *Unattributed*. So is every run on an issue that is in no project: an agent that creates an issue without a `projectId` leaves it, and every child issue of it (a child takes its parent's project), outside every project, and Paperclip's own cost events for those runs are unattributed too. `pch costs` names such issues under the by-project line (`issues in no project: ACM-12 $41.20 (9 runs), …`), costliest first. Give them a project and their later runs land under it; costs already recorded stay where they are. If Paperclip no longer has the run's project or issue, the event is posted without that one and keeps the other. The run's billing code, when it has one, goes on the event too.
 
 Events posted by 1.15.2 and earlier carry no `projectId`, so their costs stay under *Unattributed*: Paperclip's API can't change an event once it's posted.
 

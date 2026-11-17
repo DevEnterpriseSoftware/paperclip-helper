@@ -8,6 +8,7 @@ import { createGitHub, tokenSource } from "./github.mjs";
 import { companyAgents, companyPrefixes } from "./paperclip.mjs";
 import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, pausedRefusal, plural, signed } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
+import { loadPrices, priceFor } from "./prices.mjs";
 import { blocked as blockedReport } from "./blocked.mjs";
 import {
   actsAsUser, claimedOnly, continuationText, continuePausedHold, CONVERSATION_ADAPTERS, defaultOutcome, handOnRoute, handOnText, heldReviewRoute, holdFacts,
@@ -875,6 +876,7 @@ export async function setModel(ctx, from, to, { apply = false } = {}) {
     out(`No agent uses ${from}.`);
     return;
   }
+  unpricedWarning(ctx, targets, to);
   let problems = 0;
   for (const a of targets) {
     const before = a.adapterConfig ?? {};
@@ -894,6 +896,18 @@ export async function setModel(ctx, from, to, { apply = false } = {}) {
   }
   if (!apply) out(`\n${targets.length} agent(s). Run again with --apply to change them.`);
   if (problems) throw new Error(`${problems} agent(s) need checking: see the lines marked CHECK.`);
+}
+
+// Codex reports only tokens, so cost sync prices its runs from the price table. A
+// Codex agent moved to a model the table doesn't have would have its runs left
+// unsynced: say so before the move, with what to do.
+function unpricedWarning(ctx, agents, model) {
+  if (!ctx.config.costSync || !agents.some((a) => a.adapterType === "codex_local")) return;
+  if (priceFor(loadPrices(ctx.config.costPricesFile, ctx.log), model)) return;
+  out(
+    `Cost sync has no price for ${model}: the Codex agents' runs on it won't be synced until it has one. ` +
+      `Update the helper to a release that prices it (pch update), or add it to ${ctx.config.costPricesFile} (docs/cost-sync.md).\n`,
+  );
 }
 
 // ---------------------------------------------------------------- usage

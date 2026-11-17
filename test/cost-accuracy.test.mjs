@@ -61,9 +61,9 @@ test("pch usage counts fresh input the same way", () => {
   assert.deepEqual(tokensOf(legacy, "codex_local"), { input: 100_000, cached: 900_000, output: 1 });
 });
 
-test("the price table matches the published list prices (Anthropic checked 2026-11-09, OpenAI 2026-10-24)", () => {
+test("the price table matches the published list prices (Anthropic checked 2026-11-09, OpenAI 2026-11-17)", () => {
   const p = (m) => {
-    const { input, cachedInput, cacheWrite, output } = priceFor(BUILTIN_PRICES, m, "2026-11-09");
+    const { input, cachedInput, cacheWrite, output } = priceFor(BUILTIN_PRICES, m, "2026-11-17");
     return [input, cachedInput, cacheWrite, output];
   };
   // platform.claude.com/docs/en/about-claude/pricing: input, cache hit, 5m write, output.
@@ -73,8 +73,26 @@ test("the price table matches the published list prices (Anthropic checked 2026-
   assert.deepEqual(p("claude-mythos-5-2"), [8, 0.2, 10, 40]);
   assert.deepEqual(p("claude-fable-5-1"), [10, 0.25, 12.5, 50]);
   // developers.openai.com/api/docs/pricing: input, cached, 30m write, output.
+  assert.deepEqual(p("gpt-6.2-astra"), [8, 0.4, 10, 40]);
+  assert.deepEqual(p("gpt-6.2-sol"), [2, 0.1, 2.5, 10]);
+  assert.deepEqual(p("gpt-6-astra"), [10, 1, 12.5, 50]);
   assert.deepEqual(p("gpt-6.1-sol"), [2, 0.1, 2.5, 10]);
   assert.deepEqual(p("gpt-6-luna"), [0.1, 0.01, 0.125, 0.5]);
+});
+
+test("GPT-6.2 runs are priced, by their own model or the agent's", async (t) => {
+  const e = await env(t);
+  const sol = e.agent("Sol", "codex_local", { model: "gpt-6.2-sol" });
+  const astra = e.agent("Astra", "codex_local", { model: "gpt-6.2-astra" });
+  const tokens = { inputTokens: 100_000, cachedInputTokens: 900_000, outputTokens: 50_000, rawInputIncludesCached: false };
+  const s = e.run(sol.id, sub({ provider: "openai", model: "gpt-6.2-sol", ...tokens }), { resultJson: { fastMode: false } });
+  const a = e.run(astra.id, sub({ provider: "openai", model: "unknown", ...tokens }), { resultJson: { fastMode: false } });
+  await e.sync.tick();
+  // Sol: 0.1M × $2 + 0.9M × $0.10 + 0.05M × $10 = 0.20 + 0.09 + 0.50 = $0.79.
+  assert.equal(e.posted().get(s.id).costCents, 79);
+  // Astra: 0.1M × $8 + 0.9M × $0.40 + 0.05M × $40 = 0.80 + 0.36 + 2.00 = $3.16.
+  assert.equal(e.posted().get(a.id).costCents, 316);
+  assert.equal(e.posted().get(a.id).model, "gpt-6.2-astra");
 });
 
 // ------------------------------------------------------------------ Codex
@@ -207,6 +225,18 @@ test("Codex on ACP: requested fast mode is doubled only on a model that has it",
   const r = e.run(codex.id, sub({ provider: "openai", model: "gpt-5.3-codex", inputTokens: 1_000_000, cachedInputTokens: 0, outputTokens: 0, rawInputIncludesCached: false }), { resultJson: { fastMode: true } });
   await e.sync.tick();
   assert.equal(e.posted().get(r.id).costCents, 175, "1M × $1.75, not doubled");
+});
+
+test("Codex on ACP: fast mode on GPT-6.2 is doubled", async (t) => {
+  const e = await env(t);
+  const sol = e.agent("Sol", "codex_local", { model: "gpt-6.2-sol", fastMode: true });
+  const astra = e.agent("Astra", "codex_local", { model: "gpt-6.2-astra", fastMode: true });
+  const one = { inputTokens: 1_000_000, cachedInputTokens: 0, outputTokens: 0, rawInputIncludesCached: false };
+  const s = e.run(sol.id, sub({ provider: "openai", model: "gpt-6.2-sol", ...one }), { resultJson: { fastMode: true } });
+  const a = e.run(astra.id, sub({ provider: "openai", model: "gpt-6.2-astra", ...one }), { resultJson: { fastMode: true } });
+  await e.sync.tick();
+  assert.equal(e.posted().get(s.id).costCents, 400, "1M × $2, doubled");
+  assert.equal(e.posted().get(a.id).costCents, 1600, "1M × $8, doubled");
 });
 
 // ------------------------------------------------------------------ idempotency

@@ -24,18 +24,20 @@
 import fs from "node:fs";
 
 export const BUILTIN_PRICES = {
-  checked: "2026-11-09", // Anthropic; OpenAI last checked 2026-10-24
+  checked: "2026-11-17", // OpenAI; Anthropic last checked 2026-11-09
   sources: {
     openai: "https://developers.openai.com/api/docs/pricing",
     anthropic: "https://platform.claude.com/docs/en/about-claude/pricing",
   },
   models: {
     // OpenAI. cacheWrite is the 30-minute write price.
+    "gpt-6.2-astra": [{ from: "2026-11-17", input: 8, cachedInput: 0.4, cacheWrite: 10, output: 40 }],
+    "gpt-6.2-sol": [{ from: "2026-11-17", input: 2, cachedInput: 0.1, cacheWrite: 2.5, output: 10 }],
     "gpt-6-astra": [{ from: "2026-01-01", input: 10, cachedInput: 1, cacheWrite: 12.5, output: 50 }],
     "gpt-6.1-sol": [{ from: "2026-01-01", input: 2, cachedInput: 0.1, cacheWrite: 2.5, output: 10 }],
     "gpt-6-sol": [{ from: "2026-01-01", input: 2, cachedInput: 0.2, cacheWrite: 2.5, output: 10 }],
     "gpt-6-luna": [{ from: "2026-01-01", input: 0.1, cachedInput: 0.01, cacheWrite: 0.125, output: 0.5 }],
-    // Promotional price, announced as lasting at least through 2026-11-21.
+    // Promotional price, announced as lasting until 2026-11-30.
     "gpt-5.6-sol": [{ from: "2026-01-01", input: 4, cachedInput: 0.4, cacheWrite: 5, output: 20 }],
     "gpt-5.6-terra": [{ from: "2026-01-01", input: 2, cachedInput: 0.2, output: 12 }],
     "gpt-5.6-luna": [{ from: "2026-01-01", input: 0.2, cachedInput: 0.02, output: 1.2 }],

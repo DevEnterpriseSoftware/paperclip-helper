@@ -37,6 +37,47 @@ test("set-model previews, then changes only the model and keeps everything else"
   assert.equal(lines.filter((l) => l.startsWith("changed")).length, 2);
 });
 
+test("set-model warns before moving Codex agents to a model cost sync can't price", async (t) => {
+  const env = await setup();
+  t.after(env.close);
+  const make = (name, model) => {
+    const a = { id: uuid(), companyId: ids.company, name, adapterType: "codex_local", adapterConfig: { model, modelReasoningEffort: "high" }, status: "idle" };
+    env.db.agents.push(a);
+    return a;
+  };
+  const a = make("Cody", "gpt-6.1-sol");
+  make("Rex", "gpt-6.1-sol");
+
+  const priced = (await captureOutput(() => cmd.setModel(env.ctx, "gpt-6.1-sol", "gpt-6.2-sol"))).join("\n");
+  assert.doesNotMatch(priced, /no price/);
+  assert.match(priced, /would change Cody: gpt-6.1-sol → gpt-6.2-sol \(effort high kept\)/);
+
+  const unpriced = await captureOutput(() => cmd.setModel(env.ctx, "gpt-6.1-sol", "gpt-9-sol", { apply: true }));
+  assert.match(unpriced[0], /Cost sync has no price for gpt-9-sol: the Codex agents' runs on it won't be synced until it has one/);
+  assert.match(unpriced[0], /prices\.json/);
+  assert.equal(unpriced.filter((l) => /no price/.test(l)).length, 1, "said once, not per agent");
+  assert.equal(a.adapterConfig.model, "gpt-9-sol", "the warning doesn't stop the move");
+
+  // A model in the data directory's prices.json is priced.
+  fs.writeFileSync(env.ctx.config.costPricesFile, JSON.stringify({ models: { "gpt-9-sol": [{ from: "2026-01-01", input: 1, cachedInput: 0.1, output: 5 }] } }));
+  const own = (await captureOutput(() => cmd.setModel(env.ctx, "gpt-9-sol", "gpt-6.2-sol"))).join("\n");
+  assert.doesNotMatch(own, /no price/);
+  make("Lex", "gpt-6.2-sol");
+  const back = (await captureOutput(() => cmd.setModel(env.ctx, "gpt-6.2-sol", "gpt-9-sol"))).join("\n");
+  assert.doesNotMatch(back, /no price/);
+});
+
+test("set-model says nothing about prices for Claude agents or with cost sync off", async (t) => {
+  const env = await setup();
+  t.after(env.close);
+  agents(env.db);
+  const claude = (await captureOutput(() => cmd.setModel(env.ctx, "claude-opus-5", "claude-opus-9"))).join("\n");
+  assert.doesNotMatch(claude, /no price/);
+  env.db.agents.push({ id: uuid(), companyId: ids.company, name: "Cody", adapterType: "codex_local", adapterConfig: { model: "gpt-6.1-sol" }, status: "idle" });
+  const off = (await captureOutput(() => cmd.setModel(env.makeCtx({ COST_SYNC: "false" }), "gpt-6.1-sol", "gpt-9-sol"))).join("\n");
+  assert.doesNotMatch(off, /no price/);
+});
+
 test("set-model flags an agent that lost settings", async (t) => {
   const env = await setup();
   t.after(env.close);
