@@ -6,7 +6,7 @@ import path from "node:path";
 import { readStatus, serviceLive } from "./instance.mjs";
 import { createGitHub, tokenSource } from "./github.mjs";
 import { companyAgents, companyPrefixes } from "./paperclip.mjs";
-import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, pausedRefusal, plural, signed } from "./util.mjs";
+import { approvalWaitingOn, COMMAND_SIGNATURE, DECISION_STATUS, effortOf, harnessOf, onRunner, pausedRefusal, plural, signed } from "./util.mjs";
 import { createCostSync } from "./cost-sync.mjs";
 import { loadPrices, priceFor } from "./prices.mjs";
 import { blocked as blockedReport } from "./blocked.mjs";
@@ -33,7 +33,7 @@ import { answerFor, findCard } from "./answer.mjs";
 export { why } from "./why.mjs";
 import { excerpt } from "./advice.mjs";
 import { findReady } from "./ready.mjs";
-import { COUNTERS, minutesSaved, readMetrics } from "./metrics.mjs";
+import { COUNTERS, clearProblems as clearMetricsProblems, minutesSaved, readMetrics } from "./metrics.mjs";
 import { colours } from "./colour.mjs";
 
 export const USAGE = `Paperclip Helper: fixes what a self-hosted Paperclip doesn't recover from by itself.
@@ -41,7 +41,8 @@ export const USAGE = `Paperclip Helper: fixes what a self-hosted Paperclip doesn
 Usage: pch <command>
 
 What's going on
-  status                     what the running helper is doing, and when its key expires
+  status [--clear-problems]  what the running helper is doing, and when its key expires
+                             (--clear-problems: clear the warnings and errors it lists)
   why ISSUE [--prompt]       why nobody is working on an issue, and what to do about it
                              (--prompt: the same as a prompt for an LLM chat)
   blocked                    what every blocked issue waits on, and every question card waiting
@@ -841,12 +842,17 @@ async function listAgents(ctx) {
 }
 
 
+// An agent's adapter for a listing: the legacy adapter's type, or "runner:" and the
+// harness for an agent on the Paperclip Runner ("runner:claude", "runner:codex").
+export const adapterLabel = (agent) =>
+  onRunner(agent) ? `runner:${String(harnessOf(agent)).replace(/_local$/, "")}` : String(agent?.adapterType ?? "");
+
 export async function models(ctx) {
   const agents = await listAgents(ctx);
   for (const a of agents.sort((x, y) => String(x.name).localeCompare(String(y.name)))) {
     const cfg = a.adapterConfig ?? {};
     out(
-      `${String(a.name).padEnd(16)} ${String(a.adapterType ?? "").padEnd(14)} ${String(cfg.model ?? "(default)").padEnd(20)} ` +
+      `${String(a.name).padEnd(16)} ${adapterLabel(a).padEnd(14)} ${String(cfg.model ?? "(default)").padEnd(20)} ` +
         `${String(effortOf(cfg)).padEnd(8)} ${a.status ?? ""}${pauseDetail(a)}`,
     );
   }
@@ -902,7 +908,7 @@ export async function setModel(ctx, from, to, { apply = false } = {}) {
 // Codex agent moved to a model the table doesn't have would have its runs left
 // unsynced: say so before the move, with what to do.
 function unpricedWarning(ctx, agents, model) {
-  if (!ctx.config.costSync || !agents.some((a) => a.adapterType === "codex_local")) return;
+  if (!ctx.config.costSync || !agents.some((a) => harnessOf(a) === "codex_local")) return;
   if (priceFor(loadPrices(ctx.config.costPricesFile, ctx.log), model)) return;
   out(
     `Cost sync has no price for ${model}: the Codex agents' runs on it won't be synced until it has one. ` +
@@ -1040,7 +1046,16 @@ function expiryLevel(key) {
 // `pch status`: one section per component, a blank line between them and around
 // the whole. On a terminal, what is on is green, what is off yellow, errors and a
 // stopped service red, warnings and slow timings yellow (or red when very slow).
-export async function status(ctx) {
+export async function status(ctx, { clearProblems: clear = false } = {}) {
+  if (clear) {
+    const was = clearMetricsProblems(ctx.config);
+    if (!was) out("No problems recorded yet: the helper service hasn't written data/metrics.json.");
+    else {
+      out(`Cleared ${plural(was.warnings, "warning")} and ${plural(was.errors, "error")} from the status. The all-time counts are kept.`);
+      if (serviceLive(readStatus(ctx.config))) out("The running service drops its own copy at its next heartbeat (within 30 seconds).");
+    }
+    return;
+  }
   const paint = colours();
   const { red, green, yellow, bold } = paint;
   const label = (name) => bold(name);
@@ -1173,7 +1188,8 @@ function showMetrics(m, paint = colours({ enabled: false })) {
   const recent = Array.isArray(m.recent) ? m.recent : [];
   const warnings = plural(m.warnings ?? 0, "warning");
   const errors = plural(m.errors ?? 0, "error");
-  out(`  Problems: ${m.warnings ? paint.yellow(warnings) : warnings}, ${m.errors ? paint.red(errors) : errors}${recent.length ? `. The latest ${recent.length}, newest last:` : "."}`);
+  const cleared = m.problemsClearedAt ? ` since they were cleared ${since(m.problemsClearedAt)}` : "";
+  out(`  Problems${cleared}: ${m.warnings ? paint.yellow(warnings) : warnings}, ${m.errors ? paint.red(errors) : errors}${recent.length ? `. The latest ${recent.length}, newest last:` : "."}`);
   for (const p of recent) {
     const line = `${p.level === "error" ? "ERROR" : "warn "}  ${p.msg}${p.detail ? ` (${p.detail})` : ""}`;
     out(`    ${since(p.at).replace(" UTC", "")}  ${p.level === "error" ? paint.red(line) : paint.yellow(line)}`);

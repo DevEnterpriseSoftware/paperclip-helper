@@ -111,6 +111,31 @@ export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 // Agent statuses Paperclip never invokes (agent-eligibility.ts): waking such an agent does nothing.
 export const asleep = (agent) => ["paused", "terminated", "pending_approval"].includes(agent?.status);
 
+// The Paperclip Runner's adapter type. An agent on it keeps its harness (Claude Code,
+// Codex, ...) in its adapter config instead of in adapterType.
+export const RUNNER_ADAPTER = "paperclip_runner";
+
+// The harness an agent runs, as its legacy adapter type ("claude_local",
+// "codex_local", ...), whether it is on the legacy adapter or the Paperclip Runner.
+// Mirrors Paperclip's own agentHarnessType (packages/shared/src/agent-runner.ts): a
+// Runner agent with no provider is Codex, "acpx" names its agent (Claude by default).
+export function harnessOf(agent) {
+  const type = agent?.adapterType ?? null;
+  if (type !== RUNNER_ADAPTER) return type;
+  const config = agent?.adapterConfig ?? {};
+  const provider = config.provider;
+  if (provider === undefined || provider === "codex") return "codex_local";
+  if (provider === "opencode") return "opencode_local";
+  if (provider === "acpx") {
+    const name = String(config.acpxAgent ?? "claude");
+    return { codex: "codex_local", claude: "claude_local", grok: "grok_local", cursor: "cursor", pi: "pi_local", kimi: "kimi_local" }[name] ?? `acpx:${name}`;
+  }
+  return String(provider);
+}
+
+// Whether the agent runs on the Paperclip Runner rather than a legacy adapter.
+export const onRunner = (agent) => agent?.adapterType === RUNNER_ADAPTER;
+
 // "1 issue", "3 issues".
 export const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 

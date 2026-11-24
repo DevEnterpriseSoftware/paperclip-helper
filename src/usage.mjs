@@ -14,7 +14,7 @@
 // From GET /api/companies/:id/heartbeat-runs?agentId= (usageJson, contextSnapshot
 // .wakeReason, invocationSource, status) and /costs/by-agent?from=&to= (costCents).
 
-import { effortOf, TERMINAL_RUN, ts } from "./util.mjs";
+import { effortOf, harnessOf, TERMINAL_RUN, ts } from "./util.mjs";
 import { companyAgents } from "./paperclip.mjs";
 import { splitTokens } from "./prices.mjs";
 
@@ -45,7 +45,7 @@ export function tokensOf(run, adapterType) {
 const FINISHED = TERMINAL_RUN;
 // What woke the run: its wake reason, else how it was invoked (assignment, timer, on demand).
 export const wakeOf = (run) => run.contextSnapshot?.wakeReason || run.invocationSource || "unknown";
-const providerOf = (agent) => ({ claude_local: "Anthropic", codex_local: "OpenAI" })[agent?.adapterType] ?? agent?.adapterType ?? "unknown";
+const providerOf = (agent) => ({ claude_local: "Anthropic", codex_local: "OpenAI" })[harnessOf(agent)] ?? harnessOf(agent) ?? "unknown";
 
 // Per-agent totals, wake reasons and flags from runs since `since` (ms) and the cost rows.
 export function summarize({ agents, runs, costs = [], since }) {
@@ -62,7 +62,7 @@ export function summarize({ agents, runs, costs = [], since }) {
     if (!row || ts(run.createdAt) < since || !FINISHED.has(run.status)) continue;
     row.runs += 1;
     if (run.status === "failed" || run.status === "timed_out" || run.status === "interrupted") row.failed += 1;
-    const t = tokensOf(run, row.agent.adapterType);
+    const t = tokensOf(run, harnessOf(row.agent));
     row.input += t.input;
     row.cached += t.cached;
     row.output += t.output;

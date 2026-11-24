@@ -17,6 +17,8 @@ For each finished subscription run, cost sync posts one extra cost event with th
 
 **What it never touches:** runs billed to an API key (`metered_api`), which already carry their real cost, and adapters not listed in `COST_SYNC_ADAPTERS`.
 
+**Agents on the Paperclip Runner** are synced as their harness: a Runner Claude agent as `claude_local`, a Runner Codex agent as `codex_local`. Only runs Paperclip marks `subscription_included` are synced, as for legacy agents, and the Runner marks fewer of them: a Claude run only when the agent authenticates with `CLAUDE_CODE_OAUTH_TOKEN`, and a Codex run on a ChatGPT sign-in not at all (its `billingType` is `unknown`). Runs marked `unknown` are left as Paperclip recorded them; their tokens are still on the runs, so they can be priced later.
+
 Each event has zero tokens (the run's own event counted them), the run's id, provider, biller and model, the run's issue, project and billing code, the run's finish time, and the idempotency key `pch-cost-sync:<run id>`. Token totals, run counts, the Costs page's *By project* and monthly totals therefore stay right.
 
 ### Which project a cost lands under
@@ -138,7 +140,7 @@ The service posts them on its next cost-sync pass (every 15 min); `pch status` s
 | `COST_SYNC` | `true` | `false` turns it off. The installer asks after showing `pch costs`. The manual install's `.env.example` ships it as `false`, so you preview first. |
 | `COST_SYNC_INTERVAL_SEC` | `900` | How often it posts (at least 60). |
 | `COST_SYNC_SINCE` | none | Only runs that finished after this ISO 8601 time. |
-| `COST_SYNC_ADAPTERS` | `claude_local,codex_local` | Agent adapters whose subscription runs are synced. |
+| `COST_SYNC_ADAPTERS` | `claude_local,codex_local` | Agent adapters whose subscription runs are synced. A Paperclip Runner agent counts as its harness. |
 | `CODEX_DEFAULT_MODEL` | none | The model to price Codex runs with when none was recorded. |
 | `COST_PRICES_FILE` | `/data/prices.json` | Your own prices; the format is in `src/prices.mjs`. |
 

@@ -616,7 +616,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
         if (hold?.cause === "legacy_execution_requires_reconciliation" && source?.errorCode === "agent_paused") {
           const owner = db.agents.find((a) => a.id === hold.agentId);
           const user = !/^agent/.test(db.meSource ?? "board_key");
-          const conversation = ["claude_local", "codex_local", "gemini_local", "cursor", "opencode_local"].includes(owner?.adapterType);
+          const conversation = ["claude_local", "codex_local", "gemini_local", "cursor", "opencode_local", "paperclip_runner"].includes(owner?.adapterType);
           if (user && owner && conversation && issue.assigneeAgentId === owner.id && !["paused", "terminated", "pending_approval"].includes(owner.status)) {
             issue.executionBlocker = null;
             db.continuations = [...(db.continuations ?? []), { issueId: issue.id, agentId: owner.id, commentId: comment.id }];

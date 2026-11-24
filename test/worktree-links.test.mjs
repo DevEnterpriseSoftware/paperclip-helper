@@ -402,6 +402,20 @@ test("worktrees --links --retry comments only on issues still parked, never on o
   void asleep;
 });
 
+test("worktrees --links --retry: a Runner agent's run is past setup on the Runner's own start event", async (t) => {
+  const e = await env(t);
+  const fixed = parked(e.db, e.builder, { worktree: "/srv/app/.paperclip/worktrees/ACM-11-work" });
+  // The Paperclip Runner logs no adapter.invoke: its run starts with its own events.
+  e.db.onReopen = (issue, run) => {
+    if (issue.id !== fixed.issue.id) return;
+    run.status = "running";
+    e.db.runEvents[run.id] = [{ seq: 1, eventType: "native.process_start_requested", payload: {} }];
+  };
+  const lines = await captureOutput(() => cmd.worktrees(e.ctx, { links: true, retry: true, waitMs: 2000, pollMs: 50 }));
+  process.exitCode = 0;
+  assert.match(lines.join("\n"), /^ {2}ACM-11 +running: past setup$/m);
+});
+
 test("--retry needs --links, and --links takes no other option", async (t) => {
   const e = await env(t);
   await assert.rejects(cmd.worktrees(e.ctx, { retry: true }), /--retry goes with --links/);

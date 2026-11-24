@@ -1582,13 +1582,23 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   async function tick() {
     const started = now();
     let failure = null;
+    // Paperclip itself unreachable (not running, restarting, the wrong address):
+    // every other check would fail the same way, so the rest of the tick is
+    // skipped and the log says so once, not once per check and company.
+    let unreachable = false;
     // One check failing (a listing Paperclip refused, say) skips only that check for
     // that company: the others still run, and the tick says what failed.
     const run = async (name, companyId, fn) => {
+      if (unreachable) return;
       try {
         await reads.within(name, fn);
       } catch (err) {
         failure ??= `${name}: ${err.message}`;
+        if (err?.code === "network") {
+          unreachable = true;
+          log.warn("watchdog: cannot reach Paperclip; skipping the rest of this tick", { check: name, company: companyId, error: err.message });
+          return;
+        }
         log.warn("watchdog: a check failed this tick", { check: name, company: companyId, error: err.message });
       }
     };
@@ -1597,6 +1607,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       const { companyIds = [] } = await ctx.identity();
       resumes.startTick();
       for (const companyId of companyIds) {
+        if (unreachable) break;
         let listed = true;
         const list = await companyAgents(api, companyId).catch(() => {
           listed = false;

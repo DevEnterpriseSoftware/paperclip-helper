@@ -29,7 +29,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { every, TERMINAL_RUN, UUID } from "./util.mjs";
+import { every, harnessOf, TERMINAL_RUN, UUID } from "./util.mjs";
 import { estimateUsd, loadPrices, normalizeModel, priceFor, splitTokens } from "./prices.mjs";
 import { readJson, writeJson } from "./store.mjs";
 import { companyAgents, describeIssues, validationIssues } from "./paperclip.mjs";
@@ -220,7 +220,7 @@ export function createCostSync(ctx) {
   // setting for models that don't support it). With neither record, the agent's
   // setting. null when Paperclip didn't answer: the run waits for the next pass.
   async function fastModeOf(run, agent, detail) {
-    if (agent?.adapterType !== "codex_local") return false;
+    if (harnessOf(agent) !== "codex_local") return false;
     // The ACP engine records the requested setting; Paperclip applies it only on models that have fast mode.
     if (typeof detail?.resultJson?.fastMode === "boolean") {
       const model = normalizeModel(run.usageJson?.model ?? agent?.adapterConfig?.model ?? "");
@@ -327,7 +327,10 @@ export function createCostSync(ctx) {
     // Stopped and failed runs often record no usage at all; nothing to sync.
     if (!u || typeof u !== "object") return null;
     if (u.billingType !== "subscription_included") return null; // API-key and other runs: Paperclip has the cost
-    const adapter = agent?.adapterType ?? null;
+    // The harness, so a Runner agent counts as the Claude or Codex agent it is. A Runner
+    // run its provider didn't report as a subscription run (billingType "unknown") was
+    // skipped above, as Paperclip records it.
+    const adapter = harnessOf(agent);
     if (!adapter || !config.costSyncAdapters.includes(adapter)) return null;
 
     const provider = unknown(u.provider) ? PROVIDER_OF[adapter] ?? "unknown" : u.provider;
@@ -883,7 +886,7 @@ export function createCostSync(ctx) {
         if (u?.billingType !== "subscription_included" || typeof u.costUsd !== "number" || !run.sessionIdBefore) continue;
         const prev = byAfter.get(run.sessionIdBefore);
         if (!prev || prev.id === run.id || typeof prev.usageJson?.costUsd !== "number") continue;
-        const adapter = agents.get(run.agentId)?.adapterType ?? "?";
+        const adapter = harnessOf(agents.get(run.agentId)) ?? "?";
         const row = byAdapter.get(adapter) ?? { pairs: 0, notLess: 0 };
         row.pairs += 1;
         if (u.costUsd >= prev.usageJson.costUsd) row.notLess += 1;
@@ -915,7 +918,7 @@ export function createCostSync(ctx) {
   // tokens with the cache reads subtracted from the input a second time, cache writes
   // as input. `detail` is the run's own record (undefined when it couldn't be read).
   async function auditFigures(run, agent, u, detail, table) {
-    const adapter = agent.adapterType;
+    const adapter = harnessOf(agent);
     const provider = unknown(u.provider) ? PROVIDER_OF[adapter] ?? "unknown" : u.provider;
     const tokens = splitTokens(u, adapter, detail?.resultJson?.usage);
     const fast = adapter === "codex_local" ? (await fastModeOf(run, agent, detail)) === true : false;
@@ -965,7 +968,7 @@ export function createCostSync(ctx) {
         const u = run.usageJson;
         if (u?.billingType !== "subscription_included") continue;
         const agent = await agentOf(agents, run.agentId);
-        if (!agent || !config.costSyncAdapters.includes(agent.adapterType)) continue;
+        if (!agent || !config.costSyncAdapters.includes(harnessOf(agent))) continue;
         picked.push({ run, agent, u, period: at < edges[1] ? 0 : 1 });
       }
       for (let i = 0; i < picked.length; i += 6) {
@@ -1040,7 +1043,7 @@ export function createCostSync(ctx) {
         const u = run.usageJson;
         if (u?.billingType !== "subscription_included") continue;
         const agent = await agentOf(agents, run.agentId);
-        if (!agent || !config.costSyncAdapters.includes(agent.adapterType)) continue;
+        if (!agent || !config.costSyncAdapters.includes(harnessOf(agent))) continue;
         picked.push({ run, agent, u });
       }
       // Each run's own record, a few at a time.
@@ -1056,7 +1059,7 @@ export function createCostSync(ctx) {
       const floorOfCompany = floorOf(state, companyId);
       let unreadable = 0;
       for (const { run, agent, u, detail } of picked) {
-        const adapter = agent.adapterType;
+        const adapter = harnessOf(agent);
         if (detail === undefined) unreadable += 1;
         const { provider, tokens, tokenUsd, reported, posts, basis } = await auditFigures(run, agent, u, detail, table);
 

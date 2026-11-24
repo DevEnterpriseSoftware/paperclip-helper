@@ -7,6 +7,11 @@
 // file again, so nothing has to count twice. Warnings and errors are counted as
 // they're logged, and the last RECENT of them kept. A process killed between two
 // heartbeats loses at most one heartbeat's counts. It's a rough record, not an audit.
+//
+// `pch status --clear-problems` clears the warnings and errors (not the counts) from
+// another process: it writes the file with them emptied and a problemsClearedAt, and
+// the running service, which would otherwise write its own back at the next heartbeat,
+// sees the newer problemsClearedAt there and drops everything logged before it.
 
 import path from "node:path";
 import { readJson, writeJson } from "./store.mjs";
@@ -91,8 +96,20 @@ export function createMetrics(config, { version = "", now = () => Date.now() } =
     warnings: saved.warnings ?? 0,
     errors: saved.errors ?? 0,
     recent: Array.isArray(saved.recent) ? saved.recent.slice(-RECENT) : [],
+    problemsClearedAt: saved.problemsClearedAt ?? null,
     updatedAt: at(),
   };
+
+  // Problems cleared by `pch status --clear-problems` since this process last wrote
+  // the file: keep only what was logged after, and count from those.
+  function clearedSince(onDisk) {
+    const cleared = onDisk?.problemsClearedAt;
+    if (!cleared || cleared === data.problemsClearedAt) return;
+    data.problemsClearedAt = cleared;
+    data.recent = data.recent.filter((p) => p.at > cleared);
+    data.warnings = data.recent.filter((p) => p.level !== "error").length;
+    data.errors = data.recent.filter((p) => p.level === "error").length;
+  }
 
   return {
     data,
@@ -110,9 +127,21 @@ export function createMetrics(config, { version = "", now = () => Date.now() } =
       data.updatedAt = at();
     },
     save() {
+      clearedSince(readJson(file, null));
       writeJson(file, data);
     },
   };
+}
+
+// `pch status --clear-problems`: empties the warnings and errors in the file and
+// says when, so a running service drops its own at the next heartbeat (save above).
+// The counts are left alone. Returns what was there, or null with no file yet.
+export function clearProblems(config, { now = () => Date.now() } = {}) {
+  const file = metricsFile(config);
+  const saved = readJson(file, null);
+  if (!saved) return null;
+  writeJson(file, { ...saved, warnings: 0, errors: 0, recent: [], problemsClearedAt: new Date(now()).toISOString() });
+  return { warnings: saved.warnings ?? 0, errors: saved.errors ?? 0 };
 }
 
 // Wraps the logger so every warning and error is counted and the latest kept.

@@ -22,7 +22,7 @@
 // An option: "boolean", "number", "string", or { type, choices, default }.
 export const SPECS = {
   run: { usage: "run" },
-  status: { usage: "status" },
+  status: { usage: "status [--clear-problems]", options: { "clear-problems": "boolean" } },
   why: { usage: "why ISSUE [--prompt]", args: ["issue"], options: { prompt: "boolean" } },
   blocked: { usage: "blocked" },
   ready: { usage: "ready" },

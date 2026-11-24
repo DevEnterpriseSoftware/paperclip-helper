@@ -596,9 +596,26 @@ if (!BASE) {
       await settled(dependent.id);
 
       // The agent went on to wait for something else: blocked again, the done blocker still listed.
+      // Newer Paperclip refuses to enter blocked with only done blockers unless the move says
+      // who unblocks it (an unblockDescriptor), as an agent now must; older ones don't take one.
       const now = await ok("GET", `/api/issues/${dependent.id}`);
-      if (now.status !== "blocked") await ok("PATCH", `/api/issues/${dependent.id}`, { status: "blocked" });
+      if (now.status !== "blocked") {
+        const plain = await board("PATCH", `/api/issues/${dependent.id}`, { status: "blocked" });
+        if (plain.status === 422 && /unblockDescriptor/.test(JSON.stringify(plain.data))) {
+          await ok("PATCH", `/api/issues/${dependent.id}`, { status: "blocked", unblockDescriptor: { owner: "board", action: "Confirm the release window." } });
+        } else {
+          assert.ok(plain.status >= 200 && plain.status < 300, `PATCH /api/issues/${dependent.id} → ${plain.status}: ${JSON.stringify(plain.data).slice(0, 300)}`);
+        }
+      }
       await settled(dependent.id);
+      // The echo agent leaves no disposition, so Paperclip schedules a repair of the wake run
+      // (scheduled_retry, issue_disposition_repair), and on 2026.1117.0 the issue's
+      // executionRunId names it while it waits. The watchdog leaves an issue with a run on
+      // it alone, as it should, so the check is made once the repairs have run.
+      await until("the dependent's scheduled repairs to run", async () => {
+        const current = await ok("GET", `/api/issues/${dependent.id}`);
+        return !current.executionRunId && !(await runsOf(dependent.id)).some((r) => ACTIVE_RUN.has(r.status));
+      }, { timeoutMs: 300_000, everyMs: 2000 });
       const nudges = async () => (await commentsOf(dependent.id)).filter((c) => c.body.includes("every blocker on this issue is done"));
       s.skew = 10 * 60_000;
       const watchdog = createWatchdog(s.ctx, createStateStore(path.join(s.dataDir, "wake-taken-state.json")));

@@ -188,7 +188,7 @@ Paperclip records $0 for runs billed to a subscription. Cost sync posts one cost
 
 | Command | What it does |
 |---|---|
-| `pch status` | What the service is doing, its last checks and counts, Paperclip's version and build commit, and when the key expires; then all-time figures (what the helper has done, roughly how much hand work it saved) and its latest warnings and errors. |
+| `pch status` | What the service is doing, its last checks and counts, Paperclip's version and build commit, and when the key expires; then all-time figures (what the helper has done, roughly how much hand work it saved) and its latest warnings and errors. `--clear-problems` clears those, keeping the counts. |
 | `pch check [ISSUE]` | Who the key belongs to, its companies and prefixes. With an issue, its stage, current participant, and whether a merge would approve it. With `RELAY_FIX_CONFLICTS` on, also whether the GitHub token can read each repository's PRs. |
 | `pch why ISSUE` | Why nobody is working on an issue, and what to do about it. `--prompt` prints it as a prompt for an LLM chat. |
 | `pch blocked` | Why each blocked issue is blocked, which issues the chains of blocked issues end at and what those wait on, and every question card that is waiting. |
@@ -206,7 +206,7 @@ Paperclip records $0 for runs billed to a subscription. Cost sync posts one cost
 | `pch costs --sessions` | Checks whether resumed sessions report cumulative costs (see [cost sync](docs/cost-sync.md)). |
 | `pch costs --audit`, `--compare-days N` | Checks the cost figures; compares two periods and splits the change into usage and 1.12's costing (see [cost sync](docs/cost-sync.md#comparing-two-periods)). |
 | `pch costs --retry-skipped` | Posts the runs Paperclip rejected again, on the service's next pass (see [cost sync](docs/cost-sync.md#when-paperclip-rejects-a-cost-event)). |
-| `pch models` | Every agent's adapter, model, effort and status. |
+| `pch models` | Every agent's adapter (or Paperclip Runner harness), model, effort and status. |
 | `pch set-model FROM TO [--apply]` | Moves every agent on model `FROM` to `TO`. It previews unless you pass `--apply`. |
 | `pch login`, `pch revoke` | Create the helper's key; revoke and delete it. |
 | `pch secret` | Prints a random webhook secret. |

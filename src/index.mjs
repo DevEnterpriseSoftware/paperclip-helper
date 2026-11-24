@@ -188,7 +188,7 @@ async function main() {
     usage: () => cmd.usage(ctx, o),
     models: () => cmd.models(ctx),
     "set-model": () => cmd.setModel(ctx, a.from, a.to, o),
-    status: () => cmd.status(ctx),
+    status: () => cmd.status(ctx, o),
     health: () => cmd.health(ctx),
     probe: () => cmd.probe(ctx, a.url),
     prefixes: () => cmd.prefixes(ctx),

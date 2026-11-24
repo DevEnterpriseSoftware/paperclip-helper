@@ -4,6 +4,7 @@ import { minutesAgo, setup } from "./helpers.mjs";
 import { ids, uuid } from "./fake-paperclip.mjs";
 import { createWatchdog } from "../src/watchdog.mjs";
 import { createStateStore } from "../src/store.mjs";
+import { createContext } from "../src/context.mjs";
 
 function agents(db) {
   const engineer = { id: uuid(), companyId: ids.company, name: "Engineer", status: "idle", adapterType: "claude_local" };
@@ -889,6 +890,38 @@ test("one check failing (a listing Paperclip refuses) leaves the other checks to
   assert.ok(nudge.body.startsWith(`[@Reviewer](agent://${reviewer.id})`));
   assert.match(env.watchdog.stats.lastError, /^review stages: /);
   assert.equal(env.logs.filter((l) => l.msg === "watchdog: a check failed this tick" && l.check === "review stages").length, 1);
+});
+
+test("Paperclip unreachable: one log line for the tick, not one per check and company, and the next tick runs in full", async (t) => {
+  const env = await watchdogEnv(t);
+  const { issue } = droppedHandOff(env.db);
+  let down = false;
+  const fetchImpl = (url, init) => {
+    if (down) return Promise.reject(Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } }));
+    return globalThis.fetch(url, init);
+  };
+  const ctx = createContext({
+    env: { PAPERCLIP_API: env.fake.url, DATA_DIR: env.dataDir, PAPERCLIP_TIMEOUT_SEC: "10", LOG_LEVEL: "debug", WATCHDOG_STALL_SEC: "180" },
+    fetchImpl,
+    write: (line) => env.logs.push(JSON.parse(line)),
+  });
+  await ctx.identity(); // known from before the outage, as in a running helper
+  const watchdog = createWatchdog(ctx, env.state);
+
+  down = true;
+  await watchdog.tick();
+  const unreachable = env.logs.filter((l) => l.msg === "watchdog: cannot reach Paperclip; skipping the rest of this tick");
+  assert.equal(unreachable.length, 1);
+  assert.match(unreachable[0].error, /cannot reach Paperclip at .*ECONNREFUSED/);
+  assert.equal(env.logs.filter((l) => l.msg === "watchdog: a check failed this tick").length, 0);
+  assert.match(watchdog.stats.lastError, /cannot reach Paperclip/);
+  assert.equal(env.db.comments.length, 0);
+
+  down = false;
+  await watchdog.tick();
+  assert.ok(env.db.comments.find((c) => c.issueId === issue.id), "the hand-off check ran again");
+  assert.equal(watchdog.stats.lastError, null);
+  assert.equal(env.logs.filter((l) => /cannot reach Paperclip; skipping/.test(l.msg)).length, 1);
 });
 
 test("an issue whose owner ran last isn't read again every tick until it changes; a hand-off after that is still caught", async (t) => {

@@ -64,6 +64,8 @@ test("missing and extra arguments are usage errors", () => {
   assert.throws(() => parse(["set-model", "a"]), /needs its TO/);
   assert.throws(() => parse(["why", "ACM-1", "ACM-2"]), /pch why doesn't take "ACM-2"/);
   assert.throws(() => parse(["status", "now"]), /pch status doesn't take "now"/);
+  assert.equal(parse(["status", "--clear-problems"]).options.clearProblems, true);
+  assert.equal(parse(["status"]).options.clearProblems, false);
   assert.equal(parse(["check"]).args.issue, null);
   assert.throws(() => parse(["frobnicate"]), /Unknown command "frobnicate"/);
   assert.throws(() => parse(["constructor"]), /Unknown command "constructor"/);

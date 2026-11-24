@@ -31,6 +31,7 @@
 import path from "node:path";
 import { listIssues } from "./paperclip.mjs";
 import { ACTIVE_RUN, asleep, mapLimit, plural, ts } from "./util.mjs";
+import { STARTED_EVENTS } from "./release.mjs";
 
 export const VALIDATION_FAILED = "workspace_validation_failed";
 export const RECOVERY_KIND = "workspace_validation";
@@ -360,8 +361,9 @@ export function stoppedByClassifier(run) {
 // What became of an issue's next run after a retry: "past" (it got past setup),
 // "again" (refused on relative links again), "other" (refused at setup for another
 // reason now), "waiting" (queued, still in setup, or none yet). A run is `running` from
-// the moment it is claimed, before the workspace is checked; `adapterStarted` (its
-// adapter.invoke event, logged after the workspace is prepared) says it got past that.
+// the moment it is claimed, before the workspace is checked; `adapterStarted` (an
+// execution-start event, logged after the workspace is prepared: a legacy adapter's
+// adapter.invoke or the Paperclip Runner's own) says it got past that.
 export function nextRunOutcome(run, { adapterStarted = false } = {}) {
   if (!run) return { kind: "waiting", text: "no run has started yet" };
   if (ACTIVE_RUN.has(run.status)) {
@@ -397,7 +399,8 @@ export async function awaitNextRuns(api, issues, { waitMs = 60_000, pollMs = 3_0
       let adapterStarted = false;
       if (run?.status === "running") {
         const events = await api.request("GET", `/api/heartbeat-runs/${id}/events?limit=1000`).catch(() => []);
-        adapterStarted = (Array.isArray(events) ? events : []).some((e) => e.eventType === "adapter.invoke");
+        // A legacy adapter logs adapter.invoke; the Paperclip Runner logs its own start events.
+        adapterStarted = (Array.isArray(events) ? events : []).some((e) => STARTED_EVENTS.has(e.eventType));
       }
       outcome.set(issue.id, nextRunOutcome(run, { adapterStarted }));
     }

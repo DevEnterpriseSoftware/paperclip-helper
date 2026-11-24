@@ -13,7 +13,7 @@ import { selfWakeLoop } from "./self-wakes.mjs";
 import { claimedOnly, handOnRoute, heldReviewRoute, holdFacts, neverStarted, PAUSE_CANCEL, RECONCILIATION_CAUSE, releaseProblems } from "./release.mjs";
 import { describeWakes } from "./paused-holds.mjs";
 import { codeLabel, EXTENSION_ERROR, hostPaths, meaningOf, readWorkspace, RECOVERY_KIND, VALIDATION_FAILED, validationOf } from "./worktree-links.mjs";
-import { blockersWakeOf, ranRun, ts } from "./util.mjs";
+import { blockersWakeOf, harnessOf, ranRun, ts } from "./util.mjs";
 
 // A blocker counts as "finalizing" until the latest operation on its execution
 // workspace is a successful workspace_finalize. Show the last few operations.
@@ -240,7 +240,7 @@ async function whyReport(ctx, identifier, out) {
     if (verdict) {
       lastFailure = {
         kind: verdict.kind,
-        label: labelOf(assigneeAgent.adapterType),
+        label: labelOf(harnessOf(assigneeAgent)),
         what: verdict.what ?? null,
         scope: verdict.scope ?? null,
         resetAt: verdict.reset ? resetLabel(verdict.reset.at, verdict.reset.timeZone) : null,

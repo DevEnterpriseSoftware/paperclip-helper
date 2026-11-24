@@ -744,6 +744,60 @@ test("an agent whose pause never finished stays paused after its resume: the boa
   assert.ok(limitRecord(env).resumedAt);
 });
 
+test("a pause Paperclip hasn't finished 15 minutes later is told to the board once, with why it matters, and logged when it finishes", async (t) => {
+  const env = lifecycleEnv(await limitEnv(t));
+  const engineer = claude(env.db, "Engineer");
+  const reviewer = claude(env.db, "Reviewer");
+  env.db.stuckPauses.add(engineer.id); // a cancelled run on a remote environment with no stop receipt, say
+  failedRun(env.db, engineer, { at: T0 - 2 * MIN });
+  await env.watchdog.tick();
+  assert.equal(engineer.lifecycleState, "pausing");
+  assert.equal(reviewer.lifecycleState, "paused");
+  const notes = () => env.db.comments.filter((c) => c.identifier === "ACM-1");
+  assert.equal(notes().length, 1, "the limit note");
+
+  env.clock.at += 10 * MIN;
+  await env.watchdog.tick();
+  assert.equal(notes().length, 1, "not yet: Paperclip gets fifteen minutes");
+
+  engineer.lifecycleOperation = { attempts: 17 };
+  env.clock.at += 6 * MIN;
+  await env.watchdog.tick();
+  assert.equal(notes().length, 2);
+  assert.match(
+    notes()[1].body,
+    /^Engineer was paused for the Claude usage limit 16 minutes ago, but Paperclip still hasn't finished pausing it \(lifecycle state `pausing`, 17 attempts so far\)\. Paperclip retries a pause about once a minute .* every run the agent has ever had .* The resume at the reset can't take effect until the pause finishes\. .*SSH, a sandbox.* "A pause that never finishes"/s,
+  );
+  assert.doesNotMatch(notes()[1].body, /Reviewer/, "only the agent still pausing");
+  assert.ok(env.logs.some((l) => l.msg === "watchdog: Paperclip hasn't finished pausing an agent the watchdog paused" && l.agent === "Engineer" && l.lifecycleState === "pausing"));
+
+  env.clock.at += 30 * MIN;
+  await env.watchdog.tick();
+  assert.equal(notes().length, 2, "told once");
+
+  env.db.finishLifecycle(engineer);
+  env.clock.at += MIN;
+  await env.watchdog.tick();
+  assert.equal(engineer.lifecycleState, "paused");
+  assert.equal(env.logs.filter((l) => l.msg === "watchdog: Paperclip finished pausing an agent it had been stuck pausing" && l.agent === "Engineer").length, 1);
+  env.clock.at += MIN;
+  await env.watchdog.tick();
+  assert.equal(env.logs.filter((l) => /finished pausing an agent it had been stuck/.test(l.msg)).length, 1, "logged once");
+  assert.equal(notes().length, 2);
+});
+
+test("an agent whose pause finished in time gets no stuck-pause note", async (t) => {
+  const env = lifecycleEnv(await limitEnv(t));
+  const engineer = claude(env.db, "Engineer");
+  failedRun(env.db, engineer, { at: T0 - 2 * MIN });
+  await env.watchdog.tick();
+  assert.equal(engineer.lifecycleState, "paused");
+  env.clock.at += 20 * MIN;
+  await env.watchdog.tick();
+  assert.equal(env.db.comments.filter((c) => c.identifier === "ACM-1").length, 1, "the limit note only");
+  assert.ok(!env.logs.some((l) => /hasn't finished pausing/.test(l.msg)));
+});
+
 test("a resume still pending is left alone once something else holds the agent, and watched for a day at most", async (t) => {
   const env = lifecycleEnv(await limitEnv(t));
   const engineer = claude(env.db, "Engineer");

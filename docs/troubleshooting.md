@@ -32,6 +32,8 @@ Start with `pch status` and, for a stuck issue, `pch why ISSUE`.
 | An agent **runs every few minutes** and posts the same "Blocked: …" note | It's waiting on something only you can do, usually an approval. Decide it, or pause the issue. |
 | "**The original assignee is not invokable**" | The agent, or one above it in the org chart, was paused, terminated or awaiting approval when Paperclip's recovery ran. Resume it. If the agent itself was paused, the watchdog restores its issues blocked during the pause ([15](watchdog.md#15-issues-blocked-while-their-agent-was-paused)); others it un-parks with a comment; `pch why ISSUE` gives the command to do it yourself. |
 | **Agents still paused after the watchdog resumed them** (`agent.resumed` in the activity log, `pauseReason` empty) | Paperclip never finished pausing them: an old run or workspace lease of theirs isn't cleaned up, and a resume takes effect only after the pause is done. `pch models` shows `no hold, still pausing`. Resuming again won't help; restart Paperclip, and clean up a lease whose clean-up failed. The watchdog tells the board after ten minutes and again when they are back ([16](watchdog.md#a-resume-that-doesnt-take-effect)). |
+| **An agent stays `pausing`**: the board is told *"Paperclip still hasn't finished pausing it"*, or Paperclip uses more and more memory, or crashes with `JavaScript heap out of memory` a few seconds after each start | Something keeps Paperclip from proving one of the agent's old runs stopped, and every retry of the pause reads all its runs. See [a pause that never finishes](#a-pause-that-never-finishes). |
+| **The log says `cannot reach Paperclip; skipping the rest of this tick`** every few minutes | Paperclip isn't answering on `PAPERCLIP_API` at all. `pch probe` says the same. Check Paperclip's own service and its log: a crash loop shows there (for one cause, see the row above). |
 | **Agents paused by themselves** | A usage limit (Claude or Codex): the watchdog paused the agents on that account ([16](watchdog.md#16-usage-limits)). The log (and `WATCHDOG_NOTIFY_ISSUE`) says until when; they are resumed a few minutes after the reset. Resume one yourself whenever you like; `WATCHDOG_USAGE_LIMIT_PAUSE=false` turns it off. A Codex agent resumed an hour early or late: `WATCHDOG_LIMIT_TIME_ZONE` isn't your time zone (the installer sets it from the machine it runs on); correct it in `.env`. |
 | **All Claude agents paused when one model's limit was hit** (the Fable weekly limit, say, while agents on other models still had allowance) | Before 1.17.2 every Claude limit paused the whole subscription. Now a limit message that names a model pauses only that subscription's agents on that model ([16](watchdog.md#16-usage-limits)). If it still pauses them all, the message's wording wasn't recognised as naming a model: set `LOG_LEVEL=debug`, find *"a Claude run failed on a usage limit"* with its `error`, and report that text. Meanwhile, resume the agents on other models yourself; the watchdog doesn't pause an agent again for the same limit unless it fails on it. |
 | The watchdog **nudged an agent that was waiting on a board card** ("every blocker on this issue is done … the blockers-resolved wake was dropped. Please continue it."), the issue reopened from `blocked` to `todo`, and the agent's run only answered that the wake wasn't lost and it waits for the card | The agent had taken the blockers-resolved wake up, then blocked the issue on a card for you and left the done blocker in "Blocked by". Up to 1.17.1 the watchdog read "every blocker done, blocked, idle" as a dropped wake. From 1.17.2 it checks first whether the wake got through (the run Paperclip's `issue.blockers_resolved_wake_emitted` activity names, or a run or comment of the assignee since the blocker was done) and whether a card waits on a person, and leaves the issue alone if either holds ([2](watchdog.md#2-blocked-issues-whose-blockers-are-all-done)). Answer the card; that wakes the agent. With `LOG_LEVEL=debug` the log says "no blockers-resolved nudge: wake taken up by run …" or "… waits on a board interaction". |
@@ -58,3 +60,41 @@ Start with `pch status` and, for a stuck issue, `pch why ISSUE`.
 ---
 
 [← Back to the README](../README.md)
+
+## A pause that never finishes
+
+Paperclip finishes pausing an agent only once it can prove every run the agent has ever had has stopped ([watchdog 16](watchdog.md#a-pause-that-doesnt-finish)). Until then it retries about once a minute, and each retry loads all of the agent's runs, so a pause that can never finish costs memory every minute. Restarting Paperclip doesn't help: it picks the pause up again.
+
+Paperclip 2026.11 checks these, in order, for every run of the agent; the first that fails keeps it `pausing`:
+
+1. **A workspace lease not cleaned up:** a lease of one of its runs not released, `pending_cleanup`, or with `cleanup_status` `failed`.
+2. **A run not finished:** a run not `succeeded`, `failed`, `cancelled`, `timed_out` or `interrupted`, or one whose controller lease hasn't expired.
+3. **A cancelled run on a remote environment with no stop receipt:** a cancelled run whose lease is on a provider other than `local` (SSH, a sandbox) needs `cleanup_status` `success` and a stop receipt (`metadata.remoteExecutionTermination`). Leases from an environment you no longer use never get one.
+4. **A process still alive:** the run's `process_pid`, or any process in its `process_group_id`, still exists. Leftover child processes of an old run (an MCP server, a test host) keep its group alive.
+5. **A cancelled run with no record of stopping:** a cancelled run with no process ID needs `result_json.executionCancellation.state` `acknowledged`, or, for a legacy run, `execution_stage` `settled` on an adapter that doesn't continue conversations. Claude, Codex and the other local CLI adapters do, so their settled cancelled runs need the acknowledgement.
+
+These read-only queries, against Paperclip's database (`psql` to the embedded Postgres, `PGPASSWORD=paperclip psql -h 127.0.0.1 -p <its port> -U paperclip -d paperclip`), find which. Set the agent's id first with `\set A '<agent id>'`:
+
+```sql
+-- 1. leases not cleaned up
+select l.id, l.status, l.cleanup_status, l.released_at from environment_leases l join heartbeat_runs r on r.id = l.heartbeat_run_id
+ where r.agent_id = :'A' and (l.released_at is null or l.status = 'pending_cleanup' or l.cleanup_status = 'failed');
+-- 2. runs not finished
+select id, status, controller_lease_expires_at from heartbeat_runs where agent_id = :'A'
+ and (status not in ('succeeded','failed','cancelled','timed_out','interrupted') or controller_lease_expires_at > now());
+-- 3. remote leases of cancelled runs with no stop receipt
+select l.provider, l.status, count(*) from environment_leases l join heartbeat_runs r on r.id = l.heartbeat_run_id
+ where r.agent_id = :'A' and r.status = 'cancelled' and l.provider is not null and l.provider <> 'local'
+   and not (l.cleanup_status = 'success' and l.metadata ? 'remoteExecutionTermination') group by 1, 2;
+-- 5. cancelled runs with no record of stopping
+select runtime_mode, execution_stage, count(*) from heartbeat_runs where agent_id = :'A' and status = 'cancelled'
+ and started_at is not null and process_pid is null and process_group_id is null
+ and coalesce(result_json->'executionCancellation'->>'state', '') <> 'acknowledged' group by 1, 2;
+```
+
+For 4, list the run's process groups (`select distinct process_group_id from heartbeat_runs where agent_id = :'A'`) and compare them with `ps -eo pgid,pid,cmd` on Paperclip's host. Stopping the leftover processes (`kill -- -<pgid>`) lets the pause finish.
+
+For 3 and 5 there is no API: the fix is a change to Paperclip's database, marking the old runs the way Paperclip itself would have (a stop receipt on the lease, with `cleanup_status` `success`; `executionCancellation: { state: "acknowledged", acknowledgedAt: <finished_at> }` on the run). Take a backup first (`paperclipai db:backup`), limit the change to runs that finished long ago, keep the ids you changed so it can be undone, and stop the helper while you work. The pause finishes on Paperclip's next try.
+
+While you work on it, give Paperclip room: a busy instance can need more than Node's default 4 GB heap. A systemd drop-in `Environment="NODE_OPTIONS=--max-old-space-size=8192"` on Paperclip's service (then `systemctl --user daemon-reload` and a restart) stops the crash loop.
+

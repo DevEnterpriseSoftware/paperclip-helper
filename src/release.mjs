@@ -69,7 +69,7 @@ const STARTED_FIELDS = [
 ];
 // Run events that mean execution began (executionStartedEventPredicate, same file). Any
 // event carrying a sourceEventId came from a runner, which counts too.
-const STARTED_EVENTS = new Set([
+export const STARTED_EVENTS = new Set([
   "adapter.invoke", "native.process_start_requested", "native.process_identity_recorded", "harness.ready", "session.started",
   "session.resumed", "session.updated", "turn.started", "provider.event", "provider.rpc_result", "tool.execution.started",
 ]);
@@ -424,10 +424,13 @@ export function pausedHold(facts) {
 // user's plain comment on the issue (wake reason issue_commented or
 // issue_reopened_via_comment) while the issue is assigned to the hold's own agent
 // (executionBlocker.agentId, whose run the pause cancelled), that agent invokable, on
-// a conversation adapter, and the comment newer than the run's end. A comment while
-// anyone else is the assignee is saved behind the hold like any other.
+// a conversation adapter or the Paperclip Runner, and the comment newer than the run's
+// end. A comment while anyone else is the assignee is saved behind the hold like any
+// other. (A Runner agent's continuation also needs Paperclip to have a verified record
+// of the cancelled run's execution; Paperclip refuses it otherwise, and says so.)
 export const CONVERSATION_ADAPTERS = new Set([
   "claude_local", "codex_local", "cursor", "gemini_local", "opencode_local", "pi_local", "grok_local", "kimi_local", "hermes_local",
+  "paperclip_runner",
 ]);
 
 // Does the helper's key comment as a board user (actorType "user")? A board API key

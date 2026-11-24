@@ -34,13 +34,27 @@
 // exceeded. Check your plan and billing details."), and the workspace's credit or
 // spend cap are limits; "Selected model is at capacity" and "high demand" are
 // transient.
+//
+// The Paperclip Runner: an agent on it has adapterType "paperclip_runner" and its
+// harness in its adapter config, so recognisers are picked by harnessOf (util.mjs)
+// and a Runner agent is grouped by account with legacy agents on the same login.
+// The Runner files a limit as `native_provider_usage_limit` (a rate limit too): with
+// Claude's or Codex's limit wording it is the account's limit as above, without it
+// that agent's alone. Paperclip itself holds a Runner agent's new work until the
+// reported reset and retries the task then, so the watchdog never pauses a Runner
+// agent (a pause would block that retry): its limit still pauses the account's
+// legacy agents, and the board's note names the Runner agents left running.
 
-import { asleep, plural, ts } from "./util.mjs";
+import { asleep, harnessOf, onRunner, plural, ts } from "./util.mjs";
 
 const DAY_MS = 24 * 60 * 60_000;
+// The Paperclip Runner files a turn its provider ended on an exhausted allowance
+// (a usage limit, a rate limit or a quota) under its own code. Without the
+// provider's own limit wording it can't say whose allowance ran out.
+export const RUNNER_LIMIT_CODE = "native_provider_usage_limit";
 import { noteToBoard } from "./board-note.mjs";
 
-const LIMIT_CODES = new Set(["claude_transient_upstream", "provider_quota"]);
+const LIMIT_CODES = new Set(["claude_transient_upstream", "provider_quota", RUNNER_LIMIT_CODE]);
 // The wording of Claude's limit messages (as Paperclip's own claude-local parser
 // matches them, packages/adapters/claude-local/src/server/parse.ts).
 const LIMIT_TEXT =
@@ -101,7 +115,7 @@ function claudeModelLimit(text) {
 
 // A Claude agent's run that failed on a usage limit (the subscription's, or one model's own).
 export function isClaudeLimitFailure(run, agent) {
-  if (agent?.adapterType !== "claude_local") return false;
+  if (harnessOf(agent) !== "claude_local") return false;
   return CLAUDE.classify(run)?.kind === "limit";
 }
 
@@ -207,7 +221,7 @@ const REDACTED = /^\*+REDACTED\*+$/;
 // redacts; Bedrock or a proxy; a managed AI connection) is its own group: it is
 // paused when it fails itself. null for an agent that isn't a Claude agent.
 export function subscriptionOf(agent) {
-  if (agent?.adapterType !== "claude_local") return null;
+  if (harnessOf(agent) !== "claude_local") return null;
   const own = `agent:${agent.id}`;
   const env = agent.adapterConfig?.env ?? {};
   if (agent.runtimeConfig?.aiConnection || agent.adapterConfig?.managedAiConnection) return own;
@@ -292,7 +306,7 @@ export function parseCodexReset(text, now, timeZone = localZone()) {
 // compared; with a proxy (OPENAI_BASE_URL), CODEX_API_KEY or a managed AI
 // connection the agent is its own group too: paused when it fails itself.
 export function codexAccountOf(agent) {
-  if (agent?.adapterType !== "codex_local") return null;
+  if (harnessOf(agent) !== "codex_local") return null;
   const own = `agent:${agent.id}`;
   const env = agent.adapterConfig?.env ?? {};
   if (agent.runtimeConfig?.aiConnection || agent.adapterConfig?.managedAiConnection) return own;
@@ -327,8 +341,12 @@ const CLAUDE = {
     if (run?.status !== "failed" || !LIMIT_CODES.has(run.errorCode)) return null;
     const text = String(run.error ?? "");
     const own = claudeModelLimit(text);
-    if (!own && !LIMIT_TEXT.test(text)) return { kind: "transient" };
     const at = ts(run.finishedAt ?? run.updatedAt ?? run.createdAt);
+    if (!own && !LIMIT_TEXT.test(text)) {
+      // The Runner's code without Claude's limit wording: a rate limit as likely as the
+      // account's limit, so it is that agent's alone (which Paperclip holds by itself).
+      return run.errorCode === RUNNER_LIMIT_CODE ? { kind: "limit", reset: parseReset(text, at), scope: "agent", what: "usage limit" } : { kind: "transient" };
+    }
     const reset = parseReset(text, at);
     if (!own) return { kind: "limit", reset, scope: "account", what: "usage limit" };
     // One model's own limit: the agent's own model when it is that one, else the one named.
@@ -364,6 +382,11 @@ const CODEX = {
     }
     if (CODEX_BILLING.test(text)) return { kind: "limit", reset: null, scope: "account", what: "quota or billing limit", zone: validZone(timeZone) ?? "UTC" };
     if (CODEX_CAPACITY.test(text)) return { kind: "transient" };
+    // The Runner's own limit code, in wording the patterns above don't know: a rate
+    // limit as likely as the plan's, so it is that agent's alone (Paperclip holds it).
+    if (run.errorCode === RUNNER_LIMIT_CODE) {
+      return { kind: "limit", reset: parseCodexReset(text, at, timeZone), scope: "agent", what: "usage limit", zone: validZone(timeZone) ?? "UTC" };
+    }
     return null;
   },
 };
@@ -374,13 +397,13 @@ export const labelOf = (adapterType) => RECOGNISERS.get(adapterType)?.label ?? a
 
 // The account an agent's runs are billed to, for any adapter with a recogniser; null otherwise.
 export function accountOf(agent) {
-  return RECOGNISERS.get(agent?.adapterType)?.accountOf(agent) ?? null;
+  return RECOGNISERS.get(harnessOf(agent))?.accountOf(agent) ?? null;
 }
 
 // What the agent's adapter makes of a failed run (see the recognisers above); null
 // for an adapter without a recogniser, which keeps today's behaviour (nothing paused).
 export function classifyFailure(run, agent, options = {}) {
-  return RECOGNISERS.get(agent?.adapterType)?.classify(run, options, agent) ?? null;
+  return RECOGNISERS.get(harnessOf(agent))?.classify(run, options, agent) ?? null;
 }
 
 // A short, readable reset time for the board: in the zone the limit message named.
@@ -415,7 +438,7 @@ function latestLimitFailures(runs, agents, sinceByKey = new Map(), timeZone, log
     const at = ts(run.finishedAt ?? run.updatedAt ?? run.createdAt);
     if (at <= (sinceByKey.get(key) ?? 0)) continue;
     // The full text, so the wording of each limit can be checked against a real message.
-    if (agent.adapterType === "claude_local") {
+    if (harnessOf(agent) === "claude_local") {
       log?.debug?.("watchdog: a Claude run failed on a usage limit", {
         agent: agent.name, model: claudeModelOf(agent), run: run.id, errorCode: run.errorCode ?? null, scope: verdict.scope, what: verdict.what, error: String(run.error ?? ""),
       });
@@ -468,6 +491,11 @@ const MAX_RESUME_TRIES = 5;
 // stopped and cleaned up (docs/paperclip-internals.md, Agents).
 const RESUME_STUCK_MS = 10 * 60_000;
 const RESUME_WATCH_MS = 24 * 60 * 60_000;
+// A pause Paperclip accepted but hasn't finished: the board is told after this long.
+// Paperclip retries an unfinished pause about once a minute, and each try reads every
+// run the agent has ever had, so one that can never finish costs memory all the while
+// (docs/paperclip-internals.md, Agents).
+const PAUSE_STUCK_MS = 15 * 60_000;
 // Ticks an agent may stay busy (its runs keep it from being paused) before the log says so.
 const LONG_WAIT_TICKS = 30;
 
@@ -519,7 +547,7 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
         const whom = verdict.scope === "agent" ? "it" : verdict.scope === "model" ? `its agents on ${verdict.model}` : "its agents";
         once(`limit-detected:${account}:${run.id}`, () =>
           log.warn(`watchdog: ${verdict.scope === "agent" ? "an agent" : `a ${label(event)} account`} hit its ${event.what}; pausing ${whom} until it resets`, {
-            agent: agent.name, adapter: agent.adapterType, run: run.id, resetAt: new Date(event.resetAt).toISOString(), knownReset: !event.unknownReset,
+            agent: agent.name, adapter: harnessOf(agent), runner: onRunner(agent), run: run.id, resetAt: new Date(event.resetAt).toISOString(), knownReset: !event.unknownReset,
             ...(verdict.scope === "model" ? { model: verdict.model } : {}),
           }),
         );
@@ -534,6 +562,7 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
       else {
         await resumeSwitched(event, agents);
         await pauseIdle(event, agents, runs);
+        await notePausing(event, agents);
       }
     }
     logUnrecognised(runs, agents);
@@ -552,7 +581,7 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
     if (now() - last < DAY_MS) return;
     const candidates = runs
       .filter((run) => run?.status === "failed" && /\b(limit|quota)\b/i.test(String(run.error ?? "")) && ts(run.finishedAt ?? run.createdAt) > last)
-      .filter((run) => UNRECOGNISED_CHECKED.has(agents.get(run.agentId)?.adapterType))
+      .filter((run) => UNRECOGNISED_CHECKED.has(harnessOf(agents.get(run.agentId))))
       .filter((run) => !classifyFailure(run, agents.get(run.agentId), { timeZone }))
       .sort((a, b) => ts(a.finishedAt ?? a.createdAt) - ts(b.finishedAt ?? b.createdAt));
     const run = candidates[0];
@@ -563,8 +592,8 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
       records.set(key, { count: 1, at: now(), runId: run.id });
       state.touch();
     }
-    log.warn(`watchdog: a failed ${labelOf(agent.adapterType)} run mentions a limit or quota, but its usage-limit recogniser doesn't take it for one; please check it against this message (logged once a day)`, {
-      agent: agent.name, adapter: agent.adapterType, run: run.id, errorCode: run.errorCode ?? null, finishedAt: run.finishedAt ?? null, error: String(run.error),
+    log.warn(`watchdog: a failed ${labelOf(harnessOf(agent))} run mentions a limit or quota, but its usage-limit recogniser doesn't take it for one; please check it against this message (logged once a day)`, {
+      agent: agent.name, adapter: harnessOf(agent), runner: onRunner(agent), run: run.id, errorCode: run.errorCode ?? null, finishedAt: run.finishedAt ?? null, error: String(run.error),
     });
   }
 
@@ -592,7 +621,7 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
       }
       : {};
     return {
-      companyId, account, adapter: agent.adapterType, what: verdict.what, runId: run.id, lastFailureAt: at, ...model,
+      companyId, account, adapter: harnessOf(agent), what: verdict.what, runId: run.id, lastFailureAt: at, ...model,
       resetAt: active ? Math.max(prior.resetAt, resetAt) : resetAt,
       timeZone: reset?.timeZone ?? (active ? prior.timeZone : null) ?? verdict.zone ?? "UTC",
       unknownReset: active ? prior.unknownReset && !reset : !reset,
@@ -633,6 +662,9 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
     const waiting = [];
     for (const agent of members) {
       if (event.paused[agent.id] || asleep(agent)) continue; // ours, or a person's or not runnable
+      // A Runner agent isn't paused: Paperclip holds its new work until the reported
+      // reset and retries the task then by itself, which a pause would block.
+      if (onRunner(agent)) continue;
       const live = agent.status === "running" || runs.some((r) => r.agentId === agent.id && LIVE.has(r.status));
       if (live) {
         waiting.push(agent);
@@ -681,8 +713,10 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
     const adapter = event.adapter ?? "claude_local";
     const name = label(event);
     // Agents on other adapters: named by adapter when it has a recogniser.
-    const others = [...agents.values()].filter((a) => a.adapterType !== adapter && !asleep(a));
-    const otherLabels = [...new Set(others.filter((a) => RECOGNISERS.has(a.adapterType)).map((a) => labelOf(a.adapterType)))];
+    const others = [...agents.values()].filter((a) => harnessOf(a) !== adapter && !asleep(a));
+    const otherLabels = [...new Set(others.filter((a) => RECOGNISERS.has(harnessOf(a))).map((a) => labelOf(harnessOf(a))))];
+    // The account's Runner agents, which Paperclip holds and retries by itself (pauseIdle).
+    const held = [...agents.values()].filter((a) => onRunner(a) && onScope(a, event) && !asleep(a)).map((a) => a.name);
     const resumeAt = resetLabel(event.resetAt + graceMs, event.timeZone);
     const what = event.what ?? "usage limit";
     const text =
@@ -693,6 +727,7 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
         : `The limit resets ${resetLabel(event.resetAt, event.timeZone)}; the watchdog resumes them at ${resumeAt}.`) +
       (event.scope === "model" ? ` ${name} agents on other models keep running.` : "") +
       `${otherLabels.length ? ` ${otherLabels.join(" and ")} agents are unaffected and keep working.` : others.length ? " Agents on other adapters keep working." : ""}` +
+      (held.length ? ` ${names(held)} ${held.length === 1 ? "runs" : "run"} on the Paperclip Runner, which holds ${held.length === 1 ? "its" : "their"} work until the reset by itself, so the watchdog leaves ${held.length === 1 ? "it" : "them"} running.` : "") +
       " An agent you pause yourself stays paused.";
     event.notified = true;
     save(event);
@@ -784,6 +819,51 @@ export function createLimitCheck({ api, config, log, records, state, now, stats,
     if (entry.stuckNoted) {
       await noteToBoard({ api, config, log }, event.companyId, `${entry.name} is running again: Paperclip finished the resume the watchdog asked for after the ${label(event)} ${event.what ?? "usage limit"} reset, ${waitedMin} minutes later.`, { level: "info" });
     }
+  }
+
+  // Tells the board, once per agent, that a pause the watchdog asked for hasn't
+  // finished: Paperclip still shows it `pausing` well after. Logged again when it does.
+  async function notePausing(event, agents) {
+    if (config.dryRun) return;
+    const slow = [];
+    for (const [id, entry] of Object.entries(event.paused)) {
+      if (entry.resumeSentAt) continue; // the resume's own watch takes over
+      const agent = agents.get(id);
+      if (!agent) continue;
+      if (entry.pausingNoted) {
+        if (agent.lifecycleState && agent.lifecycleState !== "pausing") {
+          delete entry.pausingNoted;
+          entry.pausingDone = true;
+          log("watchdog: Paperclip finished pausing an agent it had been stuck pausing", lifecycleOf(agent, entry.name));
+          save(event);
+        }
+        continue;
+      }
+      if (entry.pausingDone || agent.lifecycleState !== "pausing") continue;
+      if (now() - ts(entry.pausedAt) < PAUSE_STUCK_MS) continue;
+      slow.push({ entry, agent });
+    }
+    if (!slow.length) return;
+    const who = names(slow.map(({ entry }) => entry.name));
+    const one = slow.length === 1;
+    const minutes = Math.round(Math.min(...slow.map(({ entry }) => now() - ts(entry.pausedAt))) / 60_000);
+    const attempts = slow.map(({ agent }) => Number(agent.lifecycleOperation?.attempts)).filter(Number.isFinite);
+    const text =
+      `${who} ${one ? "was" : "were"} paused for the ${label(event)} ${event.what ?? "usage limit"} ${minutes} minutes ago, ` +
+      `but Paperclip still hasn't finished pausing ${one ? "it" : "them"} (lifecycle state \`pausing\`` +
+      (attempts.length ? `, ${Math.max(...attempts)} attempts so far` : "") +
+      "). Paperclip retries a pause about once a minute until it can prove that every run the agent has ever had has stopped, " +
+      "and each try reads all of those runs: on a long run history that can take gigabytes of memory, enough to crash Paperclip at Node's default heap limit. " +
+      `The resume at the reset can't take effect until the pause finishes. What usually holds a pause: a cancelled run on a remote environment ` +
+      "(SSH, a sandbox) whose lease has no stop receipt, often from an environment no longer in use; a cancelled run with no record of how it stopped; " +
+      "a process still alive in an old run's process group; or a workspace lease whose clean-up failed. " +
+      'The troubleshooting guide\'s "A pause that never finishes" shows how to find which.';
+    for (const { entry, agent } of slow) {
+      entry.pausingNoted = true;
+      log.warn("watchdog: Paperclip hasn't finished pausing an agent the watchdog paused", lifecycleOf(agent, entry.name));
+    }
+    save(event);
+    await noteToBoard({ api, config, log }, event.companyId, text);
   }
 
   // Tells the board, once per agent, that a resume hasn't taken effect, and why as far as Paperclip shows.
