@@ -54,6 +54,18 @@
 // Every release asks the loop breaker first (wake-guard.mjs, `wakeGuard`): an issue the
 // watchdog has woken twice in half an hour with nothing moving on it is left alone.
 //
+// A disposition repair Paperclip suppressed itself (release.mjs suppressedRepair): the
+// issue already had a durable path, so the repair was cancelled before it started, or a
+// few seconds after its claim ("Disposition repair suppressed: durable_wait"), with no
+// usage. Paperclip settles its own recovery action for the run, so nothing is active, but
+// the hold still names that action and nothing clears it; the board's Retry only says it
+// is waiting for the run to be verified as stopped. Such a run did nothing either, so the
+// watchdog releases it the same way, recording "not performed" with the run's times, the
+// suppression and the absence of usage as evidence. Only the plain release: the run must
+// be the assignee's, with no other run queued or going and no review pending, and the
+// hold must have stood SUPPRESSED_REPAIR_SETTLE_MS. Anything else is told to the board.
+// Once per held run, so a new hold behind another run is still seen.
+//
 // A hold from a run that did execute (it started, or recorded usage) is the board's:
 // it is reported once, an hour after the run ended, unless it is one 7 releases by
 // itself (no process record and no usage, WATCHDOG_RELEASE_HOLDS on, nothing in the way).
@@ -62,7 +74,7 @@ import { asleep, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 import { noteToBoard } from "./board-note.mjs";
 import {
   actsAsUser, claimedOnly, handOnRoute, handOnText, heldBackstop, heldReviewRoute, neverStarted, ranWork, releaseHandedOn, releaseHeldReview, releaseHold, releaseProblems,
-  releaseRebuiltReview, reviewPending, unprovable, UPSTREAM_RELEASED_CODES,
+  releaseRebuiltReview, reviewPending, unprovable, UPSTREAM_RELEASED_CODES, suppressedRepair, suppressionOf, ranText, SUPPRESSED_REPAIR_SETTLE_MS,
 } from "./release.mjs";
 import { ACTIVE_RUN } from "./util.mjs";
 import { describeWakes, waitingWakes } from "./paused-holds.mjs";
@@ -79,7 +91,14 @@ export const HAND_ON_CHECK_MS = 15 * 60_000;
 const short = (id) => String(id ?? "?").slice(0, 8);
 
 // "Alice's run 1a2b3c4d, which Paperclip cancelled before it started (issue_assignee_changed)"
-export function unstartedHoldWhy({ ownerName, runId, errorCode, claimed = false }) {
+// With `suppressed` (a disposition repair Paperclip suppressed): its reason and how long it ran.
+export function unstartedHoldWhy({ ownerName, runId, errorCode, claimed = false, suppressed = null }) {
+  if (suppressed) {
+    return (
+      `Paperclip holds every wake on this issue behind ${ownerName ?? "an agent"}'s run ${short(runId)}, a disposition repair it suppressed itself ` +
+      `("${suppressed.error}"; it ${suppressed.ran}, with no usage), and never releases that hold by itself (legacy_execution_requires_reconciliation)`
+    );
+  }
   const cancelled = claimed
     ? `was cancelled while it was still preparing, before it reached its adapter (${errorCode})`
     : `its dispatch cancelled before it started (${errorCode})`;
@@ -90,8 +109,16 @@ export function unstartedHoldWhy({ ownerName, runId, errorCode, claimed = false 
 }
 
 // What lifts it when the watchdog won't: for the board's note and `pch why`.
-export function unstartedHoldRemedy({ problems, errorCode, identifier, ownerName = null, returnName = null, claimed = false }) {
+export function unstartedHoldRemedy({ problems, errorCode, identifier, ownerName = null, returnName = null, claimed = false, suppressed = null }) {
   const review = problems.some((p) => /review stage is pending/.test(p));
+  if (suppressed) {
+    // Only the plain release: anything in its way is yours to sort out, or to release by hand.
+    if (review) return `The watchdog leaves a held review to you: \`pch release ${identifier}\` shows what a release would do to it.`;
+    if (problems.some((p) => /another agent's than the assignee's/.test(p))) {
+      return `Paperclip accepts the release only while ${ownerName ?? "the run's agent"} has the issue: give it back to them and the watchdog releases it on its next scan, or see \`pch release ${identifier}\`.`;
+    }
+    return `Once that is out of the way the watchdog releases it on its next scan; \`pch release ${identifier}\` shows the hold.`;
+  }
   const upstream = claimed
     ? "Paperclip's own fix (paperclipai/paperclip#18838) doesn't cover a run cancelled after it was claimed."
     : UPSTREAM_RELEASED_CODES.has(errorCode)
@@ -160,7 +187,11 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
   async function check(facts, companyId, agents) {
     const { issue, hold, run } = facts;
     if (!hold?.runId || !run) return;
-    if (!neverStarted(facts)) return reportExecuted(facts, companyId, agents);
+    // A run that never started has its own routes (reviews, hand-ons); a suppressed
+    // repair that got a few seconds in is released only the plain way.
+    const unstarted = neverStarted(facts);
+    const suppressed = !unstarted && suppressedRepair(facts) ? { error: suppressionOf(run), ran: ranText(run) } : null;
+    if (!unstarted && !suppressed) return reportExecuted(facts, companyId, agents);
 
     const who = issue.identifier ?? issue.id;
     const key = record.release(issue, hold.runId); // shared with 7: one release per held run
@@ -187,19 +218,21 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
     const nameOf = (id) => (id && agents.get(id)?.name) ?? (id === owner?.id ? owner?.name : id === assignee?.id ? assignee?.name : null);
     const wakes = await waitingWakes(api, issue.id);
     const claimed = claimedOnly(run);
-    const why = unstartedHoldWhy({ ownerName: owner?.name, runId: hold.runId, errorCode: run.errorCode, claimed });
+    const why = unstartedHoldWhy({ ownerName: owner?.name, runId: hold.runId, errorCode: run.errorCode, claimed, suppressed });
     const held = wakes.length ? `: ${describeWakes(wakes, nameOf)} won't start` : "";
     const saved = facts.queue?.entries?.length ?? hold.savedMessageCount ?? 0;
-    const logExtra = { issue: who, sourceRun: hold.runId, errorCode: run.errorCode, waiting: wakes.length, saved };
+    const logExtra = { issue: who, sourceRun: hold.runId, errorCode: run.errorCode, waiting: wakes.length, saved, ...(suppressed ? { suppressedRepair: true } : {}) };
 
-    if (now() - ts(run.finishedAt) < stallMs) return; // Paperclip's own sweep first
+    // Paperclip's own sweep first; a suppressed repair's hold a while longer.
+    if (now() - ts(run.finishedAt) < (suppressed ? Math.max(stallMs, SUPPRESSED_REPAIR_SETTLE_MS) : stallMs)) return;
     // A held review: released keeping it when Paperclip has it in blocked or todo, or
     // its first stage started again when nothing in it is lost (release.mjs heldReviewRoute).
-    const route = heldReviewRoute(facts);
+    const route = suppressed ? null : heldReviewRoute(facts);
     // The issue belongs elsewhere: the held run's agent is asked to hand it on (release.mjs handOnRoute).
-    const handOn = route ? null : handOnRoute(facts);
+    const handOn = route || suppressed ? null : handOnRoute(facts);
     const target = handOn ? await agentFor(handOn.targetAgentId, agents).catch(() => null) : null;
-    let problems = releaseProblems(facts, { heldReview: true, handOn: Boolean(handOn) });
+    let problems = suppressed ? releaseProblems(facts) : releaseProblems(facts, { heldReview: true, handOn: Boolean(handOn) });
+    if (suppressed && issue.assigneeUserId) problems = [...problems, "the issue is assigned to a person"];
     if (route === "lossless" && issue.status === "blocked" && !actsAsUser(await ctx.identity().catch(() => null))) {
       problems = [...problems, "only a board user's comment moves a blocked review to todo with its stage kept, and the helper's Paperclip key isn't a user's"];
     }
@@ -212,7 +245,7 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
         `problems:${problems.join("|")}`,
         companyId,
         `${who}: ${why}${held}. The watchdog won't release it: ${problems.join("; ")}. ` +
-          unstartedHoldRemedy({ problems, errorCode: run.errorCode, identifier: who, ownerName: owner?.name, returnName: nameOf(issue.executionState?.returnAssignee?.agentId), claimed }),
+          unstartedHoldRemedy({ problems, errorCode: run.errorCode, identifier: who, ownerName: owner?.name, returnName: nameOf(issue.executionState?.returnAssignee?.agentId), claimed, suppressed }),
         { ...logExtra, problems, reviewPending: reviewPending(issue) },
       );
     }
@@ -239,9 +272,11 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
     records.set(key, { count: 1, at: now(), ...(retry ? { retried: true } : {}) });
     state.touch();
     const options = {
-      note:
-        `Released by Paperclip Helper's watchdog: run ${hold.runId} was cancelled before it started (${run.errorCode}), ` +
-        "so there was nothing to reconcile and Paperclip could never release this hold by itself.",
+      note: suppressed
+        ? `Released by Paperclip Helper's watchdog: run ${hold.runId} was a disposition repair Paperclip suppressed itself ("${suppressed.error}"; it ${suppressed.ran}, with no usage), ` +
+          "so there was nothing to reconcile and Paperclip could never release this hold by itself."
+        : `Released by Paperclip Helper's watchdog: run ${hold.runId} was cancelled before it started (${run.errorCode}), ` +
+          "so there was nothing to reconcile and Paperclip could never release this hold by itself.",
       signature: `\n\n${WATCHDOG_SIGNATURE}`,
       comment:
         `Paperclip held this review behind a run of yours it cancelled before it started (${run.errorCode}), so nothing reached you. ` +
@@ -286,7 +321,8 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
       return;
     }
     stats.releases += 1;
-    stats.unstartedHolds = (stats.unstartedHolds ?? 0) + 1;
+    if (suppressed) stats.suppressedRepairs = (stats.suppressedRepairs ?? 0) + 1;
+    else stats.unstartedHolds = (stats.unstartedHolds ?? 0) + 1;
     const plural = (n) => `${n} saved message${n === 1 ? "" : "s"}`;
     const delivered = result.delivered
       ? `delivered ${plural(result.delivered)} to ${runner.name}`
@@ -308,7 +344,7 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
       });
       state.touch();
     } else if (!delivered && !result.review && !result.backstop && !ci?.reported) {
-      records.set(record.unstartedFollowUp(issue, hold.runId), { count: 0, at: now(), companyId, issueId: issue.id, assigneeId: assignee.id, errorCode: run.errorCode });
+      records.set(record.unstartedFollowUp(issue, hold.runId), { count: 0, at: now(), companyId, issueId: issue.id, assigneeId: assignee.id, errorCode: run.errorCode, ...(suppressed ? { suppressed: true } : {}) });
       state.touch();
     }
     await noteToBoard(
@@ -421,7 +457,9 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
         issue,
         record.releaseNudge(issue, runId),
         agent,
-        `Paperclip held this issue behind a run of yours it had cancelled before it started (${r.errorCode}), and couldn't release the hold by itself. ` +
+        (r.suppressed
+          ? "Paperclip held this issue behind a disposition repair run of yours that it suppressed itself, and couldn't release the hold by itself. "
+          : `Paperclip held this issue behind a run of yours it had cancelled before it started (${r.errorCode}), and couldn't release the hold by itself. `) +
           "The watchdog has released it. That run did nothing, so there is nothing of it to check: please continue this issue.",
         { reason: "released unstarted hold" },
       );

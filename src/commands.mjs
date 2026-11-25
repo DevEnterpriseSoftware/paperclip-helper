@@ -12,7 +12,7 @@ import { loadPrices, priceFor } from "./prices.mjs";
 import { blocked as blockedReport } from "./blocked.mjs";
 import {
   actsAsUser, claimedOnly, continuationText, continuePausedHold, CONVERSATION_ADAPTERS, defaultOutcome, handOnRoute, handOnText, heldReviewRoute, holdFacts,
-  heldBackstop, neverStarted, pausedHold, releaseHandedOn, releaseHeldReview, releaseHold, releaseProblems, releaseRebuiltReview, RELEASE_OUTCOMES, unprovable,
+  heldBackstop, neverStarted, pausedHold, ranText, releaseHandedOn, releaseHeldReview, releaseHold, releaseProblems, releaseRebuiltReview, RELEASE_OUTCOMES, suppressedRepair, suppressionOf, unprovable,
 } from "./release.mjs";
 import { unstartedHoldRemedy } from "./unstarted-holds.mjs";
 import {
@@ -318,12 +318,16 @@ export async function release(ctx, identifier, { apply = false, outcome = null }
     return;
   }
   const unstarted = neverStarted(facts);
+  const suppressed = !unstarted && suppressedRepair(facts);
   if (unstarted && claimedOnly(run)) {
     out(`Paperclip claimed this run, then cancelled it while it was still preparing, before it reached its adapter (${run.errorCode}):`);
     out("no process, adapter invocation, session, usage, lease or execution event. There is nothing to reconcile, and Paperclip can't release the hold by itself.");
   } else if (unstarted) {
     out(`Paperclip cancelled this run before it started (${run.errorCode}): no start, process, session, usage, lease or execution event.`);
     out("There is nothing to reconcile, and Paperclip can't release the hold by itself.");
+  } else if (suppressed) {
+    out(`This run was a disposition repair Paperclip suppressed itself ("${suppressionOf(run)}"): it ${ranText(run)}, with no usage,`);
+    out("and Paperclip's own recovery action for it is already resolved. It did nothing to reconcile, and Paperclip can't release the hold by itself.");
   } else if (unprovable(facts)) out("Paperclip can't release this by itself: the run recorded no process it could check.");
 
   // A held review, released without ending it (release.mjs heldReviewRoute).
@@ -413,6 +417,7 @@ export async function release(ctx, identifier, { apply = false, outcome = null }
     out(`moves ${identifier} to todo, and ${saved ? "delivers the saved messages" : "lets the next message start a run"}.`);
     if (heldBackstop(facts)) out(`The Helper's CI backstop monitor is on it: ${identifier} goes back in progress with it before anything is delivered.`);
     if (unstarted && actionOutcome === "not_performed") out("The run never started, so the agent has nothing of it to check.");
+    else if (suppressed && actionOutcome === "not_performed") out("The run did no work, so the agent has nothing of it to check.");
     else out("Only do it if no agent process from that run is still running. Have the agent check the branch before it continues.");
     out(`  pch release ${identifier} --apply${outcomeFlag}`);
     return;
@@ -1103,11 +1108,15 @@ export async function status(ctx, { clearProblems: clear = false } = {}) {
       const took = w.lastTickMs != null ? ` (${tint(paint, slowness(w.lastTickMs, { intervalSec, what: "check" }) ?? "green", seconds(w.lastTickMs))})` : "";
       out(`${label("Watchdog")}: ${onOff(true)}. Last check ${tint(paint, late, ago(w.lastTickAt))}${took}.`);
       for (const line of tickLines(w, { paint, intervalSec })) out(`  ${line}`);
+      const releasedWhy = [
+        w.unstartedHolds ? `${w.unstartedHolds} behind a run that never started` : null,
+        w.suppressedRepairs ? `${w.suppressedRepairs} behind a suppressed disposition repair` : null,
+      ].filter(Boolean);
       const done = [
         counted(w.nudges, "nudge"),
         counted(w.heals, "blocker repaired", "blockers repaired"),
         counted(w.retries, "deferred wake retried", "deferred wakes retried"),
-        w.releases ? `${counted(w.releases, "hold released", "holds released")}${w.unstartedHolds ? ` (${w.unstartedHolds} behind a run that never started)` : ""}` : null,
+        w.releases ? `${counted(w.releases, "hold released", "holds released")}${releasedWhy.length ? ` (${releasedWhy.join(", ")})` : ""}` : null,
         counted(w.deadLinks, "link to a closed workspace cleared", "links to a closed workspace cleared"),
         counted(w.questions, "undelivered question card routed", "undelivered question cards routed"),
         counted(w.ciReports, "finished CI run reported", "finished CI runs reported"),

@@ -63,8 +63,8 @@
 //    running, holds a lease or has a live process is only reported, and so is one
 //    on an issue whose review stage is pending (the release moves the issue to
 //    todo, which Paperclip refuses or does by ending the review), whose held run
-//    is another agent's than the assignee's, or that other issues block. A run that never started is 22's, and
-//    so is one that recorded usage (tokens or a cost): it did work, which only a
+//    is another agent's than the assignee's, or that other issues block. A run that never started is 22's, so is
+//    a disposition repair Paperclip suppressed itself (release.mjs suppressedRepair), and so is one that recorded usage (tokens or a cost): it did work, which only a
 //    person can judge, so 22 reports it. Like 22, it keeps a hold whose agent waits
 //    on a CI run still going under 11's backstop, and releases it with the run's
 //    report once it has finished.
@@ -242,6 +242,13 @@
 //    on a CI run still going under 11's backstop, the hold is kept (a release would
 //    only wake it to say it is still waiting); once the run has finished, its report is
 //    posted behind the hold and the release delivers it: one wake, with the result.
+//    A disposition repair Paperclip suppressed itself because the issue already had a
+//    durable path (wake reason issue_disposition_repair, "disposition repair
+//    suppressed", no usage, never started or cut off within 10 s) holds the issue the
+//    same way, with Paperclip's own recovery action for it already resolved: nothing
+//    clears it and the board's Retry waits for good. Once it has stood 10 minutes, with
+//    the run the assignee's, nothing else running and no review pending, it is released
+//    as not performed, once per run; anything else is told to the board.
 //
 // The loop breaker (wake-guard.mjs). Every nudge, release and re-send of saved messages asks first: once the
 // watchdog has woken the same issue twice within 30 minutes and nothing has moved on
@@ -255,7 +262,7 @@
 import { companyAgents, listIssues } from "./paperclip.mjs";
 import { createTickReads } from "./tick-reads.mjs";
 import { ACTIVE_RUN, agentMention, asleep, blockersWakeOf, every, mapLimit, pausedRefusal, ranRun, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
-import { holdFacts, neverStarted, pausedHold, ranWork, releaseHold, releaseProblems, RECONCILIATION_CAUSE, unprovable } from "./release.mjs";
+import { holdFacts, neverStarted, pausedHold, ranWork, releaseHold, releaseProblems, RECONCILIATION_CAUSE, suppressedRepair, unprovable } from "./release.mjs";
 import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
 import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue, strandedCard } from "./questions.mjs";
 import { createGitHub } from "./github.mjs";
@@ -345,7 +352,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
   const stats = {
     ticks: 0, lastTickAt: null, lastTickMs: null, nudges: 0, heals: 0, stuck: 0, retries: 0, releases: 0, deadLinks: 0, questions: 0,
     ciReports: 0, ciReruns: 0, ciBackstops: 0, ciBackstopsPulled: 0, selfWakes: 0, returned: 0, resumed: 0, limitPauses: 0, limitResumes: 0, reopened: 0, wipes: 0, pausedHolds: 0,
-    runnerProblems: 0, readyNotes: 0, worktreeLinkNotes: 0, unstartedHolds: 0, lastError: null,
+    runnerProblems: 0, readyNotes: 0, worktreeLinkNotes: 0, unstartedHolds: 0, suppressedRepairs: 0, lastError: null,
     // The last tick's requests, how many were answered from what the tick had already
     // read, its slowest checks and its slowest kinds of request (for `pch status`).
     lastTick: null,
@@ -538,8 +545,9 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     if (!config.watchdogReleaseHolds) return false;
     const facts = await holdFacts(api, issue.id).catch(() => null);
     // A run a pause cancelled is 18's: its hold is resolved without moving the issue to todo.
-    // One that never started is 22's, on its scan: nothing to reconcile, and said so.
-    if (facts?.hold && (pausedHold(facts) || neverStarted(facts))) return true;
+    // One that never started is 22's, on its scan: nothing to reconcile, and said so. So
+    // is a disposition repair Paperclip suppressed itself.
+    if (facts?.hold && (pausedHold(facts) || neverStarted(facts) || suppressedRepair(facts))) return true;
     if (!facts?.hold || !unprovable(facts)) return false;
     // A run that did model work without a process record (an adapter with no local
     // process): what it did is for a person to judge. 22 reports it.

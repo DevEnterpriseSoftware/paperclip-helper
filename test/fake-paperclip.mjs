@@ -32,6 +32,7 @@ export function emptyDb() {
     queuedComments: {}, // issueId → { queueId, state, protocol, revision, targetRunId, entries }
     interrupts: [], // { issueId, body }
     recoveryActions: {}, // issueId → the active recovery action
+    recoveryActionHistory: {}, // issueId → recovery actions no longer active (resolved by Paperclip's own sweep, say)
     blockerDiagnostics: {}, // issueId → { readiness, blockers }
     workProducts: {}, // issueId → [...]
     workspaceOps: {}, // workspaceId → [...]
@@ -768,7 +769,7 @@ export async function startFake({ db = emptyDb(), allowedHosts = null } = {}) {
       }
       if (rest === "/recovery-actions" && req.method === "GET") {
         const active = db.recoveryActions[issue.id] ?? null;
-        return send(200, { active, actions: active ? [active] : [] });
+        return send(200, { active, actions: [...(active ? [active] : []), ...(db.recoveryActionHistory[issue.id] ?? [])] });
       }
       if (rest === "/comments" && req.method === "GET") {
         // Newest first, like ?order=desc.

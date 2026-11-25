@@ -38,6 +38,7 @@ export const COUNTERS = [
   { key: "retries", label: "deferred wakes retried", minutes: 5, from: (s) => s.watchdog?.retries },
   { key: "releases", label: "holds released", minutes: 15, from: (s) => s.watchdog?.releases },
   { key: "unstartedHolds", label: "of them, behind a run that never started", from: (s) => s.watchdog?.unstartedHolds },
+  { key: "suppressedRepairs", label: "of them, behind a suppressed disposition repair", from: (s) => s.watchdog?.suppressedRepairs },
   { key: "pausedHolds", label: "holds from a paused run lifted", minutes: 15, from: (s) => s.watchdog?.pausedHolds },
   { key: "heals", label: "blockers stuck on a failed clean-up repaired", minutes: 15, from: (s) => s.watchdog?.heals },
   { key: "deadLinks", label: "links to a closed workspace cleared", minutes: 15, from: (s) => s.watchdog?.deadLinks },

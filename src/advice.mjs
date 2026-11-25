@@ -17,10 +17,11 @@ import { cardText, strandedCard } from "./questions.mjs";
 import { escalatedReview } from "./board-held.mjs";
 import { PARTICIPANT_RECOVERY_CAUSE } from "./resume.mjs";
 import { pausedHoldWhy } from "./paused-holds.mjs";
-import { CONVERSATION_ADAPTERS } from "./release.mjs";
+import { CONVERSATION_ADAPTERS, SUPPRESSED_REPAIR_SETTLE_MS } from "./release.mjs";
 import { HAND_ON_CHECK_MS, unstartedHoldRemedy, unstartedHoldWhy } from "./unstarted-holds.mjs";
 
 const HAND_ON_CHECK_MIN = Math.round(HAND_ON_CHECK_MS / 60_000);
+const SUPPRESSED_REPAIR_SETTLE_MIN = Math.round(SUPPRESSED_REPAIR_SETTLE_MS / 60_000);
 import { extensionAdvice, validationAdvice } from "./worktree-links.mjs";
 
 const ASLEEP = new Set(["paused", "terminated", "pending_approval"]);
@@ -63,7 +64,7 @@ export function advise(facts) {
     blockersWake = null, // every blocker done, and the blockers-resolved wake's run (the assignee's) got under way: { runId, status }
     selfWake = null, // an agent keeps waking itself with its runs' posted final messages (self-wakes.mjs): { name, count }
     pauseHold = null, // the hold is from a run a pause cancelled (watchdog 18): { ownerName, runId, waiting, held }
-    unstartedHold = null, // the hold is from a run Paperclip cancelled before it started (watchdog 22): { ownerName, runId, errorCode, problems, route }
+    unstartedHold = null, // the hold is from a run Paperclip cancelled before it started, or a disposition repair it suppressed (watchdog 22): { ownerName, runId, errorCode, problems, route, suppressed }
     workspaceValidation = null, // Paperclip refused the assignee's runs at setup on the workspace (worktree-links.mjs): { reason, reasonCode, paths, repoUrl, nextAction }
     extensionError = null, // an agent's build fails on extensions.relativeWorktrees (worktree-links.mjs): { paths, in }
     config = {},
@@ -303,7 +304,7 @@ export function advise(facts) {
     if (problems.length) {
       return {
         what: `${what} It can't be released yet: ${problems.join("; ")}.`,
-        steps: [unstartedHoldRemedy({ problems, errorCode: unstartedHold.errorCode, identifier, ownerName: unstartedHold.ownerName, returnName: unstartedHold.returnName, claimed: unstartedHold.claimed })],
+        steps: [unstartedHoldRemedy({ problems, errorCode: unstartedHold.errorCode, identifier, ownerName: unstartedHold.ownerName, returnName: unstartedHold.returnName, claimed: unstartedHold.claimed, suppressed: unstartedHold.suppressed })],
         watchdog: "manual",
       };
     }
@@ -349,7 +350,9 @@ export function advise(facts) {
       watchdog: releasing ? "auto" : "manual",
       autoNote: ciHeld && unstartedHold.route !== "lossless"
         ? "The watchdog does this by itself once the CI run has finished (WATCHDOG_RELEASE_HOLDS), with the run's report as the saved message, and tells the board."
-        : "The watchdog does this by itself once the run ended a stall window ago and the assignee is available (WATCHDOG_RELEASE_HOLDS), and tells the board.",
+        : unstartedHold.suppressed
+          ? `The watchdog does this by itself once the hold has stood ${SUPPRESSED_REPAIR_SETTLE_MIN} minutes and the assignee is available (WATCHDOG_RELEASE_HOLDS), once per run, and tells the board.`
+          : "The watchdog does this by itself once the run ended a stall window ago and the assignee is available (WATCHDOG_RELEASE_HOLDS), and tells the board.",
     };
   }
   // A run that recorded no process id or stop can never prove it stopped: a

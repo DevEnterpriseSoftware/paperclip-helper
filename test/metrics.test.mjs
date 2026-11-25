@@ -84,7 +84,7 @@ test("clearing problems with the service running: the file is emptied at once, a
   const config = { dataDir: tempDir() };
   let clock = Date.parse("2026-11-24T10:00:00Z");
   const now = () => clock;
-  const metrics = createMetrics(config, { version: "1.18.0", now });
+  const metrics = createMetrics(config, { version: "1.19.0", now });
   const log = createLogger({ write: () => {} });
   watchProblems(log, metrics);
   for (let i = 1; i <= 3; i += 1) log.warn("watchdog: a check failed this tick", { check: `c${i}` });
@@ -116,7 +116,7 @@ test("clearing problems with the service running: the file is emptied at once, a
   metrics.save(); // a later heartbeat counts as before
   assert.equal(readMetrics(config).warnings, 2);
 
-  const restarted = createMetrics(config, { version: "1.18.0", now });
+  const restarted = createMetrics(config, { version: "1.19.0", now });
   restarted.save(); // a restart doesn't bring the cleared ones back, or clear again
   assert.equal(readMetrics(config).warnings, 2);
   assert.equal(readMetrics(config).problemsClearedAt, "2026-11-24T10:01:00.000Z");
@@ -126,9 +126,9 @@ test("clearing problems with the service running: the file is emptied at once, a
 test("pch status --clear-problems says what it cleared, and status then says since when", async (t) => {
   const env = await setup();
   t.after(env.close);
-  writeJson(env.ctx.config.statusFile, { version: "1.18.0", startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), relay: { on: false }, watchdog: { on: false }, costSync: { on: false } });
+  writeJson(env.ctx.config.statusFile, { version: "1.19.0", startedAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), relay: { on: false }, watchdog: { on: false }, costSync: { on: false } });
   writeJson(metricsFile(env.ctx.config), {
-    firstStartedAt: "2026-10-01T09:12:00Z", starts: 2, version: "1.18.0", totals: { watchdogChecks: 40 },
+    firstStartedAt: "2026-10-01T09:12:00Z", starts: 2, version: "1.19.0", totals: { watchdogChecks: 40 },
     warnings: 12, errors: 1, recent: [{ at: "2026-11-24T07:05:00Z", level: "warn", msg: "watchdog: a check failed this tick", detail: null }],
   });
   const said = (await captureOutput(() => cmd.status(env.ctx, { clearProblems: true }))).join("\n");

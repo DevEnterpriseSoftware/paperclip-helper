@@ -10,7 +10,7 @@ import { classifyFailure, labelOf, localZone, resetLabel } from "./limits.mjs";
 import { issueActivity, stagesWipe } from "./stages.mjs";
 import { isBackstop, monitorPending, runRefs, waitingOn } from "./ci-runs.mjs";
 import { selfWakeLoop } from "./self-wakes.mjs";
-import { claimedOnly, handOnRoute, heldReviewRoute, holdFacts, neverStarted, PAUSE_CANCEL, RECONCILIATION_CAUSE, releaseProblems } from "./release.mjs";
+import { claimedOnly, handOnRoute, heldReviewRoute, holdFacts, neverStarted, PAUSE_CANCEL, ranText, RECONCILIATION_CAUSE, releaseProblems, suppressedRepair, suppressionOf } from "./release.mjs";
 import { describeWakes } from "./paused-holds.mjs";
 import { codeLabel, EXTENSION_ERROR, hostPaths, meaningOf, readWorkspace, RECOVERY_KIND, VALIDATION_FAILED, validationOf } from "./worktree-links.mjs";
 import { blockersWakeOf, harnessOf, ranRun, ts } from "./util.mjs";
@@ -147,7 +147,18 @@ async function whyReport(ctx, identifier, out) {
       } else if (source?.status === "cancelled") {
         // A run cancelled before it started, or claimed and cancelled before it reached its adapter (watchdog 22).
         const facts = await holdFacts(api, id).catch(() => null);
-        if (facts && neverStarted(facts)) {
+        const unstarted = facts ? neverStarted(facts) : false;
+        // A disposition repair Paperclip suppressed itself (watchdog 22 too, plain release only).
+        const suppressed = facts && !unstarted && suppressedRepair(facts) ? { error: suppressionOf(facts.run), ran: ranText(facts.run) } : null;
+        if (suppressed) {
+          const ownerName = await nameOf(hold.agentId ?? source.agentId);
+          const problems = releaseProblems(facts);
+          unstartedHold = { ownerName, runId: hold.runId, errorCode: source.errorCode, problems, route: null, handOn: null, targetName: null, returnName: null, claimed: false, suppressed };
+          out(
+            `Held run was a suppressed disposition repair: Paperclip suppressed ${ownerName ?? "the agent"}'s run ${String(hold.runId).slice(0, 8)} itself ` +
+              `("${suppressed.error}"; it ${suppressed.ran}, no usage), and its own recovery action for it is already resolved.`,
+          );
+        } else if (facts && unstarted) {
           const ownerName = await nameOf(hold.agentId ?? source.agentId);
           const route = heldReviewRoute(facts);
           const handOn = route ? null : handOnRoute(facts);

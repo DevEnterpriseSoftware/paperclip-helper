@@ -12,7 +12,9 @@
 // A run Paperclip's dispatch gate cancelled before it started is held the same way
 // (up to 2026.1023.0), though it did nothing, and so is one a reassignment cancelled
 // after its claim but before its dispatch: neverStarted() says so from the run's own
-// record, and its release records "not performed".
+// record, and its release records "not performed". So is a disposition repair Paperclip
+// suppressed itself because the issue already had a durable path (suppressedRepair): it
+// never started or was cut off within seconds, with no usage.
 //
 // `pch release` and the watchdog share this module: the command for any such
 // hold, after you've looked; the watchdog only for one Paperclip can never
@@ -117,6 +119,65 @@ function looksUnstarted(run) {
   return true;
 }
 
+// A disposition repair Paperclip suppressed itself (seen on 2026.1023.0). The repair
+// (wake reason issue_disposition_repair) was no longer needed because the issue already
+// had a durable path (a monitor, a PR waiting on CI): its scheduled-retry gate cancelled it
+// before it started ("Scheduled disposition repair suppressed because the source state
+// changed or gained a durable path"), or the check just before dispatch cancelled it a
+// few seconds after its claim ("Disposition repair suppressed: durable_wait",
+// legacy_disposition_repair_suppressed). Paperclip still records that as a cancellation
+// with no recorded request and holds the issue behind it. Its own recovery action for the
+// run is settled (resolved, automaticRecovery preserve_without_replay_v1, evidence
+// originalFailureCode legacy_disposition_repair_suppressed), so nothing is active, yet
+// executionBlocker still names that action and nothing ever clears it.
+export const REPAIR_WAKE = "issue_disposition_repair";
+export const SUPPRESSED_REPAIR_CODES = new Set(["legacy_disposition_repair_suppressed", "issue_disposition_repair_superseded"]);
+const SUPPRESSED_REPAIR_TEXT = /disposition repair suppressed/i;
+// Longer than this, and it isn't a repair cancelled on its way in: a person's to judge.
+export const SUPPRESSED_REPAIR_MAX_RUN_MS = 10_000;
+// How long such a hold stands before the watchdog releases it, so Paperclip's own
+// recovery goes first.
+export const SUPPRESSED_REPAIR_SETTLE_MS = 10 * 60_000;
+
+const wakeReasonOf = (run) => run?.contextSnapshot?.wakeReason ?? run?.wakeReason ?? null;
+const msBetween = (a, b) => Date.parse(b ?? "") - Date.parse(a ?? "");
+
+// How long the run ran (ms), 0 when it never started, null when its record can't say.
+export function repairRanMs(run) {
+  if (!run || !("startedAt" in run)) return null;
+  if (run.startedAt === null) return 0;
+  const ms = msBetween(run.startedAt, run.finishedAt);
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
+}
+
+// The hold is behind a disposition repair Paperclip suppressed, that did nothing (no
+// usage, never started or cut off within seconds), with Paperclip's own recovery for it
+// over: nothing active, and the action the hold names settled or gone. Every part must
+// be read and agree; anything unread or unclear says no.
+export function suppressedRepair(facts) {
+  const { hold, run, issue, recovery } = facts ?? {};
+  if (hold?.cause !== RECONCILIATION_CAUSE || hold.canRetry === true || !run?.detailRead) return false;
+  if (run.status !== "cancelled" || !run.finishedAt || wakeReasonOf(run) !== REPAIR_WAKE) return false;
+  if (!recovery || recovery.active) return false;
+  if (recovery.action && recovery.action.status !== "resolved") return false;
+  const evidence = SUPPRESSED_REPAIR_CODES.has(run.errorCode) || SUPPRESSED_REPAIR_TEXT.test(String(run.error ?? "")) ||
+    recovery.action?.evidence?.originalFailureCode === "legacy_disposition_repair_suppressed";
+  if (!evidence) return false;
+  if (ranWork(run)) return false;
+  const ran = repairRanMs(run);
+  if (ran === null || ran >= SUPPRESSED_REPAIR_MAX_RUN_MS) return false;
+  const runIssue = run.contextSnapshot?.issueId ?? run.issueId ?? null;
+  if (runIssue && issue?.id && runIssue !== issue.id) return false;
+  return true;
+}
+
+// For notes and evidence: what Paperclip said, and how long it ran.
+export const suppressionOf = (run) => String(run?.error ?? "").trim() || run?.errorCode || "disposition repair suppressed";
+export const ranText = (run) => {
+  const ms = repairRanMs(run);
+  return !ms ? "never started" : `ran ${(ms / 1000).toFixed(1)} s`;
+};
+
 // Everything a release decision needs, for one issue. Null when it isn't held.
 export async function holdFacts(api, issueRef) {
   const id = encodeURIComponent(issueRef);
@@ -134,6 +195,16 @@ export async function holdFacts(api, issueRef) {
     const events = await api.request("GET", `/api/heartbeat-runs/${hold.runId}/events?limit=200`).catch(() => null);
     run.events = Array.isArray(events) ? events : null;
   }
+  // A disposition repair: is Paperclip's own recovery for it over? (suppressedRepair)
+  // { active, action }: the action the hold names, null when it isn't listed; null when unread.
+  let recovery = null;
+  if (hold.cause === RECONCILIATION_CAUSE && detail && wakeReasonOf(detail) === REPAIR_WAKE) {
+    const listed = await api.request("GET", `/api/issues/${id}/recovery-actions`).catch(() => null);
+    if (listed && typeof listed === "object") {
+      const actions = Array.isArray(listed.actions) ? listed.actions : [];
+      recovery = { active: listed.active ?? null, action: actions.find((a) => a?.id === hold.recoveryActionId) ?? null };
+    }
+  }
   const agent = hold.agentId ? await api.request("GET", `/api/agents/${hold.agentId}`).catch(() => null) : null;
   const queue = await api.request("GET", `/api/issues/${id}/queued-comments`).catch(() => null);
   // The issue is the held run's agent's, with no review pending: was it their review that ended?
@@ -142,7 +213,7 @@ export async function holdFacts(api, issueRef) {
     const activity = await api.request("GET", `/api/issues/${id}/activity`).catch(() => null);
     endedReview = endedReviewOf(activity, hold.agentId);
   }
-  return { issue, hold, run, agent, queue, endedReview, activeRun: list.some((r) => ACTIVE_RUN.has(r.status)) };
+  return { issue, hold, run, agent, queue, endedReview, recovery, activeRun: list.some((r) => ACTIVE_RUN.has(r.status)) };
 }
 
 // A hold left by a run Paperclip cancelled before it started: a
@@ -499,9 +570,19 @@ async function deliverAfterRelease(api, id) {
   return { status: after.status, delivered: 0, waiting: left };
 }
 
-// The outcome a release records when none is given: a run that never started
-// performed nothing; any other's actions are unverified.
-export const defaultOutcome = (facts) => (neverStarted(facts) ? "not_performed" : "mixed");
+// The outcome a release records when none is given: a run that never started, or a
+// disposition repair Paperclip suppressed before it did anything, performed nothing; any
+// other's actions are unverified.
+export const defaultOutcome = (facts) => (neverStarted(facts) || suppressedRepair(facts) ? "not_performed" : "mixed");
+
+// The evidence for a suppressed repair: its times, Paperclip's reason, and no usage.
+function suppressedEvidence(hold, run) {
+  const times = run.startedAt ? `started ${run.startedAt} and finished ${run.finishedAt} (${ranText(run).replace("ran ", "")})` : `never started, finished ${run.finishedAt}`;
+  return (
+    `Run ${hold.runId} was a disposition repair (${REPAIR_WAKE}) that Paperclip suppressed itself: "${suppressionOf(run)}". ` +
+    `It ${times}, and recorded no usage or output tokens, so it performed no actions.`
+  );
+}
 
 // Records the board's reconciliation, then delivers the saved messages the way
 // Interrupt does. Returns { status, delivered, waiting }.
@@ -514,6 +595,7 @@ async function resolveRun(api, id, facts, { actionOutcome, note, signature }) {
   const { hold, run } = facts;
   const ended = run ? `${run.status}${run.errorCode ? ` (${run.errorCode})` : ""}` : "stopped";
   const unstarted = neverStarted(facts);
+  const suppressed = !unstarted && suppressedRepair(facts);
   let actionId = hold.recoveryActionId;
   let resolved = 0;
   for (; resolved < MAX_ACTIONS_PER_RUN && actionId; resolved += 1) {
@@ -533,6 +615,8 @@ async function resolveRun(api, id, facts, { actionOutcome, note, signature }) {
             : `Run ${hold.runId} was cancelled by Paperclip's dispatch gate before it started (${run.errorCode}): ` +
               "it has no start time, process, session, usage, environment lease or execution event, so it performed no actions.") +
             (actionOutcome === "not_performed" ? "" : ` The board recorded its actions as ${actionOutcome.replace("_", " ")}.`)
+          : suppressed
+            ? suppressedEvidence(hold, run) + (actionOutcome === "not_performed" ? "" : ` The board recorded its actions as ${actionOutcome.replace("_", " ")}.`)
           : `Run ${hold.runId} ended ${ended} and recorded no process that is still running. ` +
             (actionOutcome === "mixed"
               ? "What it did before stopping is unverified; the assignee checks the workspace and branch before continuing."
