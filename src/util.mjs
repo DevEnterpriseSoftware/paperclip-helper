@@ -37,6 +37,12 @@ export const pausedRefusal = (err) => err?.status === 409 && /paused/i.test(err?
 
 // Run statuses that hold an issue's execution: queued, waiting to retry, or going.
 export const ACTIVE_RUN = new Set(["queued", "scheduled_retry", "running"]);
+// A row of GET /api/issues/:id/runs that executes that issue. The list also has other
+// agents' runs for other issues that only touched it (a comment, a card); their row's
+// contextIssueId names the issue they execute. A row without it counts as the issue's.
+export const onIssue = (issueId) => (r) => (r?.contextIssueId ?? r?.issueId ?? issueId) === issueId;
+// Whether a run is executing the issue now (queued, waiting to retry, or going).
+export const activeOn = (issueId) => (r) => ACTIVE_RUN.has(r?.status) && onIssue(issueId)(r);
 // Run statuses that are over, one way or another.
 export const TERMINAL_RUN = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
 // Paperclip's record that a blocker done woke a dependent's assignee

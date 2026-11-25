@@ -76,7 +76,7 @@ import {
   actsAsUser, claimedOnly, handOnRoute, handOnText, heldBackstop, heldReviewRoute, neverStarted, ranWork, releaseHandedOn, releaseHeldReview, releaseHold, releaseProblems,
   releaseRebuiltReview, reviewPending, unprovable, UPSTREAM_RELEASED_CODES, suppressedRepair, suppressionOf, ranText, SUPPRESSED_REPAIR_SETTLE_MS,
 } from "./release.mjs";
-import { ACTIVE_RUN } from "./util.mjs";
+import { activeOn } from "./util.mjs";
 import { describeWakes, waitingWakes } from "./paused-holds.mjs";
 
 const EXECUTED_REPORT_AFTER_MS = 60 * 60_000;
@@ -268,7 +268,7 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
       }
       return;
     }
-    if (!ci?.reported && !(await wakeGuard.allow(issue, "release (22)"))) return;
+    if (!ci?.reported && !(await wakeGuard.allow(issue, "release (22)", { hold: `${why}${held}` }))) return;
     records.set(key, { count: 1, at: now(), ...(retry ? { retried: true } : {}) });
     state.touch();
     const options = {
@@ -393,7 +393,7 @@ export function createUnstartedHoldCheck({ ctx, records, state, stats, dryRunSee
       }
       const runs = await api.request("GET", `/api/issues/${r.issueId}/runs`).catch(() => null);
       if (!Array.isArray(runs)) continue;
-      if (runs.some((x) => ACTIVE_RUN.has(x.status))) {
+      if (runs.some(activeOn(r.issueId))) {
         if (now() - r.at > DAY_MS) {
           done();
           await noteToBoard(ctx, companyId, `${who}: the watchdog asked ${holder?.name ?? "the held run's agent"} to give this issue to ${target?.name ?? "its owner"} a day ago, and a run is still active on it. See \`pch why ${who}\`.`, { issue: who });

@@ -240,3 +240,14 @@ test("the fake Paperclip decides a review as Paperclip does (issue-execution-pol
   await api.request("PATCH", "/api/issues/ACM-4", { status: "todo" });
   assert.deepEqual([other.status, other.executionState], ["todo", null]);
 });
+
+test("onIssue / activeOn: a run-list row counts for the issue it executes; one without contextIssueId counts as the issue's", async () => {
+  const { activeOn, onIssue } = await import("../src/util.mjs");
+  const mine = { status: "running", contextIssueId: "issue-1" };
+  const other = { status: "running", contextIssueId: "issue-2" };
+  const bare = { status: "queued" };
+  assert.equal(onIssue("issue-1")(mine), true);
+  assert.equal(onIssue("issue-1")(other), false, "another issue's run that only touched this one");
+  assert.equal(onIssue("issue-1")(bare), true);
+  assert.deepEqual([mine, other, bare, { status: "succeeded", contextIssueId: "issue-1" }].filter(activeOn("issue-1")), [mine, bare]);
+});

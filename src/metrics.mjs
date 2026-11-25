@@ -72,6 +72,8 @@ function detailOf(extra) {
     if (v == null || v === "") continue;
     parts.push(`${k} ${typeof v === "string" ? v : JSON.stringify(v)}`);
   }
+  // A note that something is left: what is in the way first.
+  if (Array.isArray(e.problems) && e.problems[0]) parts.push(String(e.problems[0]));
   return parts.join(", ").slice(0, 300) || null;
 }
 

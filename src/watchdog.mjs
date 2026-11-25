@@ -252,16 +252,18 @@
 //
 // The loop breaker (wake-guard.mjs). Every nudge, release and re-send of saved messages asks first: once the
 // watchdog has woken the same issue twice within 30 minutes and nothing has moved on
-// it since (no new CI run named, no new assignee or status, no person's comment), it
-// wakes it no more, tells the board once, and leaves the issue alone until it changes.
-// A CI run's report is never held back, and starts the count again.
+// it since (no new CI run named, no new assignee or status, no person's comment or card
+// answer, and once tripped no hold behind another run), it wakes it no more, tells the
+// board once, and leaves the issue alone until it changes. A release it holds back is
+// told to the board once per hold. A CI run's report is never held back, and starts the
+// count again.
 //
 // Nudges and retries are capped per situation (WATCHDOG_MAX_NUDGES) and spaced
 // by the stall window. Their counts are kept in the state file across restarts.
 
 import { companyAgents, listIssues } from "./paperclip.mjs";
 import { createTickReads } from "./tick-reads.mjs";
-import { ACTIVE_RUN, agentMention, asleep, blockersWakeOf, every, mapLimit, pausedRefusal, ranRun, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
+import { ACTIVE_RUN, activeOn, agentMention, onIssue, asleep, blockersWakeOf, every, mapLimit, pausedRefusal, ranRun, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 import { holdFacts, neverStarted, pausedHold, ranWork, releaseHold, releaseProblems, RECONCILIATION_CAUSE, suppressedRepair, unprovable } from "./release.mjs";
 import { clearLink, deadLinkWorkspaceId, isolatedWorkspacesEnabled, linkedWorkspace } from "./workspace.mjs";
 import { addresseeReached, cardText, pendingCards, QUESTION_STATUSES, relayIssue, strandedCard } from "./questions.mjs";
@@ -418,7 +420,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     // has finished: execution moved on without it, and Paperclip never promotes
     // it afterwards. Carried across reassignments, such a wake would otherwise
     // hide a dropped hand-off indefinitely, however many later runs come and go.
-    const finished = (Array.isArray(runs) ? runs : []).filter((r) => !ACTIVE_RUN.has(r.status));
+    const finished = (Array.isArray(runs) ? runs : []).filter((r) => !ACTIVE_RUN.has(r.status) && onIssue(issue.id)(r));
     const stale = (e) =>
       e.status === "deferred_issue_execution" && ts(e.requestedAt) > 0 && finished.some((r) => ts(r.createdAt) > ts(e.requestedAt));
     const pending = (wakes?.events ?? []).filter(
@@ -605,7 +607,10 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       return true;
     }
     // A CI report posted behind the hold is the release's wake: not a loop.
-    if (!ci?.reported && !(await wakeGuard.allow(facts.issue, "release (7)"))) return true;
+    const holdText =
+      `Paperclip holds every wake on this issue behind ${facts.agent?.name ?? "an agent"}'s run ${String(hold.runId).slice(0, 8)}, ` +
+      `which stopped with no verified stop record, and never releases that hold by itself (${hold.cause})`;
+    if (!ci?.reported && !(await wakeGuard.allow(facts.issue, "release (7)", { hold: holdText }))) return true;
     records.set(key, { count: 1, at: now() });
     state.touch();
     let result;
@@ -704,7 +709,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     }
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
     const list = Array.isArray(runs) ? runs : [];
-    if (list.some((r) => ACTIVE_RUN.has(r.status))) return;
+    if (list.some(activeOn(issue.id))) return;
     // The last run hit a provider limit (or what Paperclip took for a transient error) and
     // Paperclip's own retries are spent. A nudge only starts the same failing run again, and its
     // recovery then parks the issue under a new action, run after run. Leave it to the board.
@@ -838,7 +843,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
       if (Array.isArray(runs)) settle(issue);
       return null; // never worked on: not a hand-off
     }
-    if (runs.some((r) => r.agentId === assignee && ACTIVE_RUN.has(r.status))) return null;
+    if (runs.some((r) => r.agentId === assignee && activeOn(issue.id)(r))) return null;
     const newest = (list) => list.reduce((a, b) => (ts(b.createdAt) > ts(a.createdAt) ? b : a));
     // A run Paperclip cancelled before it started, because the issue was held for
     // reconciliation after a hand-off, did no work. It doesn't count as the owner
@@ -880,7 +885,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     const blockers = Array.isArray(diag?.blockers) ? diag.blockers : [];
     if (!diag?.readiness?.allBlockersDone || blockers.length === 0) return null;
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
-    if ((Array.isArray(runs) ? runs : []).some((r) => r.agentId === assignee && ACTIVE_RUN.has(r.status))) return null;
+    if ((Array.isArray(runs) ? runs : []).some((r) => r.agentId === assignee && activeOn(issue.id)(r))) return null;
     if (await hasPendingWake(issue, runs, agents)) return null;
     const done = blockers.map((b) => b.identifier ?? b.id).sort();
     return { agent, done, blockers, runs: Array.isArray(runs) ? runs : [] };
@@ -1152,7 +1157,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
           // Delivering a message to an agent Paperclip can't invoke only strands it again.
           if (asleep(await agentFor(issue.assigneeAgentId, agents).catch(() => null))) return;
           const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
-          if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return;
+          if ((Array.isArray(runs) ? runs : []).some(activeOn(issue.id))) return;
           await releaseHandOffHold(issue, full.executionBlocker, runs, agents);
           return;
         }
@@ -1275,7 +1280,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     if (row.executionRunId || row.checkoutRunId) return;
     const runs = await api.request("GET", `/api/issues/${row.id}/runs`).catch(() => []);
     const list = Array.isArray(runs) ? runs : [];
-    if (list.some((r) => ACTIVE_RUN.has(r.status))) return;
+    if (list.some(activeOn(row.id))) return;
     // The row may be a tick old, and has no settings: act on the issue as it is now.
     const full = await api.request("GET", `/api/issues/${row.id}`);
     if (full.executionWorkspaceId !== wsId || full.executionWorkspacePreference !== "reuse_existing") return;
@@ -1366,7 +1371,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
         const agent = await agentFor(full.assigneeAgentId, agents).catch(() => null);
         if (!agent || asleep(agent)) return;
         const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
-        if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return;
+        if ((Array.isArray(runs) ? runs : []).some(activeOn(issue.id))) return;
         if (await hasPendingWake(full, runs, agents)) return;
         if (await waitsOnBoard(full, "9", "scheduled-workspace nudge")) return;
         await nudge(
@@ -1528,7 +1533,7 @@ export function createWatchdog(outerCtx, state, deps = {}) {
     const agent = await agentFor(issue.assigneeAgentId, agents).catch(() => null);
     if (!agent || asleep(agent)) return true;
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => []);
-    if ((Array.isArray(runs) ? runs : []).some((r) => ACTIVE_RUN.has(r.status))) return true;
+    if ((Array.isArray(runs) ? runs : []).some(activeOn(issue.id))) return true;
     if (await hasPendingWake(issue, runs, agents)) return true;
     if (await waitsOnBoard(issue, "14", "cancelled-blocker nudge")) return true;
     const why = [];

@@ -37,7 +37,7 @@
 // so the wait is still known then.
 
 import { listIssues } from "./paperclip.mjs";
-import { ACTIVE_RUN, asleep, mapLimit, pausedRefusal, ts } from "./util.mjs";
+import { activeOn, asleep, mapLimit, pausedRefusal, ts } from "./util.mjs";
 
 // Runs are referred to by id (11 digits today) or by URL. A bare number needs at
 // least 9 digits and a word that says it's a run, so a PR or issue number never
@@ -624,7 +624,7 @@ export function createCiRunsCheck({ ctx, records, state, stats, dryRunSeen, reco
     if (!finishedAt || (!heldByMonitor && now() - finishedAt < stallMs)) return silent("finished less than the stall window ago", {}, { pull: false });
     const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => null);
     if (!Array.isArray(runs)) return;
-    const active = runs.filter((r) => ACTIVE_RUN.has(r.status));
+    const active = runs.filter(activeOn(issue.id));
     // The agent's own run going will see the result; another agent's queued run (often
     // cancelled at dispatch moments later) doesn't, so the backstop is brought forward.
     if (active.length) return silent("a run on the issue is in progress", {}, { pull: !active.some((r) => r.agentId === assignee) });

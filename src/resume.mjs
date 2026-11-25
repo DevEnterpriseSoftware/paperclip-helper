@@ -22,7 +22,7 @@
 // limit.
 
 import { listIssues } from "./paperclip.mjs";
-import { ACTIVE_RUN, agentMention, asleep, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
+import { ACTIVE_RUN, activeOn, agentMention, asleep, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 
 // Statuses an issue can be restored to. Anything else Paperclip recorded as the
 // previous status (it records only these three today) restores to todo.
@@ -480,7 +480,7 @@ export function createResumeSweep({ ctx, records, state, stats, dryRunSeen, reco
     if (kind === null && !notice.notInvokable) return false;
     const runs = await api.request("GET", `/api/issues/${row.id}/runs`).catch(() => null);
     if (!Array.isArray(runs)) return "postponed";
-    if (runs.some((r) => ACTIVE_RUN.has(r.status))) return false;
+    if (runs.some(activeOn(full.id ?? row.id))) return false;
     // A review whose participant couldn't be woken goes back to review: Paperclip
     // re-pends the stage with its participant and wakes it.
     if (participant) return { latest, participant, target: { status: "in_review", from: "review stage" } };

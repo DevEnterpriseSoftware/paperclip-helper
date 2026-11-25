@@ -278,3 +278,74 @@ test("advice for a suppressed repair with a problem names it", () => {
   assert.match(text, /a disposition repair it suppressed itself/);
   assert.match(text, /another run on the issue is active/);
 });
+
+// ---------------------------------------------------------------- 1.19.1: gates outside the rule
+
+// GET /api/issues/:id/runs lists other agents' runs for other issues that only touched
+// this one (a comment, a card), with contextIssueId naming the issue they execute.
+const touchingRun = (issueId, { agentId = uuid(), status = "running" } = {}) =>
+  ({ runId: uuid(), agentId, status, contextIssueId: issueId, createdAt: minutesAgo(3), startedAt: minutesAgo(3), finishedAt: null });
+
+test("holdFacts: a run executing another issue that touched this one isn't active on it; one executing this issue is", async (t) => {
+  const e = await env(t);
+  const { issue } = suppressedHold(e.db);
+  const { holdFacts, releaseProblems } = await import("../src/release.mjs");
+  e.db.issueRuns[issue.id].push(touchingRun(uuid()));
+  let facts = await holdFacts(e.ctx.api, issue.id);
+  assert.equal(facts.activeRun, false);
+  assert.ok(!releaseProblems(facts).some((p) => /another run on the issue is active/.test(p)));
+  e.db.issueRuns[issue.id].push(touchingRun(issue.id));
+  facts = await holdFacts(e.ctx.api, issue.id);
+  assert.equal(facts.activeRun, true);
+  assert.ok(releaseProblems(facts).some((p) => /another run on the issue is active/.test(p)));
+});
+
+test("released behind another agent's run for another issue, and past a loop-breaker trip under an earlier hold", async (t) => {
+  let clock = Date.now();
+  const e = await env(t, {}, () => clock);
+  // The second suppressed repair on the issue: 3.4 s, no usage, its action resolved.
+  const { issue, run, actionId } = suppressedHold(e.db, {
+    run: { startedAt: new Date(Date.now() - 20 * 60_000 - 3400).toISOString() },
+  });
+  // A triage agent, running on another issue, commented on this one: its run is in the list.
+  e.db.issueRuns[issue.id].push(touchingRun(uuid()));
+  // The loop breaker tripped on the issue last night, under the first repair's hold.
+  const { wakeLoopKey } = await import("../src/wake-guard.mjs");
+  const trippedAt = clock - 14 * 60 * 60_000;
+  e.state.nudges.set(wakeLoopKey(issue.id), {
+    count: 2, at: trippedAt, assignee: issue.assigneeAgentId, since: trippedAt - 10 * 60_000, wakes: [], refs: [],
+    rules: ["nudge", "nudge"], tripped: trippedAt, holdRun: uuid(),
+  });
+  await e.watchdog.tick();
+  assert.equal(e.db.resolutions.length, 1);
+  const { body } = e.db.resolutions[0];
+  assert.equal(body.actionId, actionId);
+  assert.equal(body.executionReconciliation.runId, run.id);
+  assert.equal(body.executionReconciliation.actionOutcome, "not_performed");
+  assert.match(body.executionReconciliation.outcomeEvidence, /\(3\.4 s\)/);
+  assert.equal(issue.executionBlocker, null);
+  assert.ok(!notes(e).some((n) => /another run on the issue is active|loop breaker/.test(n.body)), "nothing held it back");
+});
+
+test("held back by a loop-breaker trip under the same hold: the board is told once, with the gate and when it lets go", async (t) => {
+  let clock = Date.now();
+  const e = await env(t, {}, () => clock);
+  const { issue } = suppressedHold(e.db);
+  const { wakeLoopKey } = await import("../src/wake-guard.mjs");
+  const trippedAt = clock - 2 * 60 * 60_000;
+  e.state.nudges.set(wakeLoopKey(issue.id), {
+    count: 2, at: trippedAt, assignee: issue.assigneeAgentId, since: trippedAt - 10 * 60_000, wakes: [], refs: [],
+    rules: ["release (22)", "release (22)"], tripped: trippedAt, holdRun: issue.executionBlocker.runId,
+  });
+  for (let i = 0; i < 3; i += 1) {
+    await e.watchdog.tick();
+    clock += 4 * 60_000;
+  }
+  assert.equal((e.db.resolutions ?? []).length, 0);
+  const held = notes(e).filter((n) => /loop breaker/.test(n.body));
+  assert.equal(held.length, 1, "once for this hold");
+  const utc = (ms) => `${new Date(ms).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+  assert.match(held[0].body, /^ACM-40: Paperclip holds every wake on this issue behind Carla's run .{8}, a disposition repair it suppressed itself/);
+  assert.ok(held[0].body.includes(`The watchdog won't release it: the loop breaker tripped at ${utc(trippedAt)} and holds back every wake on this issue until ${utc(trippedAt + 24 * 60 * 60_000)}`), held[0].body);
+  assert.match(held[0].body, /`pch release ACM-40 --apply` releases it now, if the loop is over/);
+});

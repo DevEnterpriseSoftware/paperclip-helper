@@ -12,7 +12,7 @@
 // rule mirrors a situation in watchdog.mjs or one the watchdog deliberately
 // leaves to the board, so keep the two in step.
 
-import { ACTIVE_RUN, approvalWaitingOn, ts } from "./util.mjs";
+import { activeOn, approvalWaitingOn, ts } from "./util.mjs";
 import { cardText, strandedCard } from "./questions.mjs";
 import { escalatedReview } from "./board-held.mjs";
 import { PARTICIPANT_RECOVERY_CAUSE } from "./resume.mjs";
@@ -156,7 +156,7 @@ export function advise(facts) {
     };
   }
 
-  const active = runs.filter((r) => ACTIVE_RUN.has(r.status));
+  const active = runs.filter(activeOn(issue.id));
   const myActive = active.find(mine);
   if (myActive) {
     if (myActive.status === "running") {

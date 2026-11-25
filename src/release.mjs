@@ -20,7 +20,7 @@
 // hold, after you've looked; the watchdog only for one Paperclip can never
 // settle by itself.
 
-import { ACTIVE_RUN, TERMINAL_RUN } from "./util.mjs";
+import { activeOn, TERMINAL_RUN } from "./util.mjs";
 import { isBackstop } from "./ci-runs.mjs";
 
 export const RECONCILIATION_CAUSE = "legacy_execution_requires_reconciliation";
@@ -213,7 +213,7 @@ export async function holdFacts(api, issueRef) {
     const activity = await api.request("GET", `/api/issues/${id}/activity`).catch(() => null);
     endedReview = endedReviewOf(activity, hold.agentId);
   }
-  return { issue, hold, run, agent, queue, endedReview, recovery, activeRun: list.some((r) => ACTIVE_RUN.has(r.status)) };
+  return { issue, hold, run, agent, queue, endedReview, recovery, activeRun: list.some(activeOn(issue.id)) };
 }
 
 // A hold left by a run Paperclip cancelled before it started: a

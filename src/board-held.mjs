@@ -21,7 +21,7 @@
 
 import { listIssues } from "./paperclip.mjs";
 import { cardText } from "./questions.mjs";
-import { ACTIVE_RUN, agentMention, approvalWaitingOn, asleep, mapLimit, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
+import { ACTIVE_RUN, activeOn, agentMention, approvalWaitingOn, asleep, mapLimit, pausedRefusal, ts, WATCHDOG_SIGNATURE } from "./util.mjs";
 
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3; // Paperclip's, issue-execution-policy.ts
 const RESOLVED = new Set(["answered", "accepted", "rejected"]);
@@ -189,7 +189,7 @@ export function createBoardHeldCheck({ ctx, records, state, stats, dryRunSeen, r
         // Returning it to an agent Paperclip can't invoke only parks it.
         if (!agent || asleep(agent)) return;
         const runs = await api.request("GET", `/api/issues/${issue.id}/runs`).catch(() => null);
-        if (!Array.isArray(runs) || runs.some((r) => ACTIVE_RUN.has(r.status))) return;
+        if (!Array.isArray(runs) || runs.some(activeOn(issue.id))) return;
         const cards = await api.request("GET", `/api/issues/${issue.id}/interactions`).catch(() => []);
         // An escalated review is only ever returned by 13: returning it as you for an
         // answer would reset Paperclip's round count behind WATCHDOG_RETURN_ESCALATED_REVIEWS.

@@ -148,3 +148,17 @@ test("pch status --clear-problems before the service has written any figures say
   assert.match(said, /^No problems recorded yet: the helper service hasn't written data\/metrics\.json\.$/m);
   process.exitCode = 0;
 });
+
+test("a note for the board that something is left says what is in the way", () => {
+  const config = { dataDir: tempDir() };
+  const metrics = createMetrics(config);
+  const log = createLogger({ write: () => {} });
+  watchProblems(log, metrics);
+  log.warn("watchdog: a note for the board", { issue: "ACM-7", text: "…", problems: ["another run on the issue is active", "a review is pending"] });
+  log.warn("watchdog: a note for the board", { issue: "ACM-8", text: "…" });
+  metrics.save();
+  const m = readMetrics(config);
+  assert.equal(m.recent[0].detail, "issue ACM-7, another run on the issue is active", "the first problem");
+  assert.equal(m.recent[1].detail, "issue ACM-8");
+  fs.rmSync(config.dataDir, { recursive: true, force: true });
+});

@@ -17,7 +17,7 @@
 // isolated workspace": clear the link, so the next run gets a fresh worktree.
 // `pch workspace`, `pch why` and the watchdog share this module.
 
-import { ACTIVE_RUN } from "./util.mjs";
+import { activeOn } from "./util.mjs";
 
 const UUID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
@@ -144,7 +144,7 @@ export function clearProblems(facts, runs = [], issue = facts.issue) {
   if (facts.state === "unknown") problems.push("its linked workspace couldn't be read");
   if (!OPEN(issue.status)) problems.push(`it is ${issue.status}`);
   if (issue.executionRunId || issue.checkoutRunId) problems.push("a run holds it");
-  const active = runs.find((r) => ACTIVE_RUN.has(r.status));
+  const active = runs.find(activeOn(issue.id));
   if (active) problems.push(`a run is ${active.status} on it`);
   // A change already scheduled for the next run fixes the link by itself, and
   // a new change would cancel it.

@@ -138,3 +138,117 @@ test("the watchdog's nudges ask the loop breaker: a synthetic loop gets one boar
   assert.match(env.db.comments[0].body, /every blocker on this issue is done \(ACM-7\)/);
   assert.equal(env.state.nudges.get(wakeLoopKey(issue.id)).wakes.length, 1, "counted for the next time");
 });
+
+// ---------------------------------------------------------------- holds and card answers (1.19.1)
+
+// The issue held behind `runId` (null: not held), as GET /api/issues/:id has it.
+const holdOn = (issue, runId) => {
+  issue.executionBlocker = runId ? { runId, cause: "legacy_execution_requires_reconciliation", canRetry: false } : null;
+};
+const HOLD = "Paperclip holds every wake on this issue behind Dana's run 1a2b3c4d, a disposition repair it suppressed itself";
+
+test("the loop it guards makes a new hold each turn: a new hold before the trip doesn't count, and it still trips", async (t) => {
+  const env = await guardEnv(t);
+  const { guard, issue } = env;
+  // Released, an empty run, a suppressed repair, held again behind another run: twice.
+  holdOn(issue, "hold-1");
+  await guard.woke(issue, "release (22)");
+  env.later(8);
+  holdOn(issue, "hold-2");
+  assert.equal(await guard.allow(issue, "release (22)", { hold: HOLD }), true);
+  await guard.woke(issue, "release (22)");
+  env.later(8);
+  holdOn(issue, "hold-3");
+  assert.equal(await guard.allow(issue, "release (22)", { hold: HOLD }), false, "the third turn is held back");
+  const r = env.state.nudges.get(wakeLoopKey(issue.id));
+  assert.equal(r.holdRun, "hold-3", "the hold in force when it tripped");
+  assert.equal(env.notes.length, 1, "one note: the trip, naming the release it holds back");
+  assert.match(env.notes[0].text, /That holds back this release: Paperclip holds every wake on this issue behind Dana's run 1a2b3c4d.*`pch release ACM-301 --apply` releases it now, if the loop is over\./);
+
+  // Still behind the same run, nothing else changed: still held back, and nothing more said.
+  env.later(10);
+  assert.equal(await guard.allow(issue, "release (22)", { hold: HOLD }), false);
+  assert.equal(env.notes.length, 1);
+});
+
+test("once tripped, a hold behind another run is the issue moving on; the same hold isn't", async (t) => {
+  const env = await guardEnv(t);
+  const { guard, issue } = env;
+  holdOn(issue, "hold-A");
+  await guard.woke(issue, "nudge");
+  env.later(2);
+  await guard.woke(issue, "nudge");
+  env.later(2);
+  assert.equal(await guard.allow(issue, "nudge"), false, "tripped behind hold-A");
+  assert.equal(env.state.nudges.get(wakeLoopKey(issue.id)).holdRun, "hold-A");
+
+  env.later(60);
+  assert.equal(await guard.allow(issue, "release (22)", { hold: HOLD }), false, "the same hold: held back");
+
+  // The board released hold-A by hand, the agent ran, and Paperclip held the issue again behind another run.
+  env.later(600);
+  holdOn(issue, "hold-B");
+  assert.equal(await guard.allow(issue, "release (22)", { hold: HOLD }), true);
+  assert.ok(!env.state.nudges.has(wakeLoopKey(issue.id)), "the record is forgotten");
+  assert.ok(env.logs.some((l) => l.msg === "watchdog: the issue moved on since its last wakes; the loop breaker lets the next one through"));
+});
+
+test("a trip recorded before 1.19.1 (no hold on the record) lets a held issue through; an unheld one stays held back", async (t) => {
+  const env = await guardEnv(t);
+  const { guard, issue } = env;
+  const t0 = env.clock.now;
+  const old = { count: 2, at: t0 - 60 * 60_000, assignee: issue.assigneeAgentId, since: t0, wakes: [], refs: [], rules: ["nudge", "nudge"], tripped: t0 - 60 * 60_000 };
+  env.state.nudges.set(wakeLoopKey(issue.id), { ...old });
+  holdOn(issue, null);
+  assert.equal(await guard.allow(issue, "nudge"), false, "not held: nothing new");
+  holdOn(issue, "hold-X");
+  assert.equal(await guard.allow(issue, "release (22)"), true);
+  assert.ok(!env.state.nudges.has(wakeLoopKey(issue.id)));
+});
+
+test("a card a person answered since the first wake counts as moving on; an earlier answer or an agent's doesn't", async (t) => {
+  const env = await guardEnv(t);
+  const { guard, issue } = env;
+  const card = (over) => ({ id: uuid(), kind: "ask_user_questions", status: "answered", createdByAgentId: issue.assigneeAgentId, createdAt: minutesAgo(60), ...over });
+  env.db.interactions[issue.id] = [card({ resolvedByUserId: "u1", resolvedAt: minutesAgo(40) })]; // before the first wake
+  await guard.woke(issue, "nudge");
+  env.later(2);
+  await guard.woke(issue, "nudge");
+  env.later(2);
+  env.db.interactions[issue.id].push(card({ resolvedByAgentId: uuid(), resolvedAt: new Date(env.clock.now).toISOString() }));
+  env.db.interactions[issue.id].push(card({ status: "pending" }));
+  assert.equal(await guard.allow(issue, "nudge"), false, "an old answer, an agent's answer and a pending card: nothing new");
+  env.later(30);
+  env.db.interactions[issue.id].push(card({ resolvedByUserId: "u1", resolvedAt: new Date(env.clock.now).toISOString() }));
+  assert.equal(await guard.allow(issue, "nudge"), true, "the board answered a card");
+});
+
+test("a release the loop breaker holds back is told to the board once per hold, with when it lets go", async (t) => {
+  const env = await guardEnv(t);
+  const { guard, issue } = env;
+  const t0 = env.clock.now;
+  // Tripped by nudges, a while before the hold.
+  await guard.woke(issue, "nudge");
+  env.later(2);
+  await guard.woke(issue, "nudge");
+  env.later(2);
+  assert.equal(await guard.allow(issue, "nudge"), false);
+  const tripped = env.state.nudges.get(wakeLoopKey(issue.id)).tripped;
+  assert.equal(env.notes.length, 1);
+
+  env.later(30);
+  assert.equal(await guard.allow(issue, "release (22)", { hold: HOLD }), false);
+  assert.equal(env.notes.length, 2);
+  const { text, extra } = env.notes[1];
+  const utc = (ms) => `${new Date(ms).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+  assert.ok(text.startsWith(`ACM-301: ${HOLD}. The watchdog won't release it: the loop breaker tripped at ${utc(tripped)} and holds back every wake on this issue until ${utc(tripped + 24 * 60 * 60_000)}`), text);
+  assert.match(text, /a person's comment or card answer, another assignee or status, a new CI run named, or a hold behind another run/);
+  assert.match(text, /`pch release ACM-301 --apply` releases it now, if the loop is over; `pch why ACM-301` says what the agent waits on\.$/);
+  assert.equal(extra.problems[0], `the loop breaker tripped at ${utc(tripped)}`);
+  assert.ok(tripped >= t0);
+
+  env.later(5);
+  assert.equal(await guard.allow(issue, "release (22)", { hold: HOLD }), false);
+  assert.equal(await guard.allow(issue, "nudge"), false, "a nudge says nothing");
+  assert.equal(env.notes.length, 2, "once for this hold");
+});

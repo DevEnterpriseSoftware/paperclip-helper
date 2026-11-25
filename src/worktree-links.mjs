@@ -30,7 +30,7 @@
 
 import path from "node:path";
 import { listIssues } from "./paperclip.mjs";
-import { ACTIVE_RUN, asleep, mapLimit, plural, ts } from "./util.mjs";
+import { ACTIVE_RUN, activeOn, asleep, mapLimit, plural, ts } from "./util.mjs";
 import { STARTED_EVENTS } from "./release.mjs";
 
 export const VALIDATION_FAILED = "workspace_validation_failed";
@@ -340,7 +340,7 @@ export async function retryProblem(issue, action, runs, { agent = null, blockers
     return "a review stage is pending on it: set it back to In review, which wakes the stage's participant, instead of a comment that hands it to the assignee";
   }
   const list = Array.isArray(runs) ? runs : [];
-  const active = list.find((r) => ACTIVE_RUN.has(r.status));
+  const active = list.find(activeOn(issue.id));
   if (active) return `a run is ${active.status} on it`;
   // The last run that got past setup: one a model's safety classifier stopped stays
   // with the board, whatever the workspace does.
